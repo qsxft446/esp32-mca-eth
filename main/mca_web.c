@@ -11,6 +11,7 @@
 #include "mca_hist.h"
 #include "mca_time.h"
 #include "mca_ota.h"
+#include "mca_oled.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -1831,6 +1832,17 @@ static esp_err_t h_net_page(httpd_req_t *r)
     return httpd_resp_send(r, NET_PAGE, HTTPD_RESP_USE_STRLEN);
 }
 
+/* /oled.pbm - то, что сейчас на дисплее SSD1306, картинкой PBM 128x64
+ * (рисуется и без самого дисплея) */
+static esp_err_t h_oled(httpd_req_t *r)
+{
+    static uint8_t buf[16 + 128 * 64 / 8];
+    const size_t n = mca_oled_pbm(buf, sizeof(buf));
+    httpd_resp_set_type(r, "image/x-portable-bitmap");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, (const char *)buf, n);
+}
+
 static esp_err_t h_net_status(httpd_req_t *r)
 {
     const esp_ip4_addr_t eip = { .addr = mca_eth_ip() };
@@ -2663,6 +2675,7 @@ esp_err_t mca_web_start(void)
         URI("/net", h_net_page, NULL),
         URI("/wifi", h_net_page, NULL),    /* прежний адрес страницы */
         URI("/net/status", h_net_status, NULL),
+        URI("/oled.pbm", h_oled, NULL),
         URI("/diag/data", h_diag_data, NULL),
         URI("/diag/set", h_diag_set, NULL),
         URI("/diag/probe", h_diag_probe, NULL),

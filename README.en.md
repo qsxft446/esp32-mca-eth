@@ -171,6 +171,42 @@ Ethernet state and the firmware update over the network. If the W5500 did
 not answer at start, the console shows `W5500 не отвечает - сети нет`
 (W5500 does not respond - no network).
 
+## SSD1306 128x64 display (optional)
+
+A small I2C OLED display shows:
+
+- at the top — the device IP address (or `NO CABLE`, `WAITING FOR DHCP`,
+  `NO ETHERNET`);
+- on the next line — `RUN` (inverted, spectrum acquisition running) with
+  the current CPS, `STOP` or `SCOPE` (oscilloscope open), and the ADC rate
+  in MHz on the right;
+- at the bottom — a CPS plot by acquisition seconds over the last 128 s,
+  newest on the right; the scale runs from the minimum to the maximum on
+  screen, both labelled. While acquisition is stopped, the plot does not
+  move.
+
+| Display | ESP32-S3-ETH | Pin |
+|---|---|---|
+| SDA | GPIO18 | 31 |
+| SCL | GPIO46 | 6 |
+| VCC | 3V3 | 36 |
+| GND | GND | 38 |
+
+There are no other free pins on the header. GPIO46 is a boot pin, but at a
+normal start its level does not matter; the pull-up on the display module
+can only get in the way of entering the bootloader with the BOOT button —
+then disconnect the display (it does not affect flashing over the USB cable
+or over the network). GPIO45 does not fit: a pull-up at start would switch
+the flash supply voltage.
+
+The device finds address 0x3C or 0x3D by itself; the display can be
+connected on the fly — it is looked for every 10 s. Pins, bus speed
+(400 kHz) and 180° rotation (`MCA_OLED_FLIP`) are in `main/mca_config.h`.
+The frame is drawn even without a display: `http://<ip>/oled.pbm` is what
+is on the screen, as a picture. If the picture is shifted by a couple of
+pixels with garbage at the edge, it is a 1.3" display with an SH1106
+controller, not an SSD1306.
+
 ## MCA emulation on the serial port (shproto protocol)
 
 The device can answer on a serial port as an MCA speaking the binary

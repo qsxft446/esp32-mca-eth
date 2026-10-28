@@ -16,6 +16,7 @@
 #include "mca_emu.h"
 #include "mca_hist.h"
 #include "mca_ota.h"
+#include "mca_oled.h"
 
 static const char *TAG = "main";
 
@@ -124,6 +125,7 @@ void app_main(void)
     ESP_ERROR_CHECK(adc_clk_start(mca_freq_table[MCA_FREQ_DEFAULT_IDX]));
     ESP_ERROR_CHECK(adc_cap_init());
     ESP_ERROR_CHECK(mca_web_start());
+    mca_oled_start();           /* дисплей SSD1306, если подключён */
     mca_settings_load();        /* NVS к этому моменту поднят стартом сети */
     /* Эмуляция MCA на UART0, если включена: с этого места консоль молчит. */
     mca_emu_init();
@@ -187,6 +189,7 @@ void app_main(void)
             if (now_us - next_tick_us > 1000000)   /* сильно отстали - не догоняем */
                 next_tick_us = now_us + 1000000;
             mca_dsp_tick_1s();
+            mca_oled_tick_1s();
             /* история CPS: секунда, в которую шёл набор спектра */
             {
                 uint32_t cnt, dur;
