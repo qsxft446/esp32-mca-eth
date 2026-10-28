@@ -185,6 +185,10 @@ A small I2C OLED display shows:
   screen, both labelled. While acquisition is stopped, the plot does not
   move.
 
+The layout also suits a two-colour display (the top 16 rows yellow, the
+rest blue): both text lines lie entirely in the yellow band, the plot in the
+blue one. On a single-colour display it looks the same.
+
 | Display | ESP32-S3-ETH | Pin |
 |---|---|---|
 | SDA | GPIO18 | 31 |

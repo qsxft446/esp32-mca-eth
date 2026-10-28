@@ -81,15 +81,16 @@ static void fill(int x, int y, int w, int h, bool on)
         for (int i = x; i < x + w; i++) px(i, j, on);
 }
 
-/* Строка шрифтом 5x7 с шагом 6 точек; inv - светлым фоном. Возвращает x
- * после строки. */
+/* Строка шрифтом 5x7 (строки y..y+6) с шагом 6 точек; inv - светлым
+ * фоном в строках y-1..y+6, без строки снизу: так рамка RUN во второй
+ * строке кончается на 15-й - последней жёлтой. Возвращает x после строки. */
 static int text(int x, int y, const char *s, bool inv)
 {
     for (; *s; s++, x += 6) {
         const unsigned c = (unsigned char)*s;
         const uint8_t *g = FONT[(c >= 0x20 && c <= 0x7E) ? c - 0x20 : '?' - 0x20];
         for (int i = 0; i < 6; i++)
-            for (int j = -1; j < 8; j++) {
+            for (int j = -1; j < 7; j++) {
                 const bool dot = i < 5 && j >= 0 && j < 7 && (g[i] >> j & 1);
                 if (inv) px(x + i, y + j, !dot);
                 else if (dot) px(x + i, y + j, true);
@@ -100,7 +101,13 @@ static int text(int x, int y, const char *s, bool inv)
 
 static int text_w(const char *s) { return (int)strlen(s) * 6; }
 
-/* ---------------- кадр ---------------- */
+/* ---------------- кадр ----------------
+ * Раскладка - под двухцветный дисплей (строки 0-15 жёлтые, 16-63
+ * голубые; на одноцветном выглядит так же): текст целиком в жёлтой
+ * полосе, график - в голубой. Раньше вторая строка шла по строкам 10-18
+ * и на двухцветном дисплее RUN, CPS и частота выходили в два цвета. */
+#define YEL 16                  /* первая строка голубой части */
+
 static void render(void)
 {
     memset(s_fb, 0, sizeof(s_fb));
@@ -124,26 +131,26 @@ static void render(void)
     const mca_mode_t m = mca_mode;
     const bool scope = m == MCA_MODE_SCOPE || m == MCA_MODE_SCOPE_TRIG;
     const bool run = !scope && mca_spec_run;
-    int x = text(0, 11, scope ? "SCOPE" : (run ? "RUN" : "STOP"), run);
+    int x = text(0, 9, scope ? "SCOPE" : (run ? "RUN" : "STOP"), run);
     if (run) {
         snprintf(b, sizeof(b), "%lu cps", (unsigned long)st.cps);
-        text(x + 6, 11, b, false);
+        text(x + 6, 9, b, false);
     }
     snprintf(b, sizeof(b), "%luM", (unsigned long)((adc_clk_get_freq() + 500000) / 1000000));
-    text(W - text_w(b), 11, b, false);
+    text(W - text_w(b), 9, b, false);
 
     /* График CPS: секунды набора, новые справа, линией. Шкала - от
      * минимума до максимума на экране, подписаны оба: от нуля CPS около
      * 3500 +- 250 выглядел сплошной заливкой, и колебаний не было видно. */
-    const int gy = 21, top = gy + 1, bot = H - 1;
+    const int top = YEL + 2, bot = H - 1;
     static uint32_t cps[W];
     taskENTER_CRITICAL(&s_lock);
     const int n = s_ncps;
     memcpy(cps, s_cps, sizeof(cps));
     taskEXIT_CRITICAL(&s_lock);
-    for (int i = 0; i < W; i += 2) px(i, gy - 1, true);    /* верх графика */
+    for (int i = 0; i < W; i += 2) px(i, YEL, true);       /* верх графика */
     if (n == 0) {
-        text(0, gy + 8, "no data", false);
+        text(0, YEL + 14, "no data", false);
     } else {
         uint32_t mx = 0, mn = UINT32_MAX;
         for (int i = 0; i < n; i++) {
