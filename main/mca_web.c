@@ -1692,8 +1692,12 @@ static void ws_task(void *arg)
 static esp_err_t h_ws(httpd_req_t *r)
 {
     if (r->method == HTTP_GET) {            /* рукопожатие */
-        s_ws_fd  = httpd_req_to_sockfd(r);
-        s_ws_run = false;                   /* до первых настроек */
+        /* новое подключение не перебивает клиента, которому идут кадры:
+         * поток он заберёт, когда сам попросит кадры (run=1) */
+        if (s_ws_fd < 0 || !s_ws_run) {
+            s_ws_fd  = httpd_req_to_sockfd(r);
+            s_ws_run = false;               /* до первых настроек */
+        }
         return ESP_OK;
     }
     httpd_ws_frame_t f = { .type = HTTPD_WS_TYPE_TEXT };
@@ -1707,16 +1711,27 @@ static esp_err_t h_ws(httpd_req_t *r)
     q[f.len] = 0;
     if (f.type != HTTPD_WS_TYPE_TEXT) return ESP_OK;
 
+    /* КАДРЫ ПОЛУЧАЕТ ПОСЛЕДНИЙ КЛИЕНТ, КОТОРОМУ ОНИ НУЖНЫ (run=1).
+     * Страница шлёт настройки раз в 2 с и тогда, когда осциллограф у неё
+     * на паузе, в фоне или открыт другой режим, - с run=0. Раньше такая
+     * посылка забирала поток себе и останавливала его: у вкладки, где
+     * смотрят осциллограф, картинка замирала до её следующей посылки, до
+     * 2 с (так и было: в браузере осталась вторая вкладка на паузе).
+     * Теперь run=0 от другого клиента не трогает ни поток, ни окно снимка. */
+    const int fd = httpd_req_to_sockfd(r);
+    int32_t run = 0;
+    const bool has_run = q_int(q, "run", &run);
+    if (has_run && !run && fd != s_ws_fd && s_ws_fd >= 0 && s_ws_run)
+        return ESP_OK;
+
     size_t want = DIAG_SCOPE_LEN, pre = DIAG_SCOPE_PRE;
     scope_apply(q, &want, &pre);
     s_ws_want = want;
     s_ws_pre  = pre;
     mca_diag_set_scope_want(want, pre);
-    int32_t run = 0;
-    if (q_int(q, "run", &run)) s_ws_run = run != 0;
-    /* кадры получает последний заговоривший клиент; новые настройки -
-     * сразу кадр, не дожидаясь следующего снимка */
-    s_ws_fd    = httpd_req_to_sockfd(r);
+    if (has_run) s_ws_run = run != 0;
+    /* новые настройки - сразу кадр, не дожидаясь следующего снимка */
+    s_ws_fd    = fd;
     s_ws_force = true;
     return ESP_OK;
 }

@@ -606,6 +606,14 @@ pre-allocated memory.
   buffer. At start the device self-tests the codec; if that fails, frames
   go uncompressed (the page understands both). Under the plot you can see
   “stream … kbit/s” and which way it goes.
+- **Frames go to one window — the one where the oscilloscope is running.**
+  The page sends its settings every 2 s, also when its oscilloscope is
+  paused or the spectrum is open. Such a message from a second window used
+  to take the stream over and stop it: in the window being watched the
+  picture froze for up to 2 s. Now a paused window does not touch the
+  stream, and a new connection does not interrupt a running one. If the
+  oscilloscope is running in two windows at once, frames switch between
+  them every 2 s — watch in one.
 - **The page also draws at most 20 times per second**, at any time base.
   Large frames arrive over TCP in bursts; when each was drawn at once, the
   browser could not keep up with 32768 points, frames piled up, and the
