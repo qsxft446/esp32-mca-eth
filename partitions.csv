@@ -1,0 +1,11 @@
+# Два слота прошивки для обновления по сети (mca_ota.c).
+# nvs - на том же месте и того же размера, что в прежней таблице
+# single app: настройки и пароль WiFi переживают смену разметки.
+# phy_init не нужен (CONFIG_ESP_PHY_INIT_DATA_IN_PARTITION выключен).
+# Слоты по 1.875 МБ при прошивке ~1 МБ; всё укладывается в 4 МБ,
+# которые записаны в заголовке (см. sdkconfig.defaults).
+# Name,    Type, SubType, Offset,   Size
+nvs,       data, nvs,     0x9000,   0x6000
+otadata,   data, ota,     0xf000,   0x2000
+ota_0,     app,  ota_0,   0x20000,  0x1E0000
+ota_1,     app,  ota_1,   0x200000, 0x1E0000
