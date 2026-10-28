@@ -107,8 +107,6 @@ window.fetch = function(u){
         rearm:64,search:70,baseline_shift:10,
         baseline_win:150,flat_avg:0,pileup_pre_pct:0,
         pileup_post_pct:0,
-        /* окна во времени, нс, и частота, на которой посчитаны отсчёты */
-        trap_L_ns:2500,trap_G_ns:5500,rearm_ns:8000,search_ns:8750,fhz:8000000,
         /* список частот, как у прибора с генератором LEDC (adc_clk.c) */
         fl:[1000000,2000000,4000000,5000000,6666667,8000000,8888889,
             10000000,11428571,13333333,16000000,20000000]};

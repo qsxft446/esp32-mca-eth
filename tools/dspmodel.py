@@ -59,35 +59,7 @@ class Params:
         self.baseline_shift = 10
         self.baseline_win = 150
         self.flat_avg = 0
-        # окна во времени, нс: в прошивке задаются и хранятся именно они,
-        # а отсчёты выше - их перевод на частоте 8 МГц (windows_at)
-        self.trap_L_ns = 2500
-        self.trap_G_ns = 5500
-        self.search_ns = 8750
-        self.rearm_ns = 8000
         self.__dict__.update(kw)
-
-
-def ns_to_samples(ns, hz):
-    """Порт mca_dsp_ns_to_samples: округление до ближайшего, целочисленно."""
-    if ns <= 0:
-        return 0
-    return (ns * hz + 500000000) // 1000000000
-
-
-def windows_at(p, hz):
-    """Порт params_fix_locked для окон: отсчёты L, G, поиска и перезапуска
-    из времён p.*_ns на частоте hz, с теми же границами, что в прошивке.
-    Меняет p и возвращает его."""
-    p.trap_L = min(max(ns_to_samples(p.trap_L_ns, hz), 1), TRAP_L_MAX)
-    p.trap_G = min(max(ns_to_samples(p.trap_G_ns, hz), 1), TRAP_G_MAX)
-    if p.trap_G <= p.trap_L + 2:
-        p.trap_G = p.trap_L + 3
-    if p.trap_L + p.trap_G >= DSP_TAIL - 4:
-        p.trap_G = DSP_TAIL - 4 - p.trap_L
-    p.search = min(max(ns_to_samples(p.search_ns, hz), 1), 256)
-    p.rearm = max(ns_to_samples(p.rearm_ns, hz), 0)
-    return p
 
 
 class DSP:

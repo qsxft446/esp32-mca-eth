@@ -41,9 +41,6 @@ static const char *TAG = "mca_dsp";
 
 static uint32_t     *s_hist;
 static mca_params_t  s_par;
-/* Частота АЦП, по которой времена окон (*_ns) переводятся в отсчёты.
- * До первого mca_dsp_set_freq - частота по умолчанию. */
-static uint32_t      s_fhz;
 static mca_stats_t   s_st;
 /* БЛОКИРОВКА - СПИН, А НЕ МЬЮТЕКС. Под ней только копии нескольких
  * слов. Раньше был мьютекс, и «Применить» / «Сброс» держали его, пока
@@ -160,10 +157,6 @@ void mca_dsp_init(void)
          * есть это окно, поэтому переносить их числа как L=6, G=15
          * было неверно: мы интегрировали шестую часть от того, что
          * они. Берём L=20 (близко к их 21) и G с запасом на фронт. */
-        /* Окна задаются во ВРЕМЕНИ (поля *_ns ниже), отсчёты
-         * пересчитываются из них. Значения - прежние 20/44/64/70
-         * отсчётов на частоте по умолчанию 8 МГц: на ней обработка
-         * та же, что была. */
         .trap_L          = 20,
         .trap_G          = 44,
         .rearm           = 64,   /* L+G: трапеция возвращается к 0 */
@@ -193,12 +186,7 @@ void mca_dsp_init(void)
          * для всех амплитуд, уходит в калибровку и ширину пиков
          * не портит. */
         .flat_avg        = 0,
-        .trap_L_ns       = 2500,
-        .trap_G_ns       = 5500,
-        .search_ns       = 8750,
-        .rearm_ns        = 8000,
     };
-    s_fhz = mca_freq_table[MCA_FREQ_DEFAULT_IDX];
 
     memset(s_work, 0, sizeof(s_work));
     s_trap = 0; s_state = ST_IDLE;
@@ -856,30 +844,15 @@ void mca_dsp_get_params(mca_params_t *out)
     UNLOCK();
 }
 
-int32_t mca_dsp_ns_to_samples(int32_t ns, uint32_t hz)
+void mca_dsp_set_params(const mca_params_t *in)
 {
-    if (ns <= 0) return 0;
-    return (int32_t)(((int64_t)ns * hz + 500000000LL) / 1000000000LL);
-}
-
-/* Отсчёты окон из времён на частоте s_fhz и границы всех полей. Под LOCK.
- * Времена (*_ns) не трогаем, кроме явно неверных: если окно на этой
- * частоте упёрлось в предел, на другой частоте заданное время снова
- * станет достижимым. Что получилось на деле - видно по отсчётам. */
-static void params_fix_locked(void)
-{
-    if (s_par.trap_L_ns < 1)        s_par.trap_L_ns = 1;
-    if (s_par.trap_L_ns > 1000000)  s_par.trap_L_ns = 1000000;
-    if (s_par.trap_G_ns < 1)        s_par.trap_G_ns = 1;
-    if (s_par.trap_G_ns > 1000000)  s_par.trap_G_ns = 1000000;
-    if (s_par.search_ns < 1)        s_par.search_ns = 1;
-    if (s_par.search_ns > 1000000)  s_par.search_ns = 1000000;
-    if (s_par.rearm_ns < 0)         s_par.rearm_ns = 0;
-    if (s_par.rearm_ns > 1000000)   s_par.rearm_ns = 1000000;
-    s_par.trap_L = mca_dsp_ns_to_samples(s_par.trap_L_ns, s_fhz);
-    s_par.trap_G = mca_dsp_ns_to_samples(s_par.trap_G_ns, s_fhz);
-    s_par.search = mca_dsp_ns_to_samples(s_par.search_ns, s_fhz);
-    s_par.rearm  = mca_dsp_ns_to_samples(s_par.rearm_ns,  s_fhz);
+    /* Под блокировкой - только копия, границы и флаги запросов. Очистку
+     * гистограммы и перезапуск фильтра делает задача обработки
+     * (mca_dsp_service), печать в консоль - после блокировки. */
+    bool prime, clear;
+    LOCK();
+    mca_params_t old = s_par;
+    s_par = *in;
 
     if (s_par.trap_L < 1) s_par.trap_L = 1;
     if (s_par.trap_L > TRAP_L_MAX) s_par.trap_L = TRAP_L_MAX;
@@ -913,18 +886,6 @@ static void params_fix_locked(void)
     if (s_par.int_fall > 400) s_par.int_fall = 400;
     if (s_par.baseline_win < 1)    s_par.baseline_win = 1;
     if (s_par.baseline_win > 4095) s_par.baseline_win = 4095;
-}
-
-void mca_dsp_set_params(const mca_params_t *in)
-{
-    /* Под блокировкой - только копия, границы и флаги запросов. Очистку
-     * гистограммы и перезапуск фильтра делает задача обработки
-     * (mca_dsp_service), печать в консоль - после блокировки. */
-    bool prime, clear;
-    LOCK();
-    mca_params_t old = s_par;
-    s_par = *in;
-    params_fix_locked();
 
     /* Смена L или G меняет саму передаточную функцию: накопленный
      * аккумулятор становится бессмысленным (в нём слагаемые от старых
@@ -942,22 +903,6 @@ void mca_dsp_set_params(const mca_params_t *in)
     UNLOCK();
     if (prime) ESP_LOGI(TAG, "L/G или полярность изменены -> фильтр перезапустится с прогревом");
     if (clear) ESP_LOGI(TAG, "шкала или способ изменены -> спектр будет очищен");
-}
-
-void mca_dsp_set_freq(uint32_t hz)
-{
-    if (!hz) return;
-    LOCK();
-    const int32_t L = s_par.trap_L, G = s_par.trap_G;
-    s_fhz = hz;
-    params_fix_locked();
-    const bool prime = s_par.trap_L != L || s_par.trap_G != G;
-    if (prime) s_req_prime = true;
-    const mca_params_t p = s_par;
-    UNLOCK();
-    ESP_LOGI(TAG, "окна на %.3f МГц: L=%ld G=%ld поиск=%ld перезапуск=%ld отсч.",
-             hz / 1e6, (long)p.trap_L, (long)p.trap_G, (long)p.search,
-             (long)p.rearm);
 }
 
 /* Без блокировки. Страница спектра вызывает это до 16 раз на запрос,

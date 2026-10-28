@@ -247,7 +247,15 @@ static const char PAGE[] =
 "data-en='X axis'>ось X</span>"
 "<span class=seg><button id=bx0 onclick=setX(0) data-en='µs'>мкс</button>"
 "<button id=bx1 onclick=setX(1) data-en='smp'>отсч</button></span>"
-"<span class=lbl title='0 = автоматически' data-en-title='0 = automatic'>Y max</span><input id=ymax type=number value=0></span>"
+"<span class=lbl title='Масштаб по вертикали, как на осциллографе: сколько кодов АЦП в одной клетке, клеток 8. База стоит на первой линии снизу (при импульсах вниз - сверху), импульс выше экрана обрезается, у края - метка. Авто - масштаб по сигналу.' "
+"data-en-title='Vertical scale, as on an oscilloscope: how many ADC codes per division, 8 divisions. The baseline sits on the first line from the bottom (from the top for downward pulses), a pulse above the screen is clipped, with a mark at the edge. Auto - scale from the signal.' "
+"data-en='codes/div'>кодов/клетку</span>"
+"<select id=ydiv onchange=ydivSet()><option value=0 data-en='auto'>авто</option><option value=1>1</option>"
+"<option value=2>2</option><option value=5>5</option><option value=10>10</option><option value=20>20</option>"
+"<option value=50>50</option><option value=100>100</option><option value=200>200</option><option value=500>500</option></select>"
+"<button class='btn sm' id=bfix onclick=bfix() title='Запомнить текущий уровень базы и дальше рисовать от него: база на экране стоит на месте, а её медленный уход виден как сдвиг. Повторное нажатие - снова мерить базу по каждому кадру.' "
+"data-en-title='Remember the current baseline level and draw from it from now on: the baseline stays put on screen, and its slow drift shows as an offset. Press again to measure the baseline from every frame.' "
+"data-en='fix baseline'>зафиксировать базу</button></span>"
 "<label id=g_shs><input type=checkbox id=shset onchange=vis()> <span data-en='settings'>настройки</span></label>"
 "<label id=g_shd title='Тракт АЦП: поток, профиль, журнал потерь, проверка линий данных' "
 "data-en-title='ADC path: stream, profile, loss log, data line check'>"
@@ -305,11 +313,10 @@ static const char PAGE[] =
 "<section class='panel pad' id=g_set>"
 "<div style=overflow-x:auto><table class=ptab id=pbox></table></div>"
 "<div class=grp style=margin-top:10px><button class='btn green' onclick=apply() data-en='Apply'>Применить</button>"
-"<button class='btn amber' onclick=atune() data-en='Tune from signal'>Подобрать по сигналу</button>"
 "<span class=mut style=font-size:11.5px data-en='values go to the device only with this button and are saved in its memory'>"
 "в прибор значения уходят только по этой кнопке и "
 "сохраняются в его памяти</span></div>"
-"<div id=atres class=mut style=font-size:12.5px;margin-top:8px;line-height:1.5></div></section>"
+"</section>"
 /* ДИАГНОСТИКА ТРАКТА АЦП - под галочкой «диагностика», на обеих вкладках
    (раньше - отдельная страница /diag) */
 "<section class='panel pad' id=g_diag>"
@@ -338,11 +345,7 @@ static const char PAGE[] =
    видно, что они есть и что сейчас не действуют. */
 /* Наверху - то, что меняют обычно: частота, порог, полярность и шкала.
    Остальное - в раскрывающемся блоке «Дополнительно» (группы с 1 в
-   третьем элементе): окна подбираются кнопкой «Подобрать по сигналу»,
-   а способ интегрирования и отбраковка нужны в особых случаях.
-   US - окна L, G, поиск и перезапуск: на странице в микросекундах, в
-   приборе - наносекунды (поля *_ns в /cfg), отсчёты на текущей частоте
-   он считает сам. PS - эти отсчёты: по ним страница строит трапецию. */
+   третьем элементе): окна, способ интегрирования и отбраковка. */
 "var GR=["
 "[L('Основное','Main'),["
 "['fq',L('Частота','Sample rate'),'b',L('Частота АЦП. Выше - подробнее форма импульса, но больше нагрузка','ADC sample rate. Higher - more detailed pulse shape, but more load')],"
@@ -354,11 +357,15 @@ static const char PAGE[] =
 "['nch',L('Каналов','Channels'),'b',L('Длина шкалы вправо. Спектр не сбрасывает','Scale length to the right. Does not reset the spectrum')]"
 "]],"
 "[L('Обнаружение импульса','Pulse detection'),["
-"['trap_L',L('Окно L, мкс','Window L, µs'),'b',L('Окно трапеции. При трапеции задаёт ещё и амплитуду','Trapezoid window. With the trapezoid method it also sets the amplitude')],"
-"['trap_G',L('Зазор G, мкс','Gap G, µs'),'b',L('Отступ вычитаемого окна. G−L - длина плоской вершины','Offset of the subtracted window. G−L is the flat-top length')],"
+"['trap_L',L('Окно L','Window L'),'b',L('Окно трапеции, отсч. При трапеции задаёт ещё и амплитуду',"
+"'Trapezoid window, samples. With the trapezoid method it also sets the amplitude')],"
+"['trap_G',L('Зазор G','Gap G'),'b',L('Отступ вычитаемого окна, отсч. G−L - длина плоской вершины',"
+"'Offset of the subtracted window, samples. G−L is the flat-top length')],"
 "['hysteresis',L('Гистерезис %','Hysteresis %'),'b',L('Ниже какой доли порога должна упасть трапеция, чтобы ловить следующий','Fraction of the threshold the trapezoid must drop below before the next pulse is caught')],"
-"['rearm',L('Перезапуск, мкс','Re-arm, µs'),'b',L('Время после поиска пика, когда новые импульсы не ловятся','Time after the peak search during which new pulses are not caught')],"
-"['search',L('Поиск пика, мкс','Peak search, µs'),'b',L('Сколько после порога искать вершину','How long after the threshold to search for the peak')]"
+"['rearm',L('Перезапуск','Re-arm'),'b',L('Отсч. после пика, когда новые импульсы не ловятся',"
+"'Samples after the peak during which new pulses are not caught')],"
+"['search',L('Поиск пика','Peak search'),'b',L('Сколько отсч. после порога искать вершину',"
+"'How many samples after the threshold to search for the peak')]"
 "],1],"
 "[L('Амплитуда','Amplitude'),["
 "['algo',L('Способ измерения','Method'),'',L('Трапеция или интегрирование. Смена очищает спектр','Trapezoid or integration. Changing it clears the spectrum')],"
@@ -375,7 +382,6 @@ static const char PAGE[] =
 "[L('Связь с программами на ПК','PC software link'),["
 "['emu',L('Эмуляция MCA на COM','MCA emulation on COM'),'b',L('Порт UART0 отвечает по протоколу shproto (BecqMoni и др.). Консоль при этом молчит','UART0 answers using the shproto protocol (BecqMoni etc.). The console goes silent')]"
 "],1]];"
-"var US={trap_L:1,trap_G:1,rearm:1,search:1},PS={trap_L:20,trap_G:44};"
 /* fq и emu - не параметры обработки: уходят в прибор сразу, своими запросами */
 "var P=[];GR.forEach(function(g){g[1].forEach(function(r){if(r[0]!='fq'&&r[0]!='emu')P.push(r[0])})});"
 /* пометка только у параметров одного способа; без пометки - действует всегда */
@@ -388,8 +394,8 @@ static const char PAGE[] =
 "var H={"
 "emu:L('Эмуляция анализатора на последовательном порту UART0 - разъём UART/COM на плате (не встроенный USB). Прибор отвечает по бинарному протоколу shproto, и программы на ПК, умеющие работать с такими анализаторами (например, BecqMoni), видят его как MCA: набор, остановка, сброс, выгрузка спектра и статуса, калибровка. Скорость порта выбирается здесь, действует сразу и сохраняется. Пока эмуляция включена, консоль молчит: сообщения прошивки на порт не идут. Программе отдаётся столько каналов, сколько выбрано в «Каналов»: в BecqMoni выставьте то же число каналов, тогда они совпадут с прибором один в один. Заводские команды настройки из программы не принимаются - параметры задаются на этой странице.',"
 "'Analyzer emulation on the serial port UART0 - the UART/COM connector on the board (not the native USB). The device answers using the binary shproto protocol, and PC programs that work with such analyzers (for example, BecqMoni) see it as an MCA: start, stop, reset, spectrum and status upload, calibration. The port speed is selected here, takes effect immediately and is saved. While emulation is on, the console is silent: firmware messages are not sent to the port. The program receives as many channels as selected in “Channels”: set the same number of channels in BecqMoni, then they match the device one to one. Factory tuning commands from the program are not accepted - parameters are set on this page.'),"
-"fq:L('Частота семплирования АЦП. Выше - подробнее форма импульса, но обработка может не успевать: смотрите потерянные чанки под галочкой «диагностика». По замеру на этой плате (около 3500 имп/с) обработка спектра занимает около 70 % ядра на 16 МГц и около 90 % на 20 МГц; при большем счёте нагрузка выше. Окна фильтра (L, G, поиск пика, перезапуск) заданы во времени: при смене частоты прибор сам пересчитывает их в отсчёты.',"
-"'ADC sample rate. Higher - more detailed pulse shape, but processing may not keep up: watch lost chunks under the “diagnostics” checkbox. Measured on this board (about 3500 cps), spectrum processing takes about 70 % of the core at 16 MHz and about 90 % at 20 MHz; with a higher count rate the load is higher. Filter windows (L, G, peak search, re-arm) are set in time: when the rate changes, the device converts them to samples itself.'),"
+"fq:L('Частота семплирования АЦП. Выше - подробнее форма импульса, но обработка может не успевать: смотрите потерянные чанки под галочкой «диагностика». По замеру на этой плате (около 3500 имп/с) обработка спектра занимает около 70 % ядра на 16 МГц и около 90 % на 20 МГц; при большем счёте нагрузка выше. Параметры фильтра заданы в отсчётах, поэтому на другой частоте то же L или G - другое время.',"
+"'ADC sample rate. Higher - more detailed pulse shape, but processing may not keep up: watch lost chunks under the “diagnostics” checkbox. Measured on this board (about 3500 cps), spectrum processing takes about 70 % of the core at 16 MHz and about 90 % at 20 MHz; with a higher count rate the load is higher. Filter parameters are set in samples, so at another rate the same L or G is a different time.'),"
 "polarity:L('0 - импульсы вверх от базовой линии, 1 - вниз (например, анод ФЭУ напрямую). При 1 сигнал переворачивается ещё до обработки, и порог и спектр работают как с импульсами вверх; осциллограф синхронизируется по фронту вниз. Постоянная составляющая сигнала на обработку не влияет - её вычитает трапеция.',"
 "'0 - pulses go up from the baseline, 1 - down (for example, PMT anode directly). With 1 the signal is inverted before processing, so the threshold and spectrum work as with upward pulses; the oscilloscope triggers on a falling edge. A DC offset of the signal does not affect processing - the trapezoid subtracts it.'),"
 "algo:L('Трапеция: амплитуда по вершине трапеции (окно L, зазор G, по желанию среднее по плато). Интегрирование: среднее отсчётов импульса вокруг вершины за вычетом базовой линии (до и после вершины, база 2^N, окно базы). Поля, которые при выбранном способе ни на что не влияют, в таблице приглушены. Обнаружение события в обоих способах одинаковое - по выходу трапеции, поэтому L, G, порог, гистерезис, перезапуск и поиск пика нужны всегда. Масштабы способов различаются - после переключения подберите «Кодов на канал». Смена способа очищает спектр.',"
@@ -406,14 +412,14 @@ static const char PAGE[] =
 "'Threshold on the trapezoid output, IN ADC CODES (normalized to the window length, so it does not depend on L). Set above the trapezoid noise - see the “filter noise” line on the “Oscilloscope” tab.'),"
 "hysteresis:L('Доля порога В ПРОЦЕНТАХ, ниже которой должна опуститься трапеция, чтобы детектор снова взвёлся. 50 означает половину порога. Прежний вариант вычитал единицу, что означало почти полное отсутствие гистерезиса.',"
 "'Fraction of the threshold IN PERCENT that the trapezoid must drop below before the detector re-arms. 50 means half the threshold. The previous version subtracted one, which meant almost no hysteresis.'),"
-"trap_L:L('Длина окна интегрирования, в микросекундах: какой отрезок импульса суммируется. Именно это окно определяет, какая часть импульса пойдёт в амплитуду, и насколько усреднится шум. Прибор переводит время в отсчёты на текущей частоте АЦП - сколько вышло, видно справа; при смене частоты пересчёт идёт сам. ВНИМАНИЕ: в приборах, где окно задаётся парой RISE и FALL в отсчётах, окно интегрирования - это их сумма: RISE=6 FALL=15 - это 21 отсчёт, на 7 МГц 3 мкс. При интегрировании L и G тоже работают: по трапеции находится импульс и место его вершины. Подобрать по форме импульса - кнопка «Подобрать по сигналу».',"
-"'Integration window length, in microseconds: which stretch of the pulse is summed. This window determines which part of the pulse goes into the amplitude and how much the noise is averaged. The device converts the time to samples at the current ADC rate - the result is shown on the right; when the rate changes, it is recalculated automatically. NOTE: in devices where the window is set by a RISE and FALL pair in samples, the integration window is their sum: RISE=6 FALL=15 is 21 samples, 3 µs at 7 MHz. With integration L and G also work: the trapezoid finds the pulse and its peak position. To fit it to the pulse shape - the “Tune from signal” button.'),"
-"trap_G:L('На сколько микросекунд назад отстоит второе окно, которое вычитается. Оно должно целиком лежать на базовой линии ДО импульса, поэтому G обязан быть больше L плюс время от начала импульса до вершины. Разность G минус L даёт длину плоской вершины.',"
-"'How many microseconds back the second, subtracted window is. It must lie entirely on the baseline BEFORE the pulse, so G must be greater than L plus the time from the pulse start to its peak. G minus L gives the flat-top length.'),"
-"rearm:L('Сколько микросекунд после конца поиска пика детектор не взводится, даже если трапеция уже опустилась ниже гистерезиса. Защита от повторного срабатывания на хвосте того же импульса. Это НЕ метрика потерь, а параметр перезапуска детектора.',"
-"'How many microseconds after the end of the peak search the detector does not re-arm, even if the trapezoid has already dropped below the hysteresis. Protection against a second trigger on the tail of the same pulse. This is NOT a loss metric but a detector re-arm parameter.'),"
-"search:L('Сколько микросекунд после срабатывания порога искать максимум трапеции. Должно накрывать вершину трапеции и у импульсов у самого порога: у них порог срабатывает позже.',"
-"'How many microseconds after the threshold crossing to search for the trapezoid maximum. Must cover the trapezoid top even for pulses near the threshold: they cross it later.'),"
+"trap_L:L('Длина окна интегрирования: сколько отсчётов импульса суммируется. Именно это окно определяет, какая часть импульса пойдёт в амплитуду, и насколько усреднится шум. ВНИМАНИЕ: в приборах, где окно задаётся парой RISE и FALL, окно интегрирования - это их сумма: RISE=6 FALL=15 соответствует нашему L=21. При интегрировании L и G тоже работают: по трапеции находится импульс и место его вершины.',"
+"'Integration window length: how many pulse samples are summed. This window determines which part of the pulse goes into the amplitude and how much the noise is averaged. NOTE: in devices where the window is set by a RISE and FALL pair, the integration window is their sum: RISE=6 FALL=15 corresponds to our L=21. With integration L and G also work: the trapezoid finds the pulse and its peak position.'),"
+"trap_G:L('На сколько отсчётов назад отстоит второе окно, которое вычитается. Оно должно целиком лежать на базовой линии ДО импульса, поэтому G обязан быть больше L плюс длительность фронта. Разность G минус L даёт длину плоской вершины.',"
+"'How many samples back the second, subtracted window is. It must lie entirely on the baseline BEFORE the pulse, so G must be greater than L plus the rise time. G minus L gives the flat-top length.'),"
+"rearm:L('Сколько отсчётов жёстко пропустить после пика, независимо от гистерезиса. Защита от дребезга на спадающем хвосте. Это НЕ метрика потерь, а параметр перезапуска детектора.',"
+"'How many samples to skip unconditionally after the peak, regardless of hysteresis. Protection against chatter on the falling tail. This is NOT a loss metric but a detector re-arm parameter.'),"
+"search:L('Сколько отсчётов после срабатывания порога перебирать в поисках максимума трапеции. Должно накрывать весь импульс.',"
+"'How many samples after the threshold crossing to search for the trapezoid maximum. Must cover the whole pulse.'),"
 "baseline_shift:L('Только для интегрирования: трапеция вычитает базу сама. Постоянная времени фильтра, отслеживающего нулевой уровень. Больше значение - медленнее и плавнее подстройка. Обычно 8-12.',"
 "'Integration only: the trapezoid subtracts the baseline itself. Time constant of the filter that tracks the zero level. Larger value - slower and smoother tracking. Usually 8-12.'),"
 "flat_avg:L('Только для трапеции. 1 = амплитуда как среднее по плоской вершине трапеции, 0 = по максимуму. Проверено симуляцией: усреднение выигрывает ТОЛЬКО при длинном плато (G минус L не меньше 19). При коротком плато максимум даёт даже меньший разброс, поэтому при (G-L) меньше 16 происходит автоматический откат на максимум. Смещение максимума растёт с шумом, но это постоянный сдвиг для всех амплитуд - уходит в калибровку, ширину пиков не портит.',"
@@ -426,8 +432,12 @@ static const char PAGE[] =
 "'If AFTER the peak the trapezoid has not dropped below this percentage - the next pulse piled up on this one, reject. Lower percentage - stricter rejection.'),"
 "};"
 "var fs=document.createElement('select');fs.id='fq';fs.onchange=setfreq;"
-"function fillFq(){fs.innerHTML='';FHZ.forEach(function(h,i){"
-"var o=document.createElement('option');o.value=i;o.text=fqName(h);fs.add(o)})}"
+/* Пересборка списка сбрасывала выбор на первый пункт: после «Применить»
+   на экране стояло 1 МГц, хотя прибор работал на другой частоте. Ставим
+   пункт, ближайший к частоте прибора (REALHZ из /stat). */
+"function fillFq(){fs.innerHTML='';var bi=0,bd=1e18;FHZ.forEach(function(h,i){"
+"var o=document.createElement('option');o.value=i;o.text=fqName(h);fs.add(o);"
+"var d=Math.abs(h-(window.REALHZ||0));if(d<bd){bd=d;bi=i}});if(FHZ.length)fs.value=bi}"
 /* строки таблицы: подпись (подробная подсказка - при наведении), поле,
    на какой способ влияет, коротко что делает */
 "var pt='',adv0=0;"
@@ -438,10 +448,10 @@ static const char PAGE[] =
 "if(k=='fq')c='<span id=fqslot></span>';"
 "else if(SEL[k])c='<select id=p_'+k+'>'+SEL[k].map(function(o){"
 "return '<option value='+o[0]+'>'+o[1]+'</option>'}).join('')+'</select>';"
-"else c='<input id=p_'+k+' type=number'+(k=='cpc'?' step=0.05':US[k]?' step=0.01':'')+'>';"
+"else c='<input id=p_'+k+' type=number'+(k=='cpc'?' step=0.05':'')+'>';"
 "pt+='<tr id=w_'+k+a+'><td><label title=\"'+(H[k]||'').replace(/\"/g,'&quot;')+'\">'+r[1]+'</label></td>'+"
 "'<td>'+c+'</td><td>'+(b?'<span class=\"bdg '+b[1]+'\">'+b[0]+'</span>':'')+'</td>'+"
-"'<td>'+r[3]+(US[k]?' <b id=e_'+k+'></b>':'')+'</td></tr>'})});"
+"'<td>'+r[3]+'</td></tr>'})});"
 "var pb=document.getElementById('pbox');pb.innerHTML=pt;"
 /* «Дополнительно» свёрнуто по умолчанию; состояние помнит браузер */
 "var ADV=0;try{ADV=localStorage.getItem('adv')=='1'}catch(e){}"
@@ -488,9 +498,7 @@ static const char PAGE[] =
    команды, возвращал бы список обратно, и пункт дёргался бы. */
 "function setmode(){window.MDLOCK=Date.now()+1500;"
 "fetch('/cfg?mode='+document.getElementById('md').value)}"
-/* окна заданы во времени: на новой частоте у них другие отсчёты -
-   прибор пересчитает, страница перечитает /cfg */
-"function setfreq(){fetch('/cfg?freq='+fs.value).then(function(){setTimeout(ldcfg,700)})}"
+"function setfreq(){fetch('/cfg?freq='+fs.value)}"
 /* эмуляция MCA на COM: включается сразу, с подтверждением - консоль замолчит */
 "function setemu(){var e=document.getElementById('p_emu'),v=e.value;"
 "if(v!='0'&&!confirm(L('Включить эмуляцию MCA на порту UART0, ','Enable MCA emulation on UART0 at ')+v+"
@@ -498,113 +506,13 @@ static const char PAGE[] =
 "{e.value=window.EMU||'0';return}window.EMU=v;fetch('/cfg?emu='+v)}"
 /* «Кодов на канал» прибор хранит в тысячных: 0.5 уходит как 500 */
 "function apply(){var q=P.map(function(k){var v=document.getElementById('p_'+k).value;"
-"return k=='cpc'?'cpc='+Math.round(v*1000):US[k]?k+'_ns='+Math.round(v*1000):k+'='+v}).join('&');"
+"return k=='cpc'?'cpc='+Math.round(v*1000):k+'='+v}).join('&');"
 "fetch('/cfg?'+q).then(function(r){return r.json()}).then(fillCfg).catch(function(){})}"
 "function fillCfg(p){if(p.fl){FHZ=p.fl;fillFq()}"
 "if(p.emu!==undefined){window.EMU=String(p.emu);document.getElementById('p_emu').value=window.EMU}"
-"P.forEach(function(k){document.getElementById('p_'+k).value=k=='cpc'?p[k]/1000:US[k]?+(p[k+'_ns']/1000).toFixed(3):p[k]});"
-"PS={trap_L:p.trap_L,trap_G:p.trap_G};effShow(p);showFields();cpcTop()}"
-"function effShow(p){for(var k in US){var e=document.getElementById('e_'+k);if(!e||!p.fhz)continue;"
-"var us=p[k]*1e6/p.fhz,w=Math.abs(p[k]*1e9/p.fhz-p[k+'_ns'])>5e8/p.fhz+1;"
-"e.textContent='= '+p[k]+L(' отсч.',' smp')+(w?L(' (на этой частоте предел: ',' (limit at this rate: ')+(+us.toFixed(3))+L(' мкс)',' µs)'):'');"
-"e.style.color=w?'#f0c45a':''}}"
+"P.forEach(function(k){document.getElementById('p_'+k).value=k=='cpc'?p[k]/1000:p[k]});"
+"showFields();cpcTop()}"
 "function ldcfg(){fetch('/cfg').then(function(r){return r.json()}).then(fillCfg).catch(function(){})}"
-/* ПОДБОР ПО СИГНАЛУ. Страница переводит прибор в осциллограф, снимает до
-   60 кадров по 4096 отсчётов и считает (tuneCalc - чистая функция, её же
-   гоняет tools/test_dsp.py, уровень 11):
-   - база и шум отсчёта - медиана и MAD;
-   - импульсы выше базы на 8 шумов; чистые - без наложений и выхода за
-     шкалу; по ним фронт (начало -> вершина, Tp) и спад до 1/e (tau);
-   - L = 1.2 Tp: окно накрывает вершину. Длиннее разрешение не улучшает,
-     когда шум трапеции много меньше ширины пиков (замер 2026-10-28: L
-     14/20/28 отсч. на 16 МГц дали 6.9-7.0 %), а наложений больше;
-   - G = L + Tp + запас: вычитаемое окно целиком до начала импульса;
-   - порог - по шуму трапеции вне импульсов: 8 сигм и полтора максимума;
-   - поиск - 95 % времени от порога до вершины трапеции плюс запас;
-     перезапуск - пока трапеция импульса не опустится ниже гистерезиса
-     (95 %). Повторный подъём выше порога после этого - почти всегда уже
-     новый импульс (замер 2026-10-28: 9 из 10), его надо считать, а не
-     глушить; прежнее правило «пока выше порога» растянуло перезапуск
-     до 13 мкс. */
-"function tuneCalc(F,fh,pol,hy){"
-"var X=F.map(function(d){return pol?d.map(function(v){return 4095-v}):d}),i,k;"
-"function med(v){var q=v.slice().sort(function(x,y){return x-y}),n=q.length;return n?(n&1?q[n>>1]:(q[n/2-1]+q[n/2])/2):0}"
-"function pc(v,p){var q=v.slice().sort(function(x,y){return x-y});return q.length?q[Math.min(q.length-1,Math.floor(p*q.length))]:0}"
-"var sm=[];X.forEach(function(d){for(i=0;i<d.length;i+=5)sm.push(d[i])});"
-"var base=med(sm),dv=[];sm.forEach(function(v){if(Math.abs(v-base)<64)dv.push(Math.abs(v-base))});"
-"var sig=Math.max(0.5,1.4826*med(dv)),lev=base+Math.max(8*sig,8),E=[];"
-"X.forEach(function(d,fi){var n=d.length,j=1,pe=-1e9;"
-"while(j<n){if(!(d[j]>lev&&d[j-1]<=lev)){j++;continue}"
-"var s=j;while(s>0&&d[s-1]>base+2*sig&&j-s<64)s--;"
-"var pk=j;for(k=j;k<n&&k<j+512&&d[k]>lev;k++)if(d[k]>d[pk])pk=k;"
-"var A=d[pk]-base,te=-1,end=-1,mn=d[pk],pile=s-pe<16;"
-"for(k=pk+1;k<n;k++){if(d[k]<mn)mn=d[k];"
-"if(d[k]-mn>Math.max(6*sig,0.15*A)){pile=true;end=k;break}"
-"if(te<0&&d[k]-base<=A/Math.E)te=k;if(d[k]-base<=0.1*A){end=k;break}}"
-"var q1=-1,q9=-1;for(k=s;k<=pk;k++){if(q1<0&&d[k]-base>=0.1*A)q1=k;if(d[k]-base>=0.9*A){q9=k;break}}"
-"E.push({f:fi,s:s,pk:pk,A:A,tp:pk-s,rise:q9-q1,tau:te<0?-1:te-pk,end:end<0?n:end,"
-"ok:!pile&&end>0&&te>0&&d[pk]<4094&&s>4&&A>=Math.max(20*sig,30)});"
-"pe=end<0?n:end;j=pe+1}});"
-"for(i=0;i<E.length;i++)E[i].nx=i+1<E.length&&E[i+1].f==E[i].f?E[i+1].s:1e9;"
-"var C=E.filter(function(e){return e.ok}),r={n:C.length,all:E.length,base:base,sig:sig,fh:fh,ok:false};"
-"if(C.length<20)return r;"
-"var Tp=Math.max(1,Math.round(med(C.map(function(e){return e.tp})))),tau=med(C.map(function(e){return e.tau}));"
-"r.Tp=Tp;r.rise=med(C.map(function(e){return e.rise}));r.tau=tau;"
-"var Lw=Math.min(64,Math.max(2,Math.round(1.2*Tp))),Gw=Lw+Tp+Math.max(2,Math.round(0.2*Tp));"
-"if(Gw>128)Gw=128;if(Lw+Gw>195)Gw=195-Lw;"
-"var Y=X.map(function(d){return trapOf(d,Lw,Gw)}),nz=[],mx=0;"
-"X.forEach(function(d,fi){var n=d.length,bad=new Uint8Array(n),w=Lw+Gw+8,h=base+3*sig,la=-1e9;"
-"for(k=0;k<n;k++){if(d[k]>h)la=k;if(k-la<=w)bad[k]=1}"
-"la=1e9;for(k=n-1;k>=0;k--){if(d[k]>h)la=k;if(la-k<=w)bad[k]=1}"
-"for(k=w;k<n;k++)if(!bad[k]){var y=Y[fi][k];nz.push(y);if(y>mx)mx=y}});"
-"var m0=med(nz),big=nz.length>500,sT=big?1.4826*med(nz.map(function(y){return Math.abs(y-m0)})):sig*Math.sqrt(2/Lw);"
-"var thr=Math.max(3,Math.ceil(8*sT),Math.ceil(1.5*(big?mx:5*sT)));"
-"var dS=[],dR=[];"
-"C.forEach(function(e){var y=Y[e.f],n=y.length,c=-1;"
-"for(k=e.s;k<Math.min(n,e.s+Lw+Gw+Tp+64);k++)if(y[k]>thr){c=k;break}"
-"if(c<Lw+Gw)return;var m=c,lim=Math.min(n,c+Lw+Gw+2*Tp);"
-"for(k=c;k<lim;k++)if(y[k]>y[m])m=k;"
-"var lo=thr*(hy||50)/100,k2=m;while(k2<n&&y[k2]>=lo)k2++;if(k2>=n)return;"
-"dS.push(m-c);dR.push(k2-c)});"
-"if(dS.length<10)return r;"
-"var sr=Math.ceil(pc(dS,0.95))+Math.max(2,Math.round(0.1*Lw)),re=Math.max(0,Math.ceil(pc(dR,0.95))-sr)+2;"
-"function ns(x){return Math.round(x*1e9/fh)}"
-"r.ok=true;r.sigT=sT;r.thr=thr;r.L=Lw;r.G=Gw;r.search=sr;r.rearm=re;"
-"r.L_ns=ns(Lw);r.G_ns=ns(Gw);r.search_ns=ns(sr);r.rearm_ns=ns(re);"
-"r.below=E.filter(function(e){return e.A<thr}).length;return r}"
-"function atune(){if(window.ATUNE)return;"
-"if(!confirm(L('Прибор на несколько секунд перейдёт в режим осциллографа (набор спектра на это время встанет), снимет импульсы и предложит окна и порог. Продолжить?',"
-"'The device will switch to the oscilloscope for a few seconds (spectrum acquisition pauses), capture pulses and suggest the windows and threshold. Continue?')))return;"
-"var o=document.getElementById('atres'),fr=[],seen={},t0=0,st=null;"
-"window.ATUNE=1;o.textContent=L('снимаю импульсы...','capturing pulses...');"
-"function back(){var q=[];if(st&&st.mode!=1)q.push(fetch('/cfg?mode='+st.mode));if(st&&!st.srun)q.push(fetch('/cmd?do=scope_stop'));"
-"return Promise.all(q).catch(function(){}).then(function(){window.ATUNE=0})}"
-"function grab(){return fetch('/scope?n=4096&pre=0').then(function(r){return r.arrayBuffer()}).then(function(b){"
-"if(b.byteLength>=28){var d=sparse(b).d,key=d.length+':'+d[1]+':'+d[1000]+':'+d[3000];if(d.length>=2048&&!seen[key]){seen[key]=1;fr.push(d)}}"
-"if(fr.length<60&&Date.now()-t0<10000)return new Promise(function(res){setTimeout(res,150)}).then(grab)})}"
-"fetch('/stat').then(function(r){return r.json()}).then(function(j){st=j;return fetch('/cfg?mode=1')})"
-".then(function(){return fetch('/cmd?do=scope_start')}).then(function(){return new Promise(function(res){setTimeout(res,600)})})"
-".then(function(){t0=Date.now();return grab()}).then(function(){"
-"var r=tuneCalc(fr,st.freq,+document.getElementById('p_polarity').value,+document.getElementById('p_hysteresis').value);"
-"return back().then(function(){atShow(r)})}).catch(function(e){back();o.textContent=L('не удалось: ','failed: ')+e})}"
-"function atShow(r){var o=document.getElementById('atres');window.ATR=r;"
-"function f(x){return +x.toFixed(2)}function us(x){return +(x/1000).toFixed(3)}"
-"if(!r.ok){o.textContent=L('Подобрать не удалось: чистых импульсов ','Could not tune: clean pulses ')+r.n+L(' из ',' of ')+r.all+"
-"L(' (нужно не меньше 20). ',' (at least 20 are needed). ')+(r.all<5?L('Импульсов почти нет: проверьте сигнал и полярность.',"
-"'There are almost no pulses: check the signal and the polarity.'):L('Мешают наложения или выход за шкалу АЦП.','Pile-ups or ADC overrange get in the way.'));return}"
-"o.innerHTML=L('Импульсов ','Pulses ')+r.all+L(', чистых ',', clean ')+r.n+'. '+L('Шум ','Noise ')+f(r.sig)+"
-"L(' кода на отсчёт, у трапеции ',' codes per sample, on the trapezoid ')+f(r.sigT)+'. '+"
-"L('От начала до вершины ','Start to peak ')+us(r.Tp*1e9/r.fh)+L(' мкс, спад τ ',' µs, decay τ ')+us(r.tau*1e9/r.fh)+L(' мкс.',' µs.')+'<br>'+"
-"L('Предлагаю: ','Suggested: ')+'L '+us(r.L_ns)+', G '+us(r.G_ns)+L(', поиск ',', search ')+us(r.search_ns)+"
-"L(', перезапуск ',', re-arm ')+us(r.rearm_ns)+L(' мкс, порог ',' µs, threshold ')+r.thr+"
-"(r.below?L('. Ниже порога было импульсов: ','. Pulses below the threshold: ')+r.below:'')+"
-"' <button class=\"btn sm green\" onclick=atSet()>'+L('Поставить','Set')+'</button>'}"
-"function atSet(){var r=window.ATR;if(!r||!r.ok)return;"
-"document.getElementById('p_trap_L').value=r.L_ns/1000;document.getElementById('p_trap_G').value=r.G_ns/1000;"
-"document.getElementById('p_search').value=r.search_ns/1000;document.getElementById('p_rearm').value=r.rearm_ns/1000;"
-"document.getElementById('p_threshold').value=r.thr;apply();"
-"document.getElementById('atres').innerHTML+=' '+L('поставлено и применено','set and applied')}"
-
 "var cv=document.getElementById('cv'),cx=cv.getContext('2d');"
 /* Поле графика: сверху TOPM, снизу BOTM под шкалу каналов.
    Обе функции обязаны считать высоту одинаково, иначе кривая
@@ -653,13 +561,13 @@ static const char PAGE[] =
 "cx.textAlign='left'}"
 "cx.strokeStyle='#283024';cx.lineWidth=1;cx.strokeRect(0.5,TOPM+0.5,W-1,plotH(H));"
 "if(lbl){cx.fillStyle='#6b756a';cx.fillText(lbl,W-150,TOPM+11)}}"
-"function gridS(W,H,ymn,ymx,ns,lbl,us,x0){"
+"function gridS(W,H,ymn,ymx,ns,lbl,us,x0,nd){nd=nd||5;"
 "cx.font='11px ui-monospace,monospace';"
-/* горизонтальные линии с подписями амплитуды */
-"for(var k=0;k<=5;k++){var y=10+k*(H-30)/5;"
+/* горизонтальные линии с подписями амплитуды; nd - число клеток */
+"for(var k=0;k<=nd;k++){var y=10+k*(H-30)/nd;"
 "cx.strokeStyle='rgba(255,255,255,.05)';cx.beginPath();cx.moveTo(28,y);cx.lineTo(W,y);"
 "cx.stroke();cx.fillStyle='#6b756a';"
-"cx.fillText(Math.round(ymx-(ymx-ymn)*k/5),2,y+4)}"
+"cx.fillText(Math.round(ymx-(ymx-ymn)*k/nd),2,y+4)}"
 /* вертикальные линии: по времени, если известен шаг отсчёта
    (us - микросекунд на отсчёт), иначе по номерам отсчётов. Номера
    считаются от x0 - индекса момента синхронизации (x0 < 0 - без
@@ -709,13 +617,22 @@ static const char PAGE[] =
 /* «вся шкала» - настоящий диапазон АЦП 0..4095 в выбранном отсчёте;
    иначе - по данным. При отсчёте не от базы ноль оси далеко от сигнала,
    и тянуть к нему масштаб нельзя. */
-"var ym=+document.getElementById('ymax').value,ymn;"
+/* «кодов/клетку»: 8 клеток, база (o.b0 - где она в координатах графика)
+   на первой линии снизу, при импульсах вниз - сверху. Масштаб от кадра к
+   кадру не меняется, поэтому база стоит на месте; что не влезло в
+   экран, обрезается по краю, и рядом пишется, насколько вышло. */
+"var cd=+document.getElementById('ydiv').value||0,ym,ymn,nd=5;"
 "if(fx){ym=4095-bl;ymn=-bl}"
-"else if(o.abs){var sp=Math.max(8,smx-smn);if(!ym||ym<=0)ym=Math.ceil(smx+sp*0.15);"
+"else if(cd>0){var b0=o.b0||0;nd=8;if(NEG()){ym=b0+cd;ymn=ym-8*cd}else{ymn=b0-cd;ym=ymn+8*cd}}"
+"else if(o.abs){var sp=Math.max(8,smx-smn);ym=Math.ceil(smx+sp*0.15);"
 "ymn=Math.floor(smn-sp*0.15)}"
-"else{if(!ym||ym<=0)ym=Math.max(8,Math.ceil(smx*1.2/5)*5);ymn=Math.min(-4,Math.round(smn*1.2))}"
-"gridS(W,H,ymn,ym,a.length-1,o.us?'':L('отсчёты от базовой линии','samples from baseline'),o.xs?0:o.us,o.tg);"
-"lineS(sig,'#34d3c0',ymn,ym,W,H,1.2);"
+"else{ym=Math.max(8,Math.ceil(smx*1.2/5)*5);ymn=Math.min(-4,Math.round(smn*1.2))}"
+"gridS(W,H,ymn,ym,a.length-1,o.us?'':L('отсчёты от базовой линии','samples from baseline'),o.xs?0:o.us,o.tg,nd);"
+"var cs=sig.map(function(v){return v>ym?ym:(v<ymn?ymn:v)});"
+"lineS(cs,'#34d3c0',ymn,ym,W,H,1.2);"
+"cx.fillStyle='#f0c45a';"
+"if(smx>ym)cx.fillText('▲ '+L('выше экрана: до ','above the screen: up to ')+Math.round(smx),34,22);"
+"if(smn<ymn)cx.fillText('▼ '+L('ниже экрана: до ','below the screen: down to ')+Math.round(smn),34,H-26);"
 /* метка момента синхронизации */
 "if(o.tg>=0){var xt=28+o.tg*(W-30)/Math.max(1,a.length-1);"
 "cx.strokeStyle='#6ea8ff';cx.setLineDash([3,3]);cx.beginPath();"
@@ -797,7 +714,7 @@ static const char PAGE[] =
 "var fh=window.REALHZ||8e6,tg=j.tg;window.LASTJ=j;window.LASTW=wait;"
 /* wL/wG, а не L/G: локальное L перекрыло бы функцию перевода L(), и весь
    текст под графиком пропадал (исключение глотал опрос прибора) */
-"var wL=PS.trap_L,wG=PS.trap_G;"
+"var wL=+document.getElementById('p_trap_L').value,wG=+document.getElementById('p_trap_G').value;"
 "var Wn=Math.min(+document.getElementById('zm').value||512,a.length);"
 /* без синхронизации пропускаем запас слева: там трапеция ещё не встала */
 "var st=tg>=0?tg-Math.round(Wn*0.2):(wL|0)+(wG|0)+16;"
@@ -808,8 +725,10 @@ static const char PAGE[] =
 "for(var i=0;i<e;i++)bl+=a[i];bl/=e;"
 "for(var i=0;i<e;i++)nv+=(a[i]-bl)*(a[i]-bl);var sd=Math.sqrt(nv/e);"
 /* отсчёт оси: от базы, от середины шкалы или от нуля кодов */
-"var R=window.YREF|0,ref=R==0?bl:(R==1?2048:0),da=a.slice(st,st+Wn);"
-"var rr=draw2(da,document.getElementById('fx').checked,{bl:ref,abs:R!=0,"
+/* B - уровень базы, от которого рисуем: зафиксированный кнопкой или
+   измеренный по этому кадру; b0 - где он на оси Y при выбранном отсчёте */
+"var R=window.YREF|0,B=window.BFIX||bl,ref=R==0?B:(R==1?2048:0),da=a.slice(st,st+Wn);"
+"var rr=draw2(da,document.getElementById('fx').checked,{bl:ref,b0:B-ref,abs:R!=0,"
 "us:1e6/fh,xs:window.XAX==1,tg:tg>=0?tg-st:-1});"
 /* кадр для линейки: z - индекс момента синхронизации на экране */
 "window.SCV={n:Wn,z:tg>=0?tg-st:0,W:cv.width,a:da,sg:NEG()?-1:1,us:1e6/fh,bl:bl};"
@@ -835,7 +754,7 @@ static const char PAGE[] =
 "(window.SFPS?L(' &nbsp; обновление ',' &nbsp; refresh ')+window.SFPS+L(' раз/с','/s'):'')+"
 /* поток осциллографа и чем он идёт */
 "(window.SKBPS?' &nbsp; '+L('поток ','stream ')+window.SKBPS+L(' кбит/с',' kbit/s')+' ('+(WSOK?'WebSocket':'HTTP')+')':'')+"
-"L('<br>сигнал: мин ','<br>signal: min ')+mn+L('  макс ','  max ')+mx+L('  база ','  baseline ')+bl.toFixed(0)+L('  шум(СКО) ','  noise(RMS) ')+sd.toFixed(1)+"
+"L('<br>сигнал: мин ','<br>signal: min ')+mn+L('  макс ','  max ')+mx+L('  база ','  baseline ')+bl.toFixed(0)+(window.BFIX?L(' (зафиксирована ',' (fixed at ')+window.BFIX+L(', сдвиг ',', drift ')+((bl-window.BFIX)>=0?'+':'')+(bl-window.BFIX).toFixed(1)+')':'')+L('  шум(СКО) ','  noise(RMS) ')+sd.toFixed(1)+"
 "((mx>=4095||mn<=0)?'  <b style=color:#ff8a82>'+L('упор в шкалу АЦП','ADC scale clipped')+'</b>':'')+"
 /* сколько места осталось от базы до потолка и пола шкалы */
 "L('<br>запас по шкале от базы: вверх <b>','<br>headroom from baseline: up <b>')+(4095-Math.round(bl))+L('</b>, вниз <b>','</b>, down <b>')+"
@@ -928,11 +847,18 @@ static const char PAGE[] =
 "for(var i=0;i<2;i++)document.getElementById('bx'+i).className=i==v?'on':'';"
 "try{localStorage.setItem('mca_xax',v)}catch(e){}}"
 "function NEG(){var e=document.getElementById('p_polarity');return !!(e&&+e.value==1)}"
+/* кодов на клетку - запоминает браузер; база фиксируется до повторного нажатия */
+"function ydivSet(){try{localStorage.setItem('mca_ydiv',document.getElementById('ydiv').value)}catch(e){}scRedraw()}"
+"function bfix(){var g=window.SCV;window.BFIX=window.BFIX?0:(g?Math.round(g.bl):0);bfixLbl();scRedraw()}"
+"function bfixLbl(){var b=document.getElementById('bfix');"
+"b.textContent=window.BFIX?L('база ','baseline ')+window.BFIX+L(': отпустить',': release'):L('зафиксировать базу','fix baseline');"
+"b.className=window.BFIX?'btn sm amber':'btn sm'}"
 "try{document.getElementById('shset').checked=localStorage.getItem('mca_shset')==='1';"
 "document.getElementById('fx').checked=localStorage.getItem('mca_fx')==='1';"
 "document.getElementById('shdiag').checked=localStorage.getItem('mca_shdiag')==='1';"
 "window.YREF=+(localStorage.getItem('mca_ref')||0);"
-"window.XAX=+(localStorage.getItem('mca_xax')||0)}catch(e){window.YREF=0;window.XAX=0}"
+"window.XAX=+(localStorage.getItem('mca_xax')||0);"
+"document.getElementById('ydiv').value=localStorage.getItem('mca_ydiv')||'0'}catch(e){window.YREF=0;window.XAX=0}"
 "for(var i=0;i<3;i++)document.getElementById('rf'+i).className=i==window.YREF?'on':'';"
 "for(var i=0;i<2;i++)document.getElementById('bx'+i).className=i==window.XAX?'on':'';"
 "var SCM=1;"
@@ -1032,7 +958,7 @@ static const char PAGE[] =
 "rej:v.getInt32(24,true),d:d}}"
 /* настройки осциллографа строкой - одни и те же для /scope и WebSocket */
 "function scq(){var Wn=+document.getElementById('zm').value||512,"
-"M=(PS.trap_L|0)+(PS.trap_G|0)+16;"
+"M=(+document.getElementById('p_trap_L').value|0)+(+document.getElementById('p_trap_G').value|0)+16;"
 "return 'lvl='+(+document.getElementById('tl').value||30)+'&n='+(Wn+M)+'&pre='+(Math.round(Wn*0.2)+M)+"
 "'&amin='+(+document.getElementById('amin').value||0)+'&amax='+(+document.getElementById('amax').value||0)}"
 /* Кадр WebSocket: 10 x int32 (как у /scope, плюс номер снимка, число
@@ -1080,10 +1006,7 @@ static const char PAGE[] =
 "WS.onmessage=function(ev){if(typeof ev.data=='string')return;"
 "if(window.SRUN===0&&window.LASTJ)return;"
 "var j=wparse(ev.data);if(j)sframe(j,document.getElementById('md').value,ev.data.byteLength)}}"
-/* подбор по сигналу сам берёт кадры по 4096 отсчётов: свои запросы
-   страницы перебили бы длину окна прибора */
-"function sloop(){if(window.ATUNE){setTimeout(sloop,250);return}"
-"var md=document.getElementById('md').value,sc=(md=='1'||md=='3'),"
+"function sloop(){var md=document.getElementById('md').value,sc=(md=='1'||md=='3'),"
 /* пауза: кадры не берём, на экране последний */
 "on=sc&&!(window.SRUN===0&&window.LASTJ);"
 "if(!on)SPEND=null;"
@@ -1531,20 +1454,10 @@ static esp_err_t h_cfg(httpd_req_t *r)
         q_int(q, "int_rise",        &p.int_rise);
         q_int(q, "int_fall",        &p.int_fall);
         q_int(q, "hysteresis",      &p.hysteresis);
-        /* Окна задаются во времени, в наносекундах (страница шлёт так).
-         * Прежние ключи в отсчётах тоже принимаются - для скриптов -
-         * и переводятся во время по текущей частоте АЦП. */
-        const uint32_t fhz = adc_clk_get_freq();
-        if (fhz) {
-            if (q_int(q, "trap_L", &v)) p.trap_L_ns = (int32_t)((int64_t)v * 1000000000LL / fhz);
-            if (q_int(q, "trap_G", &v)) p.trap_G_ns = (int32_t)((int64_t)v * 1000000000LL / fhz);
-            if (q_int(q, "rearm",  &v)) p.rearm_ns  = (int32_t)((int64_t)v * 1000000000LL / fhz);
-            if (q_int(q, "search", &v)) p.search_ns = (int32_t)((int64_t)v * 1000000000LL / fhz);
-        }
-        q_int(q, "trap_L_ns",       &p.trap_L_ns);
-        q_int(q, "trap_G_ns",       &p.trap_G_ns);
-        q_int(q, "rearm_ns",        &p.rearm_ns);
-        q_int(q, "search_ns",       &p.search_ns);
+        q_int(q, "trap_L",          &p.trap_L);
+        q_int(q, "trap_G",          &p.trap_G);
+        q_int(q, "rearm",           &p.rearm);
+        q_int(q, "search",          &p.search);
         q_int(q, "baseline_shift",  &p.baseline_shift);
         q_int(q, "baseline_win",    &p.baseline_win);
         q_int(q, "flat_avg",        &p.flat_avg);
@@ -1567,9 +1480,7 @@ static esp_err_t h_cfg(httpd_req_t *r)
         "\"baseline_shift\":%ld,\"baseline_win\":%ld,"
         "\"flat_avg\":%ld,"
         "\"pileup_pre_pct\":%ld,"
-        "\"pileup_post_pct\":%ld,\"emu\":%lu,"
-        "\"trap_L_ns\":%ld,\"trap_G_ns\":%ld,\"rearm_ns\":%ld,"
-        "\"search_ns\":%ld,\"fhz\":%lu,\"fl\":[",
+        "\"pileup_post_pct\":%ld,\"emu\":%lu,\"fl\":[",
         (long)p.threshold, (long)p.cpc_milli, (long)p.nch,
         (long)p.algo, (long)p.polarity, (long)p.int_rise, (long)p.int_fall,
         (long)p.hysteresis, (long)p.trap_L,
@@ -1577,9 +1488,7 @@ static esp_err_t h_cfg(httpd_req_t *r)
         (long)p.baseline_shift, (long)p.baseline_win,
         (long)p.flat_avg,
         (long)p.pileup_pre_pct,
-        (long)p.pileup_post_pct, (unsigned long)mca_emu_baud(),
-        (long)p.trap_L_ns, (long)p.trap_G_ns, (long)p.rearm_ns,
-        (long)p.search_ns, (unsigned long)adc_clk_get_freq());
+        (long)p.pileup_post_pct, (unsigned long)mca_emu_baud());
     /* snprintf возвращает длину, которая ПОТРЕБОВАЛАСЬ БЫ. При нехватке
      * места это больше размера буфера, и отправка читала бы за его
      * границей. Ограничиваем после каждого шага. */
@@ -2047,20 +1956,7 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_NET, N_HELP_ON)
 "<div class=lr>"
 "<h3>Справка по параметрам</h3>"
 "<p>Наверху таблицы настроек &mdash; частота, порог, полярность и шкала; "
-"остальное свёрнуто в блок «Дополнительно». Окна L, G, поиск пика и "
-"перезапуск задаются <b>в микросекундах</b>: прибор сам переводит их в "
-"отсчёты на текущей частоте АЦП (сколько вышло, видно рядом с полем) и "
-"пересчитывает при смене частоты.</p>"
-"<p><b>Подобрать по сигналу.</b> Прибор на несколько секунд переходит в "
-"режим осциллографа и снимает до 60 кадров по 4096 отсчётов. По чистым "
-"импульсам (без наложений и выхода за шкалу АЦП, нужно не меньше 20) "
-"страница измеряет шум, время от начала импульса до вершины и спад и "
-"предлагает: L &asymp; 1.2 времени до вершины, G = L + время до вершины + "
-"запас, порог &mdash; 8 сигм шума трапеции вне импульсов (и не меньше "
-"полутора его максимумов), поиск &mdash; до вершины трапеции, перезапуск "
-"&mdash; пока трапеция импульса не опустится ниже гистерезиса. Значения "
-"ставятся кнопкой «Поставить».</p>"
-
+"остальное свёрнуто в блок «Дополнительно».</p>"
 "<h4>Обнаружение события</h4><table>"
 "<tr><th>Параметр</th><th>Что делает</th></tr>"
 "<tr><td>Порог<br><code>threshold</code></td><td>На сколько кодов АЦП "
@@ -2078,10 +1974,9 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_NET, N_HELP_ON)
 "доли порога. Задаётся В ПРОЦЕНТАХ: 50 значит, что трапеция должна "
 "опуститься ниже половины порога. Прежний вариант вычитал единицу, "
 "то есть гистерезиса практически не было.</td></tr>"
-"<tr><td>Перезапуск<br><code>rearm</code></td><td>Сколько микросекунд "
-"после конца поиска пика детектор не взводится, даже если трапеция уже "
-"ниже гистерезиса. Защита от повторного срабатывания на хвосте того же "
-"импульса. Это <b>не</b> метрика потерь, а параметр "
+"<tr><td>Перезапуск<br><code>rearm</code></td><td>Сколько отсчётов жёстко "
+"пропустить после пика, независимо от гистерезиса. Защита от дребезга "
+"на спадающем хвосте. Это <b>не</b> метрика потерь, а параметр "
 "перезапуска детектора.</td></tr>"
 "</table>"
 
@@ -2093,20 +1988,19 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_NET, N_HELP_ON)
 "обе суммы содержат её поровну.</p><table>"
 "<tr><th>Параметр</th><th>Что делает</th></tr>"
 "<tr><td>Окно L<br><code>trap_L</code></td><td>Длина окна "
-"интегрирования, мкс: какой отрезок импульса суммируется. Определяет, "
+"интегрирования: сколько отсчётов импульса суммируется. Определяет, "
 "какая часть импульса идёт в амплитуду и насколько усредняется шум. "
-"<b>Если окно задаётся парой RISE и FALL</b> в отсчётах (так бывает в "
-"других приборах), окно интегрирования &mdash; их сумма: RISE=6, FALL=15 "
-"&mdash; 21 отсчёт, на 7 МГц это 3 мкс.</td></tr>"
-"<tr><td>Зазор G<br><code>trap_G</code></td><td>На сколько микросекунд "
+"<b>Если окно задаётся парой RISE и FALL</b> (так бывает в других "
+"приборах), окно интегрирования &mdash; их сумма: RISE=6, FALL=15 "
+"соответствует нашему L&asymp;21.</td></tr>"
+"<tr><td>Зазор G<br><code>trap_G</code></td><td>На сколько отсчётов "
 "назад отстоит второе окно, которое вычитается. Оно должно целиком "
 "лежать на базовой линии ДО импульса, поэтому G обязан быть больше "
-"L плюс время от начала импульса до вершины. Разность G&minus;L даёт длину плоской "
+"L плюс длительность фронта. Разность G&minus;L даёт длину плоской "
 "вершины: чем она больше, тем устойчивее измеряется амплитуда.</td></tr>"
-"<tr><td>Поиск пика<br><code>search</code></td><td>Сколько микросекунд после "
-"срабатывания порога искать максимум трапеции. Должно накрывать "
-"вершину трапеции и у импульсов у самого порога: у них порог "
-"срабатывает позже.</td></tr>"
+"<tr><td>Поиск пика<br><code>search</code></td><td>Сколько отсчётов после "
+"срабатывания порога перебирать в поисках максимума трапеции. "
+"Должно накрывать весь импульс.</td></tr>"
 "</table>"
 
 "<h4>Способ измерения амплитуды</h4>"
@@ -2243,18 +2137,7 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_NET, N_HELP_ON)
 "<div class=le>"
 "<h3>Parameter reference</h3>"
 "<p>The top of the settings table holds the sample rate, threshold, polarity and "
-"scale; the rest is folded into the “Advanced” block. The windows L, G, peak search "
-"and re-arm are set <b>in microseconds</b>: the device converts them to samples at "
-"the current ADC rate (the result is shown next to the field) and recalculates them "
-"when the rate changes.</p>"
-"<p><b>Tune from signal.</b> The device switches to the oscilloscope for a few "
-"seconds and captures up to 60 frames of 4096 samples. From clean pulses (no pile-up "
-"or ADC overrange, at least 20 are needed) the page measures the noise, the time from "
-"the pulse start to its peak and the decay, and suggests: L &asymp; 1.2 times the time "
-"to peak, G = L + time to peak + margin, threshold &mdash; 8 sigma of the trapezoid "
-"noise outside the pulses (and at least one and a half of its maximum), search "
-"&mdash; up to the trapezoid peak, re-arm &mdash; until the trapezoid of the pulse "
-"drops below the hysteresis. The values are set with the “Set” button.</p>"
+"scale; the rest is folded into the “Advanced” block.</p>"
 "<h4>Event detection</h4><table>"
 "<tr><th>Parameter</th><th>What it does</th></tr>"
 "<tr><td>Threshold<br><code>threshold</code></td><td>How many ADC codes a sample "
@@ -2270,10 +2153,9 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_NET, N_HELP_ON)
 "signal must first drop below a fraction of the threshold. Set IN PERCENT: 50 means "
 "the trapezoid must drop below half the threshold. The previous version subtracted "
 "one, so there was practically no hysteresis.</td></tr>"
-"<tr><td>Re-arm<br><code>rearm</code></td><td>How many microseconds after the end "
-"of the peak search the detector does not re-arm, even if the trapezoid is already "
-"below the hysteresis. Protection against a second trigger on the tail of the same "
-"pulse. This is <b>not</b> a loss metric but a detector "
+"<tr><td>Re-arm<br><code>rearm</code></td><td>How many samples to skip "
+"unconditionally after the peak, regardless of hysteresis. Protection against "
+"chatter on the falling tail. This is <b>not</b> a loss metric but a detector "
 "re-arm parameter.</td></tr>"
 "</table>"
 
@@ -2283,18 +2165,18 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_NET, N_HELP_ON)
 "hardly depends on which point of the top is hit. The DC component (baseline) is "
 "subtracted automatically: both sums contain it equally.</p><table>"
 "<tr><th>Parameter</th><th>What it does</th></tr>"
-"<tr><td>Window L<br><code>trap_L</code></td><td>Integration window length, µs: "
-"which stretch of the pulse is summed. It determines which part of the pulse goes "
-"into the amplitude and how much the noise is averaged. <b>If the window is set by a "
-"RISE and FALL pair</b> in samples (as in some other devices), the integration window "
-"is their sum: RISE=6, FALL=15 &mdash; 21 samples, which is 3 µs at 7 MHz.</td></tr>"
-"<tr><td>Gap G<br><code>trap_G</code></td><td>How many microseconds back the "
-"second, subtracted window is. It must lie entirely on the baseline BEFORE the pulse, "
-"so G must be greater than L plus the time from the pulse start to its peak. The difference G&minus;L is the flat-top "
+"<tr><td>Window L<br><code>trap_L</code></td><td>Integration window length: how "
+"many pulse samples are summed. It determines which part of the pulse goes into the "
+"amplitude and how much the noise is averaged. <b>If the window is set by a RISE and "
+"FALL pair</b> (as in some other devices), the integration window is their sum: "
+"RISE=6, FALL=15 corresponds to our L&asymp;21.</td></tr>"
+"<tr><td>Gap G<br><code>trap_G</code></td><td>How many samples back the second, "
+"subtracted window is. It must lie entirely on the baseline BEFORE the pulse, so G "
+"must be greater than L plus the rise time. The difference G&minus;L is the flat-top "
 "length: the longer it is, the more stable the amplitude measurement.</td></tr>"
-"<tr><td>Peak search<br><code>search</code></td><td>How many microseconds after the "
-"threshold crossing to search for the trapezoid maximum. Must cover the trapezoid top "
-"even for pulses near the threshold: they cross it later.</td></tr>"
+"<tr><td>Peak search<br><code>search</code></td><td>How many samples after the "
+"threshold crossing to search for the trapezoid maximum. Must cover the whole "
+"pulse.</td></tr>"
 "</table>"
 
 "<h4>Amplitude method</h4>"

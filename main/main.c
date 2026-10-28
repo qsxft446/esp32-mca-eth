@@ -122,7 +122,6 @@ void app_main(void)
     mca_hist_init();
 
     ESP_ERROR_CHECK(adc_clk_start(mca_freq_table[MCA_FREQ_DEFAULT_IDX]));
-    mca_dsp_set_freq(adc_clk_get_freq());   /* окна L/G - во времени */
     ESP_ERROR_CHECK(adc_cap_init());
     ESP_ERROR_CHECK(mca_web_start());
     mca_settings_load();        /* NVS к этому моменту поднят стартом сети */
@@ -156,7 +155,6 @@ void app_main(void)
                 bool was = adc_cap_is_running();
                 capture_stop();
                 adc_clk_set_freq(mca_freq_table[idx]);
-                mca_dsp_set_freq(adc_clk_get_freq());
                 mca_settings_save_freq(idx);
                 vTaskDelay(pdMS_TO_TICKS(20));
                 if (was) capture_start();

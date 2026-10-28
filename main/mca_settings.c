@@ -3,7 +3,6 @@
 #include "adc_clk.h"
 
 #include "nvs.h"
-#include <stddef.h>
 #include "esp_log.h"
 
 static const char *TAG = "settings";
@@ -13,14 +12,8 @@ static const char *TAG = "settings";
 /* Увеличивать при ЛЮБОЙ правке mca_params_t. Запись от прошивки с другой
  * структурой будет отброшена целиком, а не прочитана вкривь: совпадение
  * размера ещё не значит, что поля лежат на тех же местах. */
-#define PARAMS_VER 5        /* 2: полярность; 3: убран архив форм;
-                               4: «кодов на канал» вместо усиления;
-                               5: окна L, G, поиск, перезапуск во времени */
-
-/* Запись версии 4 - начало нынешней структуры: поля *_ns дописаны в
- * конец. Её окна были в отсчётах на сохранённой частоте - переводим во
- * время по ней же, тогда после обновления обработка остаётся прежней. */
-#define PARAMS_V4_LEN offsetof(mca_params_t, trap_L_ns)
+#define PARAMS_VER 4        /* 2: полярность; 3: убран архив форм;
+                               4: «кодов на канал» вместо усиления */
 
 /* ЧАСТОТА ХРАНИТСЯ В ГЕРЦАХ (ключ "fhz").
  *
@@ -53,7 +46,18 @@ void mca_settings_load(void)
         return;
     }
 
-    /* Частота - первой: по ней переводятся окна записи версии 4. */
+    uint8_t ver = 0;
+    mca_params_t p;
+    size_t len = sizeof(p);
+    if (nvs_get_u8(h, "pver", &ver) == ESP_OK && ver == PARAMS_VER &&
+        nvs_get_blob(h, "params", &p, &len) == ESP_OK && len == sizeof(p)) {
+        mca_dsp_set_params(&p);     /* пройдут ту же проверку, что из веба */
+        ESP_LOGI(TAG, "настройки обработки загружены");
+    } else {
+        ESP_LOGW(TAG, "настроек обработки нет или они от другой версии "
+                      "прошивки - значения по умолчанию");
+    }
+
     uint32_t hz = 0;
     uint8_t  fi;
     if (nvs_get_u32(h, "fhz", &hz) != ESP_OK) {
@@ -64,34 +68,8 @@ void mca_settings_load(void)
     if (hz) {
         const int i = freq_nearest_idx(hz);
         adc_clk_set_freq(mca_freq_table[i]);
-        mca_dsp_set_freq(adc_clk_get_freq());
         ESP_LOGI(TAG, "частота из сохранённых: %.3f МГц",
                  mca_freq_table[i] / 1e6);
-    }
-    const uint32_t fhz = adc_clk_get_freq();
-
-    uint8_t ver = 0;
-    mca_params_t p;
-    size_t len = sizeof(p);
-    const bool got = nvs_get_u8(h, "pver", &ver) == ESP_OK &&
-                     nvs_get_blob(h, "params", &p, &len) == ESP_OK;
-    if (got && ver == PARAMS_VER && len == sizeof(p)) {
-        mca_dsp_set_params(&p);     /* пройдут ту же проверку, что из веба */
-        ESP_LOGI(TAG, "настройки обработки загружены");
-    } else if (got && ver == 4 && len == PARAMS_V4_LEN && fhz) {
-        p.trap_L_ns = (int32_t)((int64_t)p.trap_L * 1000000000LL / fhz);
-        p.trap_G_ns = (int32_t)((int64_t)p.trap_G * 1000000000LL / fhz);
-        p.search_ns = (int32_t)((int64_t)p.search * 1000000000LL / fhz);
-        p.rearm_ns  = (int32_t)((int64_t)p.rearm  * 1000000000LL / fhz);
-        mca_dsp_set_params(&p);
-        mca_dsp_get_params(&p);
-        mca_settings_save_params(&p);
-        ESP_LOGI(TAG, "настройки прежней версии перенесены: окна L=%ld G=%ld "
-                 "нс на %.3f МГц", (long)p.trap_L_ns, (long)p.trap_G_ns,
-                 fhz / 1e6);
-    } else {
-        ESP_LOGW(TAG, "настроек обработки нет или они от другой версии "
-                      "прошивки - значения по умолчанию");
     }
     nvs_close(h);
 }

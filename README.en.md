@@ -245,36 +245,14 @@ BecqMoni (answers to commands).
   same processing parameter table as on the “Oscilloscope” tab: the parameters can be
   changed right during acquisition to see how the spectrum changes.
 - **Processing settings.** The top of the table holds the sample rate,
-  threshold, polarity and spectrum scale; the rest is folded into
-  “Advanced” (the browser remembers whether it is open). The windows L, G,
-  peak search and re-arm are set **in microseconds**: the device stores them
-  in nanoseconds and converts them to samples at the current ADC rate,
-  including when the rate changes; the resulting number of samples is shown
-  next to the field, and if at this rate the window hit its limit (L up to
-  64 samples, G up to 128) — the actual time. The windows used to be set in
-  samples, and changing the rate silently changed the processing. Saved
-  settings of the previous version are converted to time at the saved rate
-  on the first start — the processing stays the same. `/cfg` accepts the
-  windows as `trap_L_ns` etc.; the old keys in samples (`trap_L`…) are
-  accepted too and converted at the current rate.
-- **“Tune from signal”** — a button under the table. The device switches to
-  the oscilloscope for a few seconds, the page captures up to 60 frames of
-  4096 samples, measures the noise, the time from the pulse start to its
-  peak and the decay on clean pulses (no pile-up or overrange, at least 20
-  are needed) and suggests the windows and threshold; they are set with the
-  “Set” button. Rules: L ≈ 1.2 times the time to peak, G = L + time to
-  peak + margin (the rear window entirely before the pulse), threshold —
-  8 sigma of the trapezoid noise outside the pulses and at least one and a
-  half of its maximum, search — 95 % of the time from the threshold to the
-  trapezoid peak plus a margin, re-arm — until the trapezoid of the pulse
-  drops below the hysteresis (a rise above the threshold after that is
-  almost always a new pulse: 9 out of 10 on the device signal). Why L is not longer: when
-  the trapezoid noise is much smaller than the peak width, a longer window
-  does not improve resolution but adds pile-up — 5-minute acquisitions at
-  16 MHz with L = 14, 20 and 28 samples gave the same 6.9–7.0 % on the
-  ~358 peak. On the device signal (~1 µs from start to peak, 4.5 µs decay)
-  the tuning gave L 1.19 µs, G 2.38 µs (19 and 38 samples at 16 MHz) —
-  almost the same as chosen by hand.
+  threshold, polarity and spectrum scale; the rest (trapezoid windows,
+  measurement method, pile-up rejection, MCA emulation) is folded into
+  “Advanced”, and the browser remembers whether it is open. The windows L,
+  G, search and re-arm are in samples. They can be left alone: 5-minute
+  acquisitions at 16 MHz with L = 14, 20 and 28 samples gave the same
+  6.9–7.0 % resolution on the ~358 peak — on this board the trapezoid noise
+  is much smaller than the peak width, and the resolution is set by the
+  detector.
 - **CPS monitor** — on the same tab, below the spectrum: current CPS, mean
   over the whole history with its error, last interval, a plot by averaging
   intervals with a moving average, an interval table and CSV export. The
@@ -303,6 +281,16 @@ BecqMoni (answers to commands).
   end of the pulse — copied into the integration parameters) and a table of
   all processing settings, marked with the measurement method each one
   belongs to.
+- **Oscilloscope “codes/div” scale** — as on an ordinary oscilloscope: auto
+  or 1, 2, 5 … 500 ADC codes per division, 8 divisions. The baseline sits on
+  the first line from the bottom (from the top for downward pulses), the
+  scale does not change from frame to frame, so the baseline noise of a few
+  codes can be examined. A pulse above the screen is clipped, and how far it
+  went is shown at the edge. The browser remembers the choice.
+- **“Fix baseline”** — remembers the current baseline level, and from then
+  on the oscilloscope draws from it rather than from the baseline of each
+  frame: the baseline stays put on screen, and its slow drift shows under
+  the plot as “drift”. Pressing again returns to per-frame measurement.
 - **Start/Stop apply to the open tab:** on “Spectrum” — spectrum acquisition
   (together with “Reset”, the status line and acquisition
   time/CPS/events; the time runs only while the spectrum is being
@@ -731,19 +719,16 @@ on other ESP32-S3 boards:
    jumping to 0 and 4095 and OTR firing at one rate means the clock reaches
    the ADC in bad shape (as with LEDC at 16 MHz, see “A CLK generator from
    the camera block”).
-4. Spectrum: “Tune from signal” — windows and threshold from the pulse shape
-   and noise (or by hand: threshold above the trapezoid noise, the “filter
-   noise” line under the oscilloscope), “Codes per channel” so the peaks
-   fit the scale.
+4. Spectrum: threshold above the trapezoid noise (the “filter
+   noise” line under the oscilloscope), L and G from the pulse shape,
+   “Codes per channel” so the peaks fit the scale.
 
 ## Tools (`tools/`)
 
-- `test_dsp.py` — 11 levels of processing checks on a model, including the
+- `test_dsp.py` — 10 levels of processing checks on a model, including the
   vector version against the plain one, the oscilloscope frame compression
-  against the page decoder, the splitting of the CPS history into
-  intervals, the conversion of windows from time to samples and tuning from
-  the signal on pulses of known shape (the page functions run in node).
-  `python tools/test_dsp.py`.
+  against the page decoder and the splitting of the CPS history into
+  intervals (the page functions run in node). `python tools/test_dsp.py`.
 - `dspmodel.py`, `scopemodel.py`, `scopecodec.py` — models of the
   processing, the oscilloscope and its frame compression.
 - `hotloop.py` — hot-loop cycle estimate from the disassembly.

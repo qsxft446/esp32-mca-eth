@@ -34,13 +34,6 @@ void mca_dsp_get_params(mca_params_t *out);
  * в спектре и сколько миллисекунд шёл набор (0 - набор не шёл). */
 void mca_dsp_last_second(uint32_t *counts, uint32_t *dur_ms);
 void mca_dsp_set_params(const mca_params_t *in);
-/* Частота АЦП изменилась: окна L, G, поиск и перезапуск заданы во
- * времени (поля *_ns) и пересчитываются в отсчёты на новой частоте.
- * Звать после каждой смены частоты - adc_clk_get_freq(). */
-void mca_dsp_set_freq(uint32_t hz);
-/* Перевод времени окна в отсчёты на частоте hz, с округлением до
- * ближайшего - тем же, что в mca_dsp_set_params (и в tools/dspmodel.py). */
-int32_t mca_dsp_ns_to_samples(int32_t ns, uint32_t hz);
 
 size_t mca_dsp_get_spectrum(uint32_t *dst, size_t from, size_t count);
 
