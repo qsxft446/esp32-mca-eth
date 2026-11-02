@@ -14,6 +14,7 @@ idf_component_register(
          "mca_time.c"
          "mca_ota.c"
          "mca_oled.c"
+         "mca_log.c"
     INCLUDE_DIRS "."
     EMBED_FILES "logo.png"
     REQUIRES driver esp_driver_gpio esp_driver_ledc esp_driver_spi

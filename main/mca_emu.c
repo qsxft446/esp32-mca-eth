@@ -1,4 +1,5 @@
 #include "mca_emu.h"
+#include "mca_log.h"
 #include "mca_config.h"
 #include "mca_dsp.h"
 #include "mca_web.h"
@@ -83,7 +84,6 @@ static const uint32_t BAUDS[] = { 38400, 115200, 460800, 600000, 921600 };
 static volatile uint32_t s_baud;          /* 0 - выключено            */
 static TaskHandle_t      s_task;
 static volatile bool     s_stop_req;
-static vprintf_like_t    s_prev_vprintf;
 static uint32_t          s_regs[N_REGS];
 static bool              s_silent;        /* -sta -s: без выгрузки     */
 static uint32_t          s_limit_s;       /* -sta xx: время набора, с  */
@@ -528,15 +528,14 @@ static void emu_task(void *arg)
 }
 
 /* ---------------- включение / выключение ---------------- */
-static int null_vprintf(const char *fmt, va_list ap) { return 0; }
-
 static void emu_start(uint32_t baud)
 {
     ESP_LOGW(TAG, "эмуляция MCA на UART0, %lu бод - дальше консоль молчит",
              (unsigned long)baud);
     vTaskDelay(pdMS_TO_TICKS(30));      /* дать сообщению уйти */
-    /* журнал - в никуда: иначе он смешался бы с пакетами протокола */
-    s_prev_vprintf = esp_log_set_vprintf(null_vprintf);
+    /* журнал - не в консоль: иначе он смешался бы с пакетами протокола;
+     * на странице «Диагностика» он по-прежнему виден (mca_log) */
+    mca_log_console(false);
 
     if (!uart_is_driver_installed(EMU_UART))
         uart_driver_install(EMU_UART, 1024, TX_RING, 0, NULL, 0);
@@ -559,7 +558,7 @@ static void emu_stop(void)
     uart_wait_tx_done(EMU_UART, pdMS_TO_TICKS(500));
     uart_set_baudrate(EMU_UART, CONFIG_ESP_CONSOLE_UART_BAUDRATE);
     uart_driver_delete(EMU_UART);
-    esp_log_set_vprintf(s_prev_vprintf);
+    mca_log_console(true);
     s_baud = 0;
     ESP_LOGI(TAG, "эмуляция MCA выключена, консоль снова работает");
 }

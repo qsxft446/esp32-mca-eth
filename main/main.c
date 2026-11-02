@@ -17,6 +17,7 @@
 #include "mca_hist.h"
 #include "mca_ota.h"
 #include "mca_oled.h"
+#include "mca_log.h"
 
 static const char *TAG = "main";
 
@@ -115,6 +116,7 @@ static void capture_stop(void)
 
 void app_main(void)
 {
+    mca_log_init();             /* лог для страницы «Диагностика» - первым */
     ESP_LOGI(TAG, "=== MCA на AD9226 + ESP32-S3 ===");
     mca_ota_init();             /* слот прошивки и след отката - в лог */
 

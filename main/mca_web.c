@@ -12,6 +12,7 @@
 #include "mca_time.h"
 #include "mca_ota.h"
 #include "mca_oled.h"
+#include "mca_log.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -182,7 +183,8 @@ static const char PAGE[] =
    /stat) меняется только кнопкой «Старт» на вкладке. */
 "<nav id=tabs><span data-md=0 onclick=tab(0) data-en='Spectrum'>Спектр</span>"
 "<span data-md=1 onclick=tab(SCM) data-en='Oscilloscope'>Осциллограф</span>"
-"<a href=/settings data-en='Settings'>Настройки</a><a href=/help data-en='Help'>Справка</a></nav>"
+"<a href=/settings data-en='Settings'>Настройки</a><a href=/diag data-en='Diagnostics'>Диагностика</a>"
+"<a href=/help data-en='Help'>Справка</a></nav>"
 "<select id=md hidden><option value=0><option value=1>"
 "<option value=2><option value=3></select>"
 "<div class=wrap>"
@@ -1504,10 +1506,12 @@ static void net_init(void)
 "<span style=color:var(--accent)>AD9226</span></div>" \
 "<div class=chips><span class='seg lng'><button onclick=\"setLang('ru')\">RU</button>" \
 "<button onclick=\"setLang('en')\">EN</button></span></div></header>"
-#define SUB_NAV(W, H) "<nav><a href=/#spectrum data-en='Spectrum'>Спектр</a>" \
-    "<a href=/#scope data-en='Oscilloscope'>Осциллограф</a>" W H "</nav>"
+#define SUB_NAV(S, D, H) "<nav><a href=/#spectrum data-en='Spectrum'>Спектр</a>" \
+    "<a href=/#scope data-en='Oscilloscope'>Осциллограф</a>" S D H "</nav>"
 #define N_SET    "<a href=/settings data-en='Settings'>Настройки</a>"
 #define N_SET_ON "<span class=on data-en='Settings'>Настройки</span>"
+#define N_DIAG    "<a href=/diag data-en='Diagnostics'>Диагностика</a>"
+#define N_DIAG_ON "<span class=on data-en='Diagnostics'>Диагностика</span>"
 #define N_HELP    "<a href=/help data-en='Help'>Справка</a>"
 #define N_HELP_ON "<span class=on data-en='Help'>Справка</span>"
 
@@ -1516,7 +1520,7 @@ static void net_init(void)
  * «Осциллограф» под галочками, сеть и прошивка - на странице «Сеть». Всё
  * собрано здесь; прежние адреса /net и /wifi открывают эту страницу. */
 static const char SET_PAGE[] =
-SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
+SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "<div class=wrap>"
 "<div style='display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start'>"
 "<section class='panel pad' style='flex:1 1 360px'>"
@@ -1557,13 +1561,6 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "в прибор значения уходят только по этой кнопке и "
 "сохраняются в его памяти</span></div>"
 "</section>"
-"<section class='panel pad' id=g_diag>"
-"<h3 data-en='ADC diagnostics'>Диагностика АЦП</h3>"
-"<label><input type=checkbox id=den onchange=dtog()> "
-"<span data-en='per-bit statistics (analyses 1 chunk/s)'>побитовая статистика (разбор 1 чанка/с)</span></label>"
-"<div id=dout></div>"
-"<button class='btn sm' onclick=dprobe() style=margin-top:10px data-en='Check data lines'>Проверить линии данных</button>"
-"<div id=dpr style=margin-top:8px;font-size:12.5px></div></section>"
 "</div>"
 "<script>i18n();"
 /* Список частот присылает прибор (/cfg, поле fl): он зависит от
@@ -1632,8 +1629,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "var H={"
 "emu:L('Эмуляция анализатора на последовательном порту UART0 - разъём UART/COM на плате (не встроенный USB). Прибор отвечает по бинарному протоколу shproto, и программы на ПК, умеющие работать с такими анализаторами (например, BecqMoni), видят его как MCA: набор, остановка, сброс, выгрузка спектра и статуса, калибровка. Скорость порта выбирается здесь, действует сразу и сохраняется. Пока эмуляция включена, консоль молчит: сообщения прошивки на порт не идут. Программе отдаётся столько каналов, сколько выбрано в «Каналов»: в BecqMoni выставьте то же число каналов, тогда они совпадут с прибором один в один. Заводские команды настройки из программы не принимаются - параметры задаются на этой странице.',"
 "'Analyzer emulation on the serial port UART0 - the UART/COM connector on the board (not the native USB). The device answers using the binary shproto protocol, and PC programs that work with such analyzers (for example, BecqMoni) see it as an MCA: start, stop, reset, spectrum and status upload, calibration. The port speed is selected here, takes effect immediately and is saved. While emulation is on, the console is silent: firmware messages are not sent to the port. The program receives as many channels as selected in “Channels”: set the same number of channels in BecqMoni, then they match the device one to one. Factory tuning commands from the program are not accepted - parameters are set on this page.'),"
-"fq:L('Частота семплирования АЦП. Выше - подробнее форма импульса, но обработка может не успевать: смотрите потерянные чанки в разделе «Диагностика АЦП» ниже. По замеру на этой плате (около 3500 имп/с) обработка спектра занимает около 70 % ядра на 16 МГц и около 90 % на 20 МГц; при большем счёте нагрузка выше. Параметры фильтра заданы в отсчётах, поэтому на другой частоте то же L или G - другое время.',"
-"'ADC sample rate. Higher - more detailed pulse shape, but processing may not keep up: watch lost chunks in the “ADC diagnostics” section below. Measured on this board (about 3500 cps), spectrum processing takes about 70 % of the core at 16 MHz and about 90 % at 20 MHz; with a higher count rate the load is higher. Filter parameters are set in samples, so at another rate the same L or G is a different time.'),"
+"fq:L('Частота семплирования АЦП. Выше - подробнее форма импульса, но обработка может не успевать: смотрите потерянные чанки на странице «Диагностика». По замеру на этой плате (около 3500 имп/с) обработка спектра занимает около 70 % ядра на 16 МГц и около 90 % на 20 МГц; при большем счёте нагрузка выше. Параметры фильтра заданы в отсчётах, поэтому на другой частоте то же L или G - другое время.',"
+"'ADC sample rate. Higher - more detailed pulse shape, but processing may not keep up: watch lost chunks on the “Diagnostics” page. Measured on this board (about 3500 cps), spectrum processing takes about 70 % of the core at 16 MHz and about 90 % at 20 MHz; with a higher count rate the load is higher. Filter parameters are set in samples, so at another rate the same L or G is a different time.'),"
 "polarity:L('0 - импульсы вверх от базовой линии, 1 - вниз (например, анод ФЭУ напрямую). При 1 сигнал переворачивается ещё до обработки, и порог и спектр работают как с импульсами вверх; осциллограф синхронизируется по фронту вниз. Постоянная составляющая сигнала на обработку не влияет - её вычитает трапеция.',"
 "'0 - pulses go up from the baseline, 1 - down (for example, PMT anode directly). With 1 the signal is inverted before processing, so the threshold and spectrum work as with upward pulses; the oscilloscope triggers on a falling edge. A DC offset of the signal does not affect processing - the trapezoid subtracts it.'),"
 "algo:L('Трапеция: амплитуда по вершине трапеции (окно L, зазор G, по желанию среднее по плато). Интегрирование: среднее отсчётов импульса вокруг вершины за вычетом базовой линии (до и после вершины, база 2^N, окно базы). Поля, которые при выбранном способе ни на что не влияют, в таблице приглушены. Обнаружение события в обоих способах одинаковое - по выходу трапеции, поэтому L, G, порог, гистерезис, перезапуск и поиск пика нужны всегда. Масштабы способов различаются - после переключения подберите «Кодов на канал». Смена способа очищает спектр.',"
@@ -1771,6 +1768,71 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "function fww(){var p=document.getElementById('fwp');fwi().then(function(j){"
 "p.textContent=L('прибор перезапущен, работает версия ','device restarted, running version ')+j.ver})"
 ".catch(function(){p.textContent=L('жду перезапуска прибора...','waiting for the device to restart...');setTimeout(fww,2000)})}"
+"ldcfg();ld();fwi();"
+"</script></body></html>";
+
+static esp_err_t h_set_page(httpd_req_t *r)
+{
+    httpd_resp_set_type(r, "text/html; charset=utf-8");
+    return httpd_resp_send(r, SET_PAGE, HTTPD_RESP_USE_STRLEN);
+}
+
+/* ---- страница «Диагностика»: лог прибора и диагностика тракта АЦП ---- */
+static const char DIAG_PAGE[] =
+SUB_HEAD("Диагностика", "Diagnostics") SUB_NAV(N_SET, N_DIAG_ON, N_HELP)
+"<div class=wrap>"
+/* лог прибора: строки ESP_LOG с начала работы (кольцо 256 строк, mca_log.c),
+   цвет - по уровню, фильтр по уровням, файл - кнопкой */
+"<section class='panel pad'>"
+"<div class=grp style=margin-bottom:8px><b style=color:#e8efe2 data-en='Device log'>Лог прибора</b>"
+"<span class=ml></span>"
+"<label title='ошибки' data-en-title='errors'><input type=checkbox id=lgE checked onchange=lgdraw()> <b style=color:#ff8a82>E</b></label>"
+"<label title='предупреждения' data-en-title='warnings'><input type=checkbox id=lgW checked onchange=lgdraw()> <b style=color:#f0c45a>W</b></label>"
+"<label title='сообщения' data-en-title='messages'><input type=checkbox id=lgI checked onchange=lgdraw()> <b style=color:#cfe0cc>I</b></label>"
+"<label title='отладка' data-en-title='debug'><input type=checkbox id=lgD checked onchange=lgdraw()> <b style=color:#7d8a7b>D</b></label>"
+"<label title='прокручивать к новым строкам' data-en-title='scroll to new lines'>"
+"<input type=checkbox id=lgf checked> <span data-en='follow'>следить</span></label>"
+"<button class='btn sm' onclick=lgsave() data-en='Save'>Сохранить</button>"
+"<button class='btn sm' onclick=lgclr() data-en='Clear screen'>Очистить экран</button></div>"
+"<div id=lgv class=mono style='height:420px;overflow:auto;font-size:12px;line-height:1.45;"
+"background:#0b0f0b;border:1px solid #283024;border-radius:6px;padding:6px 8px;"
+"white-space:pre-wrap;word-break:break-word'></div>"
+"<div class=mut id=lgs style=font-size:11.5px;margin-top:6px></div>"
+"</section>"
+"<section class='panel pad' id=g_diag>"
+"<h3 data-en='ADC diagnostics'>Диагностика АЦП</h3>"
+"<label><input type=checkbox id=den onchange=dtog()> "
+"<span data-en='per-bit statistics (analyses 1 chunk/s)'>побитовая статистика (разбор 1 чанка/с)</span></label>"
+"<div id=dout></div>"
+"<button class='btn sm' onclick=dprobe() style=margin-top:10px data-en='Check data lines'>Проверить линии данных</button>"
+"<div id=dpr style=margin-top:8px;font-size:12.5px></div></section>"
+"</div>"
+"<script>i18n();"
+/* /log?from=N: первая строка - «#следующий самый_старый», дальше «номер
+   уровень текст». Номер следующего меньше прежнего - прибор перезапущен. */
+"var LG={nx:0,a:[],busy:0,lost:0},LGC={E:'#ff8a82',W:'#f0c45a',I:'#cfe0cc',D:'#7d8a7b',V:'#5e6a5d'};"
+"function lgload(){if(LG.busy)return;LG.busy=1;"
+"fetch('/log?from='+LG.nx).then(function(r){return r.text()}).then(function(t){LG.busy=0;"
+"var ls=t.split('\\n'),h=ls[0].slice(1).split(' '),nx=+h[0],first=+h[1],add=0;"
+"if(nx<LG.nx){LG.a=[];LG.a.push(['W',L('— прибор перезапущен —','— device restarted —')])}"
+"else if(LG.nx>0&&first>LG.nx)LG.lost+=first-LG.nx;"
+"for(var i=1;i<ls.length;i++){var x=ls[i];if(!x)continue;var p=x.indexOf(' ');"
+"LG.a.push([x.charAt(p+1),x.slice(p+3)]);add++}"
+"if(LG.a.length>3000)LG.a.splice(0,LG.a.length-3000);LG.nx=nx;"
+"document.getElementById('lgs').textContent=L('строк на экране: ','lines on screen: ')+LG.a.length+"
+"(LG.lost?L(', пропущено (кольцо переполнилось): ',', skipped (the ring overflowed): ')+LG.lost:'');"
+"if(add)lgdraw()}).catch(function(){LG.busy=0})}"
+"function lgesc(x){return x.replace(/&/g,'&amp;').replace(/</g,'&lt;')}"
+"function lgdraw(){var v=document.getElementById('lgv'),h='';"
+"LG.a.forEach(function(x){var c=document.getElementById('lg'+x[0]);if(c&&!c.checked)return;"
+"h+='<div style=color:'+(LGC[x[0]]||'#9aa59a')+'>'+lgesc(x[1])+'</div>'});"
+"v.innerHTML=h;if(document.getElementById('lgf').checked)v.scrollTop=v.scrollHeight}"
+"function lgclr(){LG.a=[];LG.lost=0;lgdraw()}"
+"function lgsave(){var s=LG.a.map(function(x){return x[1]}).join('\\r\\n')+'\\r\\n',n=new Date(),"
+"p=function(v){return (v<10?'0':'')+v},a=document.createElement('a');"
+"a.href=URL.createObjectURL(new Blob([s],{type:'text/plain'}));"
+"a.download='mca_log_'+n.getFullYear()+p(n.getMonth()+1)+p(n.getDate())+'_'+p(n.getHours())+p(n.getMinutes())+p(n.getSeconds())+'.txt';"
+"document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1000)}"
 /* диагностика тракта АЦП: опрос раз в секунду, пока страница открыта */
 "function dtog(){fetch('/diag/set?en='+(document.getElementById('den').checked?1:0))}"
 "function df(v,c){return '<span class='+c+'>'+v+'</span>'}"
@@ -1881,13 +1943,47 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "df(L('НИ ОДНА линия не шевелится — АЦП не преобразует. Смотрите питание платы и приходит ли на неё такт.',"
 "'NOT A SINGLE line is changing — the ADC is not converting. Check the board power and whether the clock reaches it.'),'bad');"
 "document.getElementById('dpr').innerHTML=h})}"
-"ldcfg();ld();fwi();dupd();setInterval(dupd,1000);"
+"lgload();setInterval(lgload,1000);dupd();setInterval(dupd,1000);"
 "</script></body></html>";
 
-static esp_err_t h_set_page(httpd_req_t *r)
+static esp_err_t h_diag_page(httpd_req_t *r)
 {
     httpd_resp_set_type(r, "text/html; charset=utf-8");
-    return httpd_resp_send(r, SET_PAGE, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(r, DIAG_PAGE, HTTPD_RESP_USE_STRLEN);
+}
+
+/* /log?from=N - строки лога прибора с номера N (см. mca_log.h): первая
+ * строка «#следующий самый_старый», дальше «номер уровень текст». N вне
+ * кольца - с самой старой из лежащих. */
+static esp_err_t h_log(httpd_req_t *r)
+{
+    char q[32], v[12];
+    uint32_t from = 0, first, next;
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "from", v, sizeof(v)) == ESP_OK)
+        from = (uint32_t)strtoul(v, NULL, 10);
+    mca_log_range(&first, &next);
+    if (from < first || from > next) from = first;
+    httpd_resp_set_type(r, "text/plain; charset=utf-8");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    /* веб-сервер обрабатывает запросы по одному - общий буфер безопасен */
+    static char buf[2048];
+    static char txt[MCA_LOG_WIDTH];
+    int n = snprintf(buf, sizeof(buf), "#%lu %lu\n", (unsigned long)next,
+                     (unsigned long)first);
+    esp_err_t e = ESP_OK;
+    for (uint32_t i = from; i < next && e == ESP_OK; i++) {
+        char lv;
+        if (!mca_log_get(i, &lv, txt, sizeof(txt))) continue;
+        if (n + (int)strlen(txt) + 16 > (int)sizeof(buf)) {
+            e = httpd_resp_send_chunk(r, buf, n);
+            n = 0;
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "%lu %c %s\n", (unsigned long)i, lv, txt);
+    }
+    if (e == ESP_OK && n) e = httpd_resp_send_chunk(r, buf, n);
+    if (e == ESP_OK) e = httpd_resp_send_chunk(r, NULL, 0);
+    return e;
 }
 
 /* /net/set?mode=dhcp | /net/set?mode=static&ip=&mask=&gw=&dns= - настройка
@@ -2111,7 +2207,7 @@ static esp_err_t h_diag_set(httpd_req_t *r)
 
 /* ---- справка по параметрам ---- */
 static const char HELP_PAGE[] =
-SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_HELP_ON)
+SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "<style>td:first-child{white-space:nowrap;font-weight:600;width:1%}"
 "table{margin:4px 0 14px}</style>"
 "<div class=wrap><section class='panel pad' style=max-width:920px>"
@@ -2289,10 +2385,15 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_HELP_ON)
 "частота, порог, полярность, шкала спектра и в блоке «Дополнительно» все "
 "параметры обработки; в прибор уходят кнопкой «Применить». Смена «Кодов на "
 "канал» и способа измерения очищает спектр, смена L, G и полярности "
-"перезапускает фильтр. <b>Диагностика АЦП</b> &mdash; поток отсчётов и его "
-"реальная скорость, регистры камерного интерфейса, профиль за последнюю "
-"секунду (занятость обработки, такты на отсчёт, запросы, память), журнал "
-"потерь чанков, побитовая статистика линий данных и их проверка.</td></tr>"
+"перезапускает фильтр.</td></tr>"
+"<tr><td>Диагностика</td><td>Отдельная страница. <b>Лог прибора</b> &mdash; сообщения "
+"прошивки с начала работы (последние 256 строк), цвет по уровню: красные &mdash; "
+"ошибки, жёлтые &mdash; предупреждения; галочки E/W/I/D скрывают уровни, «Сохранить» "
+"пишет лог в файл. Лог виден и тогда, когда консоль молчит из-за эмуляции MCA на "
+"COM. <b>Диагностика АЦП</b> &mdash; поток отсчётов и его реальная скорость, регистры "
+"камерного интерфейса, профиль за последнюю секунду (занятость обработки, такты на "
+"отсчёт, запросы, память), журнал потерь чанков, побитовая статистика линий данных "
+"и их проверка.</td></tr>"
 "</table></div>"
 
 "<div class=le>"
@@ -2451,10 +2552,15 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_HELP_ON)
 "<b>ADC settings</b> &mdash; sample rate, threshold, polarity, spectrum scale and, in "
 "the “Advanced” block, all processing parameters; they go to the device with the "
 "“Apply” button. Changing “Codes per channel” or the method clears the spectrum, "
-"changing L, G or polarity restarts the filter. <b>ADC diagnostics</b> &mdash; the "
-"sample stream and its real rate, camera interface registers, the last-second "
-"profile (processing busy time, cycles per sample, requests, memory), the chunk loss "
-"log, per-bit statistics of the data lines and their check.</td></tr>"
+"changing L, G or polarity restarts the filter.</td></tr>"
+"<tr><td>Diagnostics</td><td>A separate page. <b>Device log</b> &mdash; firmware "
+"messages since start (the last 256 lines), coloured by level: red &mdash; errors, "
+"yellow &mdash; warnings; the E/W/I/D checkboxes hide levels, “Save” writes the log to "
+"a file. The log is visible even when the console is silent because of MCA emulation "
+"on COM. <b>ADC diagnostics</b> &mdash; the sample stream and its real rate, camera "
+"interface registers, the last-second profile (processing busy time, cycles per "
+"sample, requests, memory), the chunk loss log, per-bit statistics of the data lines "
+"and their check.</td></tr>"
 "</table></div>"
 
 "</section></div></body></html>";
@@ -2783,7 +2889,7 @@ esp_err_t mca_web_start(void)
 
     httpd_handle_t srv = NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 32;          /* 25 своих + 2 у /ota, с запасом */
+    cfg.max_uri_handlers = 40;          /* 31 свой + 2 у /ota, с запасом */
     cfg.stack_size       = 8192;
     cfg.core_id          = 0;           /* веб на ядро 0, DSP на ядро 1 */
     cfg.lru_purge_enable = true;
@@ -2805,6 +2911,8 @@ esp_err_t mca_web_start(void)
         URI("/cfg", h_cfg, NULL),
         URI("/cmd", h_cmd, NULL),
         URI("/settings", h_set_page, NULL),
+        URI("/diag", h_diag_page, NULL),
+        URI("/log", h_log, NULL),
         URI("/net", h_set_page, NULL),     /* прежние адреса страницы сети */
         URI("/wifi", h_set_page, NULL),
         URI("/net/status", h_net_status, NULL),

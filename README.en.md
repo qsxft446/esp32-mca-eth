@@ -298,8 +298,8 @@ BecqMoni (answers to commands).
   (ResultDataFile, opens in BecqMoni), CSV (channel, count), N42
   (ANSI N42.42), SPE (SpectraLine).
 - **Settings** — a separate page (link at the top): “Network” (address:
-  DHCP or static), “Firmware” (version and update over the network), “ADC
-  settings” and “ADC diagnostics” sections. The “Spectrum” and “Oscilloscope”
+  DHCP or static), “Firmware” (version and update over the network) and
+  “ADC settings” sections. The “Spectrum” and “Oscilloscope”
   tabs no longer carry settings or diagnostics — the oscilloscope fetches the
   windows, threshold and polarity it needs from the device by itself every
   5 s.
@@ -369,12 +369,21 @@ BecqMoni (answers to commands).
   change as soon as the tab was opened: the oscilloscope started by itself,
   and acquisition silently paused. The header chip shows what the device is
   actually doing.
-- **Diagnostics** — the “ADC diagnostics” section on the “Settings” page:
-  sample stream and its real rate, per-bit statistics of the data lines,
-  last-second profile (including processing busy time and CPU cycles per
-  sample by stage — copy, difference, threshold and events — against the
-  budget of 240 MHz / sample rate), chunk loss log with the device mode,
-  data-line check.
+- **Diagnostics** — a separate page (`/diag`) with two cards:
+  - **Device log** — firmware messages (ESP_LOG) since start: the device
+    keeps the last 256 lines in PSRAM (`main/mca_log.c`), the page fetches
+    new ones every second. Coloured by level: red — errors, yellow —
+    warnings, light — messages, grey — debug; the E/W/I/D checkboxes hide
+    levels, “follow” scrolls to new lines, “Save” writes the log to a file.
+    The log is visible even when the console is silent because of MCA
+    emulation on COM: emulation turns off only printing to the UART, not the
+    collection. Lines from before `app_main` (bootloader, core start) are not
+    in the log — only in the console.
+  - **ADC diagnostics** — sample stream and its real rate, per-bit
+    statistics of the data lines, last-second profile (including processing
+    busy time and CPU cycles per sample by stage — copy, difference,
+    threshold and events — against the budget of 240 MHz / sample rate),
+    chunk loss log with the device mode, data-line check.
 
 ![Single pulse](docs/scope-pulse.png)
 
@@ -737,7 +746,7 @@ pre-allocated memory.
 By default the profile is not printed to the console — only the line
 `потеряно чанков: N, при последней потере шёл /…` (chunks lost: N, the
 request in progress at the last loss was /…), and only in the second when
-losses happened. The “ADC diagnostics” section of the “Settings” page always shows the
+losses happened. The “Diagnostics” page always shows the
 profile. To enable printing: `#define MCA_PROF_LOG 1` in
 `main/mca_config.h`. Then every second:
 
@@ -788,13 +797,13 @@ on other ESP32-S3 boards:
    fields in `main/adc_cap.c`. On this board the working mode is all
    polarities non-inverted, frame sync tied to constant zero; it was found
    by trying all 48 variants (variant 16), after which the search was
-   removed from the firmware. In “ADC diagnostics” on the “Settings” page, the “high
+   removed from the firmware. On the “Diagnostics” page, the “high
    bits 12–15” line must be 0, and “Check data lines” must show D0–D11
    toggling.
 2. Signal from the PMT: a flat baseline between pulses, headroom on the
    ADC scale.
 3. Raise the frequency step by step, checking the oscilloscope and `lost`
-   in the console (or in “ADC diagnostics”) at each step. Data
+   in the console (or on the “Diagnostics” page) at each step. Data
    jumping to 0 and 4095 and OTR firing at one rate means the clock reaches
    the ADC in bad shape (as with LEDC at 16 MHz, see “A CLK generator from
    the camera block”).
