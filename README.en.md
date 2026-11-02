@@ -48,7 +48,7 @@ partition stayed where it was.
 
 After that, no cable is needed, by any of these:
 
-- the “Network” page, “Firmware” block: choose `build/esp32_mca.bin`,
+- the “Settings” page, “Firmware” section: choose `build/esp32_mca.bin`,
   “Upload and restart”;
 - `python tools/ota.py <ip>` — sends `build/esp32_mca.bin`, waits for the
   restart and checks that the new slot is running;
@@ -164,9 +164,9 @@ power comes over PoE.
 Pins follow the Waveshare schematic and are changed in `main/mca_config.h`
 (`PIN_ETH_*`). The SPI bus runs at 20 MHz. The address comes from DHCP and is printed in the
 console: `Ethernet подключён: http://<ip>/` (Ethernet connected), and shown
-on the “Network” page.
+on the “Settings” page, “Network” section.
 
-The “Network” page (`/net`, the old `/wifi` address works too) shows the
+The “Settings” page (`/settings`, the old `/net` and `/wifi` addresses work too) shows the
 Ethernet state and the firmware update over the network. If the W5500 did
 not answer at start, the console shows `W5500 не отвечает - сети нет`
 (W5500 does not respond - no network).
@@ -281,18 +281,21 @@ BecqMoni (answers to commands).
 - **Spectrum** — acquisition, lin/log scale, analysis of the
   selected peak (centroid, FWHM, resolution), file export: XML
   (ResultDataFile, opens in BecqMoni), CSV (channel, count), N42
-  (ANSI N42.42), SPE (SpectraLine). Under the “settings” checkbox is the
-  same processing parameter table as on the “Oscilloscope” tab: the parameters can be
-  changed right during acquisition to see how the spectrum changes.
-- **Processing settings.** The top of the table holds the sample rate,
-  threshold, polarity and spectrum scale; the rest (trapezoid windows,
-  measurement method, pile-up rejection, MCA emulation) is folded into
-  “Advanced”, and the browser remembers whether it is open. The windows L,
-  G, search and re-arm are in samples. They can be left alone: 5-minute
-  acquisitions at 16 MHz with L = 14, 20 and 28 samples gave the same
-  6.9–7.0 % resolution on the ~358 peak — on this board the trapezoid noise
-  is much smaller than the peak width, and the resolution is set by the
-  detector.
+  (ANSI N42.42), SPE (SpectraLine).
+- **Settings** — a separate page (link at the top): “Network” (Ethernet and
+  the address), “Firmware” (version and update over the network), “ADC
+  settings” and “ADC diagnostics” sections. The “Spectrum” and “Oscilloscope”
+  tabs no longer carry settings or diagnostics — the oscilloscope fetches the
+  windows, threshold and polarity it needs from the device by itself every
+  5 s.
+- **ADC settings.** The top of the table holds the sample rate, threshold,
+  polarity and spectrum scale; the rest (trapezoid windows, measurement
+  method, pile-up rejection, MCA emulation) is folded into “Advanced”, and
+  the browser remembers whether it is open. The windows L, G, search and
+  re-arm are in samples. They can be left alone: 5-minute acquisitions at
+  16 MHz with L = 14, 20 and 28 samples gave the same 6.9–7.0 % resolution on
+  the ~358 peak — on this board the trapezoid noise is much smaller than the
+  peak width, and the resolution is set by the detector.
 - **CPS monitor** — on the same tab, below the spectrum: current CPS, mean
   over the whole history with its error, last interval, a plot by averaging
   intervals with a moving average, an interval table and CSV export. The
@@ -318,9 +321,8 @@ BecqMoni (answers to commands).
   “amplitude from–to”: show only pulses whose height above
   the baseline is within the given range of ADC codes, X axis in µs or in
   samples from the trigger point), a ruler with A/B/C markers (start, peak,
-  end of the pulse — copied into the integration parameters) and a table of
-  all processing settings, marked with the measurement method each one
-  belongs to.
+  end of the pulse; the “set before / after peak” button writes them into
+  the integration parameters right away).
 - **Oscilloscope “codes/div” scale** — as on an ordinary oscilloscope: auto
   or 1, 2, 5 … 500 ADC codes per division, 8 divisions. The baseline sits on
   the first line from the bottom (from the top for downward pulses), the
@@ -337,13 +339,12 @@ BecqMoni (answers to commands).
   acquired), on “Oscilloscope” — only the oscilloscope: pause holds the last
   frame and does not touch spectrum acquisition. The firmware turns ADC
   capture on by itself when the open tab needs it.
-- **Diagnostics** — the “diagnostics” checkbox next to “settings” on both
-  tabs (there is no separate page any more): sample stream and its real
-  rate, per-bit statistics of the data lines, last-second profile
-  (including processing busy time and CPU cycles per sample by stage —
-  copy, difference, threshold and events — against the budget of
-  240 MHz / sample rate), chunk loss log with the device mode, data-line
-  check.
+- **Diagnostics** — the “ADC diagnostics” section on the “Settings” page:
+  sample stream and its real rate, per-bit statistics of the data lines,
+  last-second profile (including processing busy time and CPU cycles per
+  sample by stage — copy, difference, threshold and events — against the
+  budget of 240 MHz / sample rate), chunk loss log with the device mode,
+  data-line check.
 
 ![Single pulse](docs/scope-pulse.png)
 
@@ -706,7 +707,7 @@ pre-allocated memory.
 By default the profile is not printed to the console — only the line
 `потеряно чанков: N, при последней потере шёл /…` (chunks lost: N, the
 request in progress at the last loss was /…), and only in the second when
-losses happened. Under the “diagnostics” checkbox the page always shows the
+losses happened. The “ADC diagnostics” section of the “Settings” page always shows the
 profile. To enable printing: `#define MCA_PROF_LOG 1` in
 `main/mca_config.h`. Then every second:
 
@@ -757,13 +758,13 @@ on other ESP32-S3 boards:
    fields in `main/adc_cap.c`. On this board the working mode is all
    polarities non-inverted, frame sync tied to constant zero; it was found
    by trying all 48 variants (variant 16), after which the search was
-   removed from the firmware. With the “diagnostics” checkbox, the “high
+   removed from the firmware. In “ADC diagnostics” on the “Settings” page, the “high
    bits 12–15” line must be 0, and “Check data lines” must show D0–D11
    toggling.
 2. Signal from the PMT: a flat baseline between pulses, headroom on the
    ADC scale.
 3. Raise the frequency step by step, checking the oscilloscope and `lost`
-   in the console (or under the “diagnostics” checkbox) at each step. Data
+   in the console (or in “ADC diagnostics”) at each step. Data
    jumping to 0 and 4095 and OTR firing at one rate means the clock reaches
    the ADC in bad shape (as with LEDC at 16 MHz, see “A CLK generator from
    the camera block”).
