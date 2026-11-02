@@ -372,9 +372,13 @@ BecqMoni (answers to commands).
 - **Diagnostics** — a separate page (`/diag`) with two cards:
   - **Device log** — firmware messages (ESP_LOG) since start: the device
     keeps the last 256 lines in PSRAM (`main/mca_log.c`), the page fetches
-    new ones every second. Coloured by level: red — errors, yellow —
-    warnings, light — messages, grey — debug; the E/W/I/D checkboxes hide
-    levels, “follow” scrolls to new lines, “Save” writes the log to a file.
+    new ones every second. Coloured by level: red (with the line
+    highlighted) — errors, yellow — warnings, light — messages, grey —
+    debug. The tag is coloured by subsystem: ADC, network, firmware,
+    settings, display, emulation, system; numbers, addresses and values in
+    the text are highlighted. The E/W/I/D checkboxes and the subsystem
+    checkboxes (with line counts) hide what is not needed, “follow” scrolls
+    to new lines, “Save” writes the log to a file.
     The log is visible even when the console is silent because of MCA
     emulation on COM: emulation turns off only printing to the UART, not the
     collection. Lines from before `app_main` (bootloader, core start) are not
