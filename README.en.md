@@ -164,10 +164,10 @@ power comes over PoE.
 Pins follow the Waveshare schematic and are changed in `main/mca_config.h`
 (`PIN_ETH_*`). The SPI bus runs at 20 MHz. The address comes from DHCP and is printed in the
 console: `Ethernet подключён: http://<ip>/` (Ethernet connected), and shown
-on the “Settings” page, “Network” section.
+on the display, if one is connected.
 
-The “Settings” page (`/settings`, the old `/net` and `/wifi` addresses work too) shows the
-Ethernet state and the firmware update over the network. If the W5500 did
+On the “Settings” page (`/settings`, the old `/net` and `/wifi` addresses work too) the
+“Network” (address settings) and “Firmware” (update over the network) cards sit side by side. If the W5500 did
 not answer at start, the console shows `W5500 не отвечает - сети нет`
 (W5500 does not respond - no network).
 
@@ -297,8 +297,8 @@ BecqMoni (answers to commands).
   selected peak (centroid, FWHM, resolution), file export: XML
   (ResultDataFile, opens in BecqMoni), CSV (channel, count), N42
   (ANSI N42.42), SPE (SpectraLine).
-- **Settings** — a separate page (link at the top): “Network” (Ethernet and
-  the address), “Firmware” (version and update over the network), “ADC
+- **Settings** — a separate page (link at the top): “Network” (address:
+  DHCP or static), “Firmware” (version and update over the network), “ADC
   settings” and “ADC diagnostics” sections. The “Spectrum” and “Oscilloscope”
   tabs no longer carry settings or diagnostics — the oscilloscope fetches the
   windows, threshold and polarity it needs from the device by itself every

@@ -984,6 +984,8 @@ static const char PAGE[] =
 "setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},1000)}"
 "function mclr(){if(!confirm(L('Очистить историю CPS на приборе?','Clear the CPS history on the device?')))return;"
 "fetch('/hist?clear=1').then(function(){mload()})}"
+/* вкладка из ссылки с других страниц: #scope или #spectrum - только вид */
+"if(location.hash=='#scope'){window.VINIT=1;tab(SCM)}else if(location.hash=='#spectrum'){window.VINIT=1;tab(0)}"
 "setInterval(poll,1000);poll();wsOpen();sloop();"
 "</script></body></html>";
 
@@ -1502,7 +1504,8 @@ static void net_init(void)
 "<span style=color:var(--accent)>AD9226</span></div>" \
 "<div class=chips><span class='seg lng'><button onclick=\"setLang('ru')\">RU</button>" \
 "<button onclick=\"setLang('en')\">EN</button></span></div></header>"
-#define SUB_NAV(W, H) "<nav><a href=/ data-en='Spectrum'>Спектр</a>" W H "</nav>"
+#define SUB_NAV(W, H) "<nav><a href=/#spectrum data-en='Spectrum'>Спектр</a>" \
+    "<a href=/#scope data-en='Oscilloscope'>Осциллограф</a>" W H "</nav>"
 #define N_SET    "<a href=/settings data-en='Settings'>Настройки</a>"
 #define N_SET_ON "<span class=on data-en='Settings'>Настройки</span>"
 #define N_HELP    "<a href=/help data-en='Help'>Справка</a>"
@@ -1515,19 +1518,17 @@ static void net_init(void)
 static const char SET_PAGE[] =
 SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "<div class=wrap>"
-"<section class='panel pad' style=max-width:720px>"
+"<div style='display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start'>"
+"<section class='panel pad' style='flex:1 1 360px'>"
 "<h3 data-en='Network'>Сеть</h3>"
-"<div id=eth class=n style=margin-bottom:6px>...</div>"
-"<p class=n data-en='The device works over Ethernet only (power over PoE); there is no WiFi in this "
-"firmware.'>Прибор работает только по Ethernet (питание по PoE), WiFi в этой прошивке нет.</p>"
 "<div class=grp style='margin:10px 0'>"
 "<label><input type=radio name=nm id=nmd onchange=nmode()> <span data-en='address from the router (DHCP)'>адрес от роутера (DHCP)</span></label>"
 "<label><input type=radio name=nm id=nms onchange=nmode()> <span data-en='static address'>статический адрес</span></label></div>"
 "<table class=ptab id=nst>"
-"<tr><td data-en='Address'>Адрес</td><td><input id=n_ip placeholder=192.168.1.50></td></tr>"
-"<tr><td data-en='Mask'>Маска</td><td><input id=n_mask placeholder=255.255.255.0></td></tr>"
-"<tr><td data-en='Gateway'>Шлюз</td><td><input id=n_gw placeholder=192.168.1.1></td></tr>"
-"<tr><td>DNS</td><td><input id=n_dns placeholder=192.168.1.1></td></tr></table>"
+"<tr><td data-en='Address'>Адрес</td><td><input id=n_ip placeholder=192.168.1.50 style=width:220px></td></tr>"
+"<tr><td data-en='Mask'>Маска</td><td><input id=n_mask placeholder=255.255.255.0 style=width:220px></td></tr>"
+"<tr><td data-en='Gateway'>Шлюз</td><td><input id=n_gw placeholder=192.168.1.1 style=width:220px></td></tr>"
+"<tr><td>DNS</td><td><input id=n_dns placeholder=192.168.1.1 style=width:220px></td></tr></table>"
 "<button class='btn green' onclick=netSave() style=margin-top:8px data-en='Save address'>Сохранить адрес</button>"
 "<div id=nmsg class=n style=margin-top:8px></div>"
 "<p class=n data-en='A new static address is applied at once, and this page opens on it. If it does not "
@@ -1538,7 +1539,7 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "BOOT, удержанная 5 с во время работы, возвращает DHCP.</p>"
 "</section>"
 /* обновление прошивки по сети: файл build/esp32_mca.bin, см. mca_ota.c */
-"<section class='panel pad' style=max-width:720px>"
+"<section class='panel pad' style='flex:1 1 360px'>"
 "<h3 data-en='Firmware'>Прошивка</h3>"
 "<div id=fw class=n style=margin-bottom:10px>...</div>"
 "<input id=fwf type=file accept=.bin style='width:100%;margin:4px 0 10px'>"
@@ -1547,7 +1548,7 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "<p class=n data-en='File build/esp32_mca.bin from the project build. If the new firmware does not "
 "come up on the network, the next restart brings back the previous one.'>Файл build/esp32_mca.bin "
 "из сборки проекта. Если новая прошивка не выйдет на связь, следующая перезагрузка вернёт прежнюю.</p>"
-"</section>"
+"</section></div>"
 "<section class='panel pad'>"
 "<h3 data-en='ADC settings'>Настройки АЦП</h3>"
 "<div style=overflow-x:auto><table class=ptab id=pbox></table></div>"
@@ -1726,14 +1727,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "function ldcfg(){fetch('/stat').then(function(r){return r.json()}).then(function(j){window.REALHZ=j.freq})"
 ".catch(function(){}).then(function(){return fetch('/cfg')}).then(function(r){return r.json()})"
 ".then(fillCfg).catch(function(){})}"
+/* форма адреса: записанная настройка, а при DHCP - то, что выдал роутер */
 "function ld(){fetch('/net/status').then(r=>r.json()).then(function(j){"
-"var ei=j.eth_ip!='0.0.0.0';"
-"document.getElementById('eth').innerHTML=!j.eth_present?L('модуль W5500 не найден','W5500 module not found'):"
-"ei?L('подключён: ','connected: ')+'<b><a href=http://'+j.eth_ip+'/>http://'+j.eth_ip+'/</a></b>':"
-"(j.eth_link?L('кабель подключён, жду адрес от роутера','cable connected, waiting for an address from the router'):"
-"L('модуль найден, кабель не подключён','module found, cable not connected'));"
-"document.getElementById('eth').innerHTML+=(ei?' &nbsp;<span class=mut>'+(j.dhcp?'DHCP':L('статический','static'))+', '+L('маска ','mask ')+j.mask+', '+L('шлюз ','gateway ')+j.gw+'</span>':'')+"
-"(j.pend>0?' <b style=color:#f0c45a>'+L('ждёт подтверждения ещё ','awaiting confirmation for ')+j.pend+L(' с',' s')+'</b>':'');"
 "if(!window.NFILL){window.NFILL=1;var c=j.cfg;document.getElementById(c.dhcp?'nmd':'nms').checked=true;"
 "if(!c.dhcp){document.getElementById('n_ip').value=c.ip;document.getElementById('n_mask').value=c.mask;"
 "document.getElementById('n_gw').value=c.gw=='0.0.0.0'?'':c.gw;document.getElementById('n_dns').value=c.dns=='0.0.0.0'?'':c.dns}"
@@ -1886,7 +1881,7 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "df(L('НИ ОДНА линия не шевелится — АЦП не преобразует. Смотрите питание платы и приходит ли на неё такт.',"
 "'NOT A SINGLE line is changing — the ADC is not converting. Check the board power and whether the clock reaches it.'),'bad');"
 "document.getElementById('dpr').innerHTML=h})}"
-"ldcfg();ld();fwi();dupd();setInterval(ld,3000);setInterval(dupd,1000);"
+"ldcfg();ld();fwi();dupd();setInterval(dupd,1000);"
 "</script></body></html>";
 
 static esp_err_t h_set_page(httpd_req_t *r)
@@ -2289,7 +2284,7 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_HELP_ON)
 "АЦП, а строка «запас по шкале» &mdash; сколько кодов осталось от базы "
 "до потолка и до пола.</td></tr>"
 "<tr><td>Настройки</td><td>Отдельная страница (ссылка «Настройки» вверху). "
-"<b>Сеть</b> &mdash; состояние Ethernet и адрес прибора. <b>Прошивка</b> &mdash; "
+"<b>Сеть</b> &mdash; адрес прибора: от роутера (DHCP) или статический. <b>Прошивка</b> &mdash; "
 "версия и обновление по сети файлом build/esp32_mca.bin. <b>Настройки АЦП</b> &mdash; "
 "частота, порог, полярность, шкала спектра и в блоке «Дополнительно» все "
 "параметры обработки; в прибор уходят кнопкой «Применить». Смена «Кодов на "
@@ -2451,7 +2446,7 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_HELP_ON)
 "range, and the “headroom from baseline” line shows how many codes are left from the "
 "baseline to the ceiling and the floor.</td></tr>"
 "<tr><td>Settings</td><td>A separate page (the “Settings” link at the top). "
-"<b>Network</b> &mdash; the Ethernet state and the device address. <b>Firmware</b> "
+"<b>Network</b> &mdash; the device address: from the router (DHCP) or static. <b>Firmware</b> "
 "&mdash; the version and an update over the network with the build/esp32_mca.bin file. "
 "<b>ADC settings</b> &mdash; sample rate, threshold, polarity, spectrum scale and, in "
 "the “Advanced” block, all processing parameters; they go to the device with the "
