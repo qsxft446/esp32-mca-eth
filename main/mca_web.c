@@ -177,12 +177,13 @@ static const char PAGE[] =
 /* язык страниц: RU / EN (см. LJS) - рядом с частотой АЦП */
 "<span class='seg lng'><button onclick=\"setLang('ru')\">RU</button>"
 "<button onclick=\"setLang('en')\">EN</button></span></div></header>"
-/* Режимы - вкладками. Сам режим живёт в скрытом
-   списке md: на него завязаны опрос и синхронизация с прибором. */
+/* Вкладки - это ВИД страницы (скрытый список md), а не режим прибора:
+   открыть осциллограф не значит его запустить. Режим прибора (DM, из
+   /stat) меняется только кнопкой «Старт» на вкладке. */
 "<nav id=tabs><span data-md=0 onclick=tab(0) data-en='Spectrum'>Спектр</span>"
 "<span data-md=1 onclick=tab(SCM) data-en='Oscilloscope'>Осциллограф</span>"
 "<a href=/settings data-en='Settings'>Настройки</a><a href=/help data-en='Help'>Справка</a></nav>"
-"<select id=md hidden onchange=setmode()><option value=0><option value=1>"
+"<select id=md hidden><option value=0><option value=1>"
 "<option value=2><option value=3></select>"
 "<div class=wrap>"
 "<div class=status id=st data-en='connecting...'>подключение...</div>"
@@ -322,9 +323,23 @@ static const char PAGE[] =
 /* RLOCK - как MDLOCK для режима: ответ /stat, ушедший с прибора ДО
    команды, иначе вернул бы прежнее состояние, и опрос осциллографа и
    подпись в шапке на секунду дёрнулись бы обратно */
+/* Режим прибора общий: осциллограф и набор спектра одновременно не
+   идут. «Старт» на «Осциллографе» при идущем наборе - только после
+   предупреждения: набор останавливается (накопленный спектр остаётся),
+   прибор переходит в осциллограф. «Старт» на «Спектре» возвращает
+   прибор в набор. Раньше режим менялся уже при открытии вкладки, и
+   осциллограф запускался сам, а набор молча вставал. */
+"function DSC(){return window.DM==1||window.DM==3}"
+"function devmode(v){window.DM=v;window.MDLOCK=Date.now()+1500;return fetch('/cfg?mode='+v)}"
 "function run(on){window.RLOCK=Date.now()+1500;"
-"if(isScope()){window.SRUN=on?1:0;cmd(on?'scope_start':'scope_stop');"
-"runChip(on,1)}else{cmd(on?'start':'stop');runChip(on,0)}}"
+"if(isScope()){if(on){"
+"if(!DSC()&&window.SPRUN&&!confirm(L('Набор спектра остановится: накопленный спектр сохранится, продолжить набор можно кнопкой «Старт» на вкладке «Спектр». Запустить осциллограф?',"
+"'Spectrum acquisition will stop: the accumulated spectrum is kept, acquisition can be resumed with “Start” on the “Spectrum” tab. Start the oscilloscope?')))return;"
+"window.SRUN=1;window.SPRUN=0;window.LASTJ=null;"
+"fetch('/cmd?do=stop').then(function(){return devmode(SCM)}).then(function(){cmd('scope_start')})}"
+"else{window.SRUN=0;cmd('scope_stop')}runChip(on,1)}"
+"else{if(on&&DSC())devmode(0).then(function(){cmd('start')});else cmd(on?'start':'stop');"
+"window.SPRUN=on?1:0;runChip(on,0)}}"
 /* подпись в шапке: состояние той работы, что на открытой вкладке */
 "function runChip(on,sc){"
 "document.getElementById('rundot').className=on?'dot':'dot off';"
@@ -336,11 +351,8 @@ static const char PAGE[] =
    как вложение, поэтому страница никуда не уходит. */
 "function expo(f){var d=new Date();"
 "location.href='/export.'+f+'?t='+Math.floor(d/1000)+'&tz='+(-d.getTimezoneOffset())}"
-/* MDLOCK - окно, в течение которого ответы /stat не трогают выбор
-   режима. Без него ответ, ушедший с прибора ДО применения новой
-   команды, возвращал бы список обратно, и пункт дёргался бы. */
-"function setmode(){window.MDLOCK=Date.now()+1500;"
-"fetch('/cfg?mode='+document.getElementById('md').value)}"
+/* MDLOCK - окно, в течение которого ответы /stat не трогают DM: ответ,
+   ушедший с прибора ДО новой команды, вернул бы прежний режим. */
 "var cv=document.getElementById('cv'),cx=cv.getContext('2d');"
 /* Поле графика: сверху TOPM, снизу BOTM под шкалу каналов.
    Обе функции обязаны считать высоту одинаково, иначе кривая
@@ -700,8 +712,9 @@ static const char PAGE[] =
 "document.getElementById('bauto').className=m=='1'?'on':'';"
 "document.getElementById('bwait').className=m=='3'?'on':'';"
 "showCtl()}"
-"function tab(v){document.getElementById('md').value=v;setmode();hl();window.LASTSIG='';poll()}"
-"function scm(v){SCM=v;tab(v)}"
+"function tab(v){document.getElementById('md').value=v;hl();window.LASTSIG='';poll()}"
+/* авто / ждущий: если осциллограф уже идёт - сразу на приборе */
+"function scm(v){SCM=v;if(DSC())devmode(v);tab(v)}"
 "function setLog(v){document.getElementById('lg').checked=!!v;"
 "document.getElementById('blin').className=v?'':'on';"
 "document.getElementById('blog').className=v?'on':'';poll()}"
@@ -710,6 +723,10 @@ static const char PAGE[] =
 "hl();"
 "function poll(){"
 "var md=document.getElementById('md').value;"
+/* вкладка осциллографа, а прибор не в нём: холст пуст, под ним - что нажать */
+"if(isScope()&&!DSC()&&window.DM!==undefined){cv.width=cv.clientWidth;cx.clearRect(0,0,cv.width,cv.height);window.LASTJ=null;"
+"document.getElementById('sc').innerHTML=L('Осциллограф остановлен. «Старт» запустит его','The oscilloscope is stopped. “Start” launches it')+"
+"(window.SPRUN?L(' &mdash; набор спектра при этом остановится.',' &mdash; spectrum acquisition will stop then.'):'.')}"
 "if(md=='0'||md=='2'){mload();fetch('/spectrum').then(r=>r.json()).then(function(j){"
 "draw(j.d,document.getElementById('lg').checked);"
 "var a=j.d,mx=0,tot=0,pk=0;"
@@ -748,15 +765,12 @@ static const char PAGE[] =
 "var mt=document.getElementById('mtime');if(mt&&j.tsrc!==undefined){var dd=new Date(j.tnow);"
 "mt.textContent=L('время прибора ','device time ')+(j.tnow?p2(dd.getHours())+':'+p2(dd.getMinutes())+':'+"
 "p2(dd.getSeconds()):L('не задано','not set'))+(j.tsrc==1?' (SNTP)':j.tsrc==2?L(' (от браузера)',' (from browser)'):'')}"
-"if(!(window.RLOCK>Date.now())){if(j.srun!==undefined)window.SRUN=j.srun;"
-"if(isScope())runChip(j.srun,1);else runChip(j.run,0)}"
+"if(j.mode!==undefined&&!(window.MDLOCK>Date.now()))window.DM=j.mode;"
+"if(!(window.RLOCK>Date.now())){if(j.srun!==undefined)window.SRUN=j.srun;window.SPRUN=j.run;"
+"if(isScope())runChip(DSC()&&j.srun,1);else runChip(!DSC()&&j.run,0)}"
 "document.getElementById('fchip').textContent=(j.freq/1e6).toFixed(2)+L(' МГц',' MHz');"
-/* Режим ОБЩИЙ для всего прибора, а не для вкладки: если его сменили
-   из другого окна, список должен это показать, иначе страница рисует
-   чужие устаревшие данные и молча не набирает спектр. */
-"if(j.mode!==undefined&&!(window.MDLOCK>Date.now())){"
-"var mdel=document.getElementById('md');"
-"if(+mdel.value!==+j.mode){mdel.value=j.mode;hl()}}"
+/* при открытии страницы - вкладка того, что прибор делает сейчас */
+"if(!window.VINIT&&j.mode!==undefined){window.VINIT=1;if(j.mode==1||j.mode==3){SCM=+j.mode;tab(SCM)}}"
 "window.REALHZ=j.freq})}"
 /* ОСЦИЛЛОГРАФ опрашивается отдельно от спектра и статуса: следующий
    запрос уходит, как только отрисован предыдущий, но не чаще раза в
@@ -820,11 +834,11 @@ static const char PAGE[] =
 "WS.onopen=function(){WSOK=1;WSQ=''};"
 "WS.onclose=function(){WSOK=0;WS=null;setTimeout(wsOpen,3000)};"
 "WS.onmessage=function(ev){if(typeof ev.data=='string')return;"
-"if(window.SRUN===0&&window.LASTJ)return;"
+"if(!DSC()||(window.SRUN===0&&window.LASTJ))return;"
 "var j=wparse(ev.data);if(j)sframe(j,document.getElementById('md').value,ev.data.byteLength)}}"
 "function sloop(){var md=document.getElementById('md').value,sc=(md=='1'||md=='3'),"
 /* пауза: кадры не берём, на экране последний */
-"on=sc&&!(window.SRUN===0&&window.LASTJ);"
+"on=sc&&DSC()&&!(window.SRUN===0&&window.LASTJ);"
 "if(!on)SPEND=null;"
 "if(WSOK){var q=scq()+'&run='+(on?1:0),t=Date.now();"
 "if(q!=WSQ||t-WST>2000){try{WS.send(q);WSQ=q;WST=t}catch(e){}}"
@@ -848,11 +862,20 @@ static const char PAGE[] =
 "fetch('/hist?from='+MH.nx).then(function(r){return r.arrayBuffer()}).then(function(b){MH.busy=0;"
 "if(b.byteLength<28)return;var v=new DataView(b),ep=v.getUint32(0,true),fs=v.getUint32(4,true),"
 "nx=v.getUint32(8,true),nds=v.getUint32(12,true),n=v.getUint32(16,true),now=Date.now();"
-"if(ep!==MH.ep){MH.ep=ep;MH.t=[];MH.c=[];MH.d=[];MV.end=0}"
+"if(ep!==MH.ep){MH.ep=ep;MH.t=[];MH.c=[];MH.d=[];MV.end=0;MH.o=null}"
+"var o0=mofs(now,nds);"
 "for(var i=0;i<n&&38+10*i<=b.byteLength;i++){var o=28+10*i;"
-"MH.t.push(now-(nds-v.getUint32(o,true))*100);MH.c.push(v.getUint32(o+4,true));MH.d.push(v.getUint16(o+8,true))}"
+"MH.t.push(o0+v.getUint32(o,true)*100);MH.c.push(v.getUint32(o+4,true));MH.d.push(v.getUint16(o+8,true))}"
 "var ex=MH.t.length-21600;if(ex>0){MH.t.splice(0,ex);MH.c.splice(0,ex);MH.d.splice(0,ex)}"
 "MH.nx=fs+n;if(MH.nx<nx)mload();else mdraw()}).catch(function(){MH.busy=0})}"
+/* Сдвиг часов прибора относительно браузера - один на всю историю.
+   Раньше время отсчёта считалось от момента своего запроса («сейчас минус
+   возраст»), и у каждой порции был свой сдвиг: задержка сети и округление
+   до 0.1 с. Отсчёт у границы секунды перескакивал в соседнюю - в одной
+   секунде два отсчёта, следующая пустая, и график рвался (у прибора шаг
+   отсчётов ровно 1.0 с: 280 из 284). Пересчёт - только при расхождении
+   больше 2 с (перевели часы компьютера). */
+"function mofs(now,nds){var o=now-nds*100;if(MH.o==null||Math.abs(o-MH.o)>2000)MH.o=o;return MH.o}"
 /* Интервалы по step мс, выровненные по часам; отдаются только законченные
    (конец не позже последнего отсчёта). T - время конца отсчёта. */
 "function mbuck(T,C,D,step){var o={t:[],c:[],d:[]},k=-1,cur=NaN,n=T.length;if(!n)return o;"
@@ -1496,8 +1519,23 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "<h3 data-en='Network'>Сеть</h3>"
 "<div id=eth class=n style=margin-bottom:6px>...</div>"
 "<p class=n data-en='The device works over Ethernet only (power over PoE); there is no WiFi in this "
-"firmware. The address comes from the router via DHCP.'>Прибор работает только по Ethernet (питание "
-"по PoE), WiFi в этой прошивке нет. Адрес выдаёт роутер по DHCP.</p>"
+"firmware.'>Прибор работает только по Ethernet (питание по PoE), WiFi в этой прошивке нет.</p>"
+"<div class=grp style='margin:10px 0'>"
+"<label><input type=radio name=nm id=nmd onchange=nmode()> <span data-en='address from the router (DHCP)'>адрес от роутера (DHCP)</span></label>"
+"<label><input type=radio name=nm id=nms onchange=nmode()> <span data-en='static address'>статический адрес</span></label></div>"
+"<table class=ptab id=nst>"
+"<tr><td data-en='Address'>Адрес</td><td><input id=n_ip placeholder=192.168.1.50></td></tr>"
+"<tr><td data-en='Mask'>Маска</td><td><input id=n_mask placeholder=255.255.255.0></td></tr>"
+"<tr><td data-en='Gateway'>Шлюз</td><td><input id=n_gw placeholder=192.168.1.1></td></tr>"
+"<tr><td>DNS</td><td><input id=n_dns placeholder=192.168.1.1></td></tr></table>"
+"<button class='btn green' onclick=netSave() style=margin-top:8px data-en='Save address'>Сохранить адрес</button>"
+"<div id=nmsg class=n style=margin-top:8px></div>"
+"<p class=n data-en='A new static address is applied at once, and this page opens on it. If it does not "
+"open from the new address within 60 s (wrong subnet or gateway), the device returns to the previous "
+"settings. Holding the BOOT button for 5 s while the device is running switches back to DHCP.'>"
+"Новый статический адрес применяется сразу, и эта страница открывается по нему. Если за 60 с она "
+"не откроется с нового адреса (не та подсеть или шлюз), прибор вернётся к прежним настройкам. Кнопка "
+"BOOT, удержанная 5 с во время работы, возвращает DHCP.</p>"
 "</section>"
 /* обновление прошивки по сети: файл build/esp32_mca.bin, см. mca_ota.c */
 "<section class='panel pad' style=max-width:720px>"
@@ -1693,7 +1731,35 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_HELP)
 "document.getElementById('eth').innerHTML=!j.eth_present?L('модуль W5500 не найден','W5500 module not found'):"
 "ei?L('подключён: ','connected: ')+'<b><a href=http://'+j.eth_ip+'/>http://'+j.eth_ip+'/</a></b>':"
 "(j.eth_link?L('кабель подключён, жду адрес от роутера','cable connected, waiting for an address from the router'):"
-"L('модуль найден, кабель не подключён','module found, cable not connected'))})}"
+"L('модуль найден, кабель не подключён','module found, cable not connected'));"
+"document.getElementById('eth').innerHTML+=(ei?' &nbsp;<span class=mut>'+(j.dhcp?'DHCP':L('статический','static'))+', '+L('маска ','mask ')+j.mask+', '+L('шлюз ','gateway ')+j.gw+'</span>':'')+"
+"(j.pend>0?' <b style=color:#f0c45a>'+L('ждёт подтверждения ещё ','awaiting confirmation for ')+j.pend+L(' с',' s')+'</b>':'');"
+"if(!window.NFILL){window.NFILL=1;var c=j.cfg;document.getElementById(c.dhcp?'nmd':'nms').checked=true;"
+"if(!c.dhcp){document.getElementById('n_ip').value=c.ip;document.getElementById('n_mask').value=c.mask;"
+"document.getElementById('n_gw').value=c.gw=='0.0.0.0'?'':c.gw;document.getElementById('n_dns').value=c.dns=='0.0.0.0'?'':c.dns}"
+"else{document.getElementById('n_ip').value=j.eth_ip!='0.0.0.0'?j.eth_ip:'';document.getElementById('n_mask').value=j.mask;"
+"document.getElementById('n_gw').value=j.gw}nmode()}})}"
+/* поля адреса - только для статического */
+"function nmode(){var st=document.getElementById('nms').checked;"
+"document.getElementById('nst').style.opacity=st?1:.4;"
+"['n_ip','n_mask','n_gw','n_dns'].forEach(function(k){document.getElementById(k).disabled=!st})}"
+/* Сохранить: DHCP - сразу; статический - прибор применяет его через
+   0.5 с, а страница переходит на новый адрес и оттуда подтверждает его
+   (?netok=1). Не открылась за 60 с - прибор вернётся к прежнему. */
+"function netSave(){var m=document.getElementById('nmsg'),st=document.getElementById('nms').checked;"
+"function v(k){return document.getElementById(k).value.trim()}"
+"var ip=v('n_ip'),q=st?'mode=static&ip='+encodeURIComponent(ip)+'&mask='+encodeURIComponent(v('n_mask'))+"
+"'&gw='+encodeURIComponent(v('n_gw'))+'&dns='+encodeURIComponent(v('n_dns')):'mode=dhcp';"
+"if(!confirm(st?L('Прибор перейдёт на адрес ','The device will move to address ')+ip+L('. Страница откроется по нему; если за 60 с не откроется, прибор вернётся к прежним настройкам. Продолжить?',"
+"'. The page will open on it; if it does not open within 60 s, the device returns to the previous settings. Continue?'):"
+"L('Адрес будет от роутера (DHCP) и может смениться: смотрите его на дисплее прибора или в консоли. Продолжить?',"
+"'The address will come from the router (DHCP) and may change: see it on the device display or in the console. Continue?')))return;"
+"fetch('/net/set?'+q).then(function(r){return r.json()}).then(function(j){m.textContent=L(j.msg,j.en||j.msg);"
+"if(j.ok&&st)setTimeout(function(){location.href='http://'+ip+'/settings?netok=1'},2000)})"
+".catch(function(){m.textContent=L('нет связи с прибором','no connection to the device')})}"
+/* открылись с нового адреса - подтвердить его */
+"if(location.search.indexOf('netok=1')>=0)fetch('/net/confirm').then(function(r){return r.json()}).then(function(j){"
+"document.getElementById('nmsg').textContent=L(j.msg,j.en||j.msg)});"
 "function fwi(){return fetch('/ota').then(r=>r.json()).then(function(j){"
 "document.getElementById('fw').innerHTML=L('версия ','version ')+'<b>'+j.ver+'</b> ('+j.date+' '+j.time+'), '+"
 "L('слот ','slot ')+j.run+(j.state=='pending'?L(', ждёт подтверждения',', awaiting confirmation'):'');return j})}"
@@ -1829,6 +1895,71 @@ static esp_err_t h_set_page(httpd_req_t *r)
     return httpd_resp_send(r, SET_PAGE, HTTPD_RESP_USE_STRLEN);
 }
 
+/* /net/set?mode=dhcp | /net/set?mode=static&ip=&mask=&gw=&dns= - настройка
+ * адреса. Статический применяется через 0.5 с (ответ успевает уйти) и
+ * ждёт подтверждения /net/confirm с нового адреса 60 с, иначе прибор
+ * вернёт прежнюю. Сообщение - на двух языках: msg и en. */
+#define NET_CONFIRM_S 60
+
+static bool q_ip(const char *q, const char *key, uint32_t *out)
+{
+    char v[20];
+    esp_ip4_addr_t a;
+    if (httpd_query_key_value(q, key, v, sizeof(v)) != ESP_OK || !v[0]) return false;
+    if (esp_netif_str_to_ip4(v, &a) != ESP_OK) return false;
+    *out = a.addr;
+    return true;
+}
+
+static esp_err_t net_reply(httpd_req_t *r, bool ok, const char *msg, const char *en)
+{
+    char buf[400];
+    int n = snprintf(buf, sizeof(buf), "{\"ok\":%s,\"msg\":\"%s\",\"en\":\"%s\",\"t\":%d}",
+                     ok ? "true" : "false", msg, en, NET_CONFIRM_S);
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, buf, n);
+}
+
+static esp_err_t h_net_set(httpd_req_t *r)
+{
+    char q[200], v[12] = { 0 };
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) != ESP_OK ||
+        httpd_query_key_value(q, "mode", v, sizeof(v)) != ESP_OK)
+        return net_reply(r, false, "нет параметра mode", "no mode parameter");
+    mca_net_cfg_t c = { 0 };
+    if (!strcmp(v, "dhcp")) {
+        c.dhcp = 1;
+    } else {
+        if (!q_ip(q, "ip", &c.ip) || !q_ip(q, "mask", &c.mask))
+            return net_reply(r, false, "адрес или маска заданы неверно",
+                             "the address or mask is invalid");
+        /* маска - сплошные единицы слева: 255.255.255.0 и т.п. */
+        const uint32_t m = __builtin_bswap32(c.mask);
+        if (m == 0 || (~m & (~m + 1)) != 0)
+            return net_reply(r, false, "маска задана неверно", "the mask is invalid");
+        q_ip(q, "gw", &c.gw);
+        q_ip(q, "dns", &c.dns);
+        if (c.gw && (c.gw & c.mask) != (c.ip & c.mask))
+            return net_reply(r, false, "шлюз не из этой подсети",
+                             "the gateway is not in this subnet");
+    }
+    if (mca_eth_set_cfg(&c, 500, NET_CONFIRM_S) != ESP_OK)
+        return net_reply(r, false, "Ethernet не работает", "Ethernet is not working");
+    return c.dhcp ? net_reply(r, true, "адрес будет от роутера (DHCP)",
+                              "the address will come from the router (DHCP)")
+                  : net_reply(r, true, "адрес применён, жду подтверждения",
+                              "address applied, waiting for confirmation");
+}
+
+static esp_err_t h_net_confirm(httpd_req_t *r)
+{
+    return mca_eth_confirm()
+        ? net_reply(r, true, "новый адрес подтверждён и сохранён",
+                    "the new address is confirmed and saved")
+        : net_reply(r, false, "подтверждать нечего", "nothing to confirm");
+}
+
 /* /oled.pbm - то, что сейчас на дисплее SSD1306, картинкой PBM 128x64
  * (рисуется и без самого дисплея) */
 static esp_err_t h_oled(httpd_req_t *r)
@@ -1842,12 +1973,25 @@ static esp_err_t h_oled(httpd_req_t *r)
 
 static esp_err_t h_net_status(httpd_req_t *r)
 {
-    const esp_ip4_addr_t eip = { .addr = mca_eth_ip() };
-    char buf[160];
+    uint32_t ip, mask, gw;
+    mca_eth_ip_info(&ip, &mask, &gw);
+    mca_net_cfg_t cur, sv;
+    mca_eth_get_cfg(&cur, &sv);
+    const esp_ip4_addr_t eip = { .addr = ip }, em = { .addr = mask }, eg = { .addr = gw },
+                         cip = { .addr = sv.ip }, cm = { .addr = sv.mask },
+                         cg = { .addr = sv.gw }, cd = { .addr = sv.dns };
+    char buf[480];
+    /* cfg - записанная настройка (её показывает форма), pend - секунд до
+     * возврата прежней, пока новый адрес не подтверждён */
     int n = snprintf(buf, sizeof(buf),
-        "{\"eth_present\":%s,\"eth_link\":%s,\"eth_ip\":\"" IPSTR "\"}",
+        "{\"eth_present\":%s,\"eth_link\":%s,\"eth_ip\":\"" IPSTR "\","
+        "\"mask\":\"" IPSTR "\",\"gw\":\"" IPSTR "\",\"dhcp\":%d,\"pend\":%d,"
+        "\"cfg\":{\"dhcp\":%d,\"ip\":\"" IPSTR "\",\"mask\":\"" IPSTR "\","
+        "\"gw\":\"" IPSTR "\",\"dns\":\"" IPSTR "\"}}",
         mca_eth_present() ? "true" : "false",
-        mca_eth_link_up() ? "true" : "false", IP2STR(&eip));
+        mca_eth_link_up() ? "true" : "false", IP2STR(&eip), IP2STR(&em), IP2STR(&eg),
+        cur.dhcp, mca_eth_pending_s(), sv.dhcp, IP2STR(&cip), IP2STR(&cm),
+        IP2STR(&cg), IP2STR(&cd));
     httpd_resp_set_type(r, "application/json");
     /* snprintf возвращает длину, которая ПОТРЕБОВАЛАСЬ БЫ. При нехватке
      * места это больше размера буфера, и отправка читала бы за его
@@ -2669,6 +2813,8 @@ esp_err_t mca_web_start(void)
         URI("/net", h_set_page, NULL),     /* прежние адреса страницы сети */
         URI("/wifi", h_set_page, NULL),
         URI("/net/status", h_net_status, NULL),
+        URI("/net/set", h_net_set, NULL),
+        URI("/net/confirm", h_net_confirm, NULL),
         URI("/oled.pbm", h_oled, NULL),
         URI("/diag/data", h_diag_data, NULL),
         URI("/diag/set", h_diag_set, NULL),

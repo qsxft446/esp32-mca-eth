@@ -22,7 +22,7 @@ typedef struct __attribute__((packed)) {
 
 bool   mca_hist_init(void);
 /* Из главной задачи, раз в секунду, только если dur_ms > 0. */
-void   mca_hist_push(uint32_t counts, uint32_t dur_ms);
+void   mca_hist_push(uint32_t counts, uint32_t dur_ms, int64_t t_us);  /* t_us - время тика, esp_timer */
 /* Очистить и сменить эпоху (страница по ней понимает, что история новая). */
 void   mca_hist_clear(void);
 /* Отсчёты начиная с номера from (меньше старейшего или больше

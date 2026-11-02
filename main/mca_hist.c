@@ -37,11 +37,16 @@ bool mca_hist_init(void)
     return true;
 }
 
-void mca_hist_push(uint32_t counts, uint32_t dur_ms)
+void mca_hist_push(uint32_t counts, uint32_t dur_ms, int64_t t_us)
 {
     if (!s_ring) return;
+    /* Время отсчёта - плановое время секундного тика, а не момент записи:
+     * главный цикл просыпается раз в 100 мс, и момент записи гулял на
+     * долю шага - соседние отсчёты шли через 0.9 и 1.1 с (на приборе пара
+     * на ~280 отсчётов), и при неудачной фазе секунда на графике
+     * страницы оставалась пустой. */
     const mca_hist_sample_t smp = {
-        .end_ds = (uint32_t)(esp_timer_get_time() / 100000),
+        .end_ds = (uint32_t)(t_us / 100000),
         .counts = counts,
         .dur_ms = (uint16_t)(dur_ms > 65535 ? 65535 : dur_ms),
     };

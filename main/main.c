@@ -185,6 +185,9 @@ void app_main(void)
 
         const int64_t now_us = esp_timer_get_time();
         if (now_us >= next_tick_us) {
+            /* плановое время тика: ровно через 1 с, в отличие от now_us,
+             * который опаздывает на долю 100-мс шага цикла */
+            const int64_t tick_us = next_tick_us;
             next_tick_us += 1000000;
             if (now_us - next_tick_us > 1000000)   /* сильно отстали - не догоняем */
                 next_tick_us = now_us + 1000000;
@@ -194,7 +197,7 @@ void app_main(void)
             {
                 uint32_t cnt, dur;
                 mca_dsp_last_second(&cnt, &dur);
-                if (dur) mca_hist_push(cnt, dur);
+                if (dur) mca_hist_push(cnt, dur, tick_us);
             }
             mca_diag_tick_1s(adc_clk_get_freq());
             mca_prof_tick_1s();

@@ -171,6 +171,21 @@ Ethernet state and the firmware update over the network. If the W5500 did
 not answer at start, the console shows `W5500 не отвечает - сети нет`
 (W5500 does not respond - no network).
 
+**Static address.** In the “Network” section of the “Settings” page —
+“address from the router (DHCP)” or “static address” with address, mask,
+gateway and DNS fields (an empty DNS equals the gateway). The device checks
+the mask and that the gateway is in the same subnet. So that a mistake does
+not lose the device:
+
+- a new static address is applied at once but written to memory only after
+  confirmation: the page opens on the new address by itself and confirms it.
+  If there is no confirmation within 60 s (the address is not on your
+  network, wrong gateway), the device returns to the previous settings; a
+  restart within those 60 s brings them back too;
+- the **BOOT** button on the board, held for 5 s while running (not at power
+  on), switches back to DHCP;
+- the current address is shown on the display and in the console.
+
 ## SSD1306 128x64 display (optional)
 
 A small I2C OLED display shows:
@@ -309,7 +324,15 @@ BecqMoni (answers to commands).
   with the page closed; the page only fetches new samples. The CPS of an
   interval is the counts divided by the time acquisition actually ran
   (without lost chunks). “Clear history” does not touch the spectrum, and
-  “Reset” does not touch the history.
+  “Reset” does not touch the history. A gap in the plot appears only where
+  there was no acquisition. The plot used to break sometimes in the middle
+  of acquisition too: the time of a sample was computed from the moment of
+  each page request, network delay shifted neighbouring samples, and a
+  second stayed empty. Now the offset of the device clock against the
+  browser is one for the whole history, and the device stamps a sample with
+  the scheduled time of the one-second tick — exactly 1 s apart (it used to
+  be the moment of writing, which wandered by a fraction of the main loop's
+  100 ms step).
 - **Device clock** — there is no real-time clock. The time comes from SNTP
   (`pool.ntp.org`) when there is internet access; otherwise any open page
   gives the device the browser time when the clock is unset or off by more
@@ -337,8 +360,15 @@ BecqMoni (answers to commands).
   (together with “Reset”, the status line and acquisition
   time/CPS/events; the time runs only while the spectrum is being
   acquired), on “Oscilloscope” — only the oscilloscope: pause holds the last
-  frame and does not touch spectrum acquisition. The firmware turns ADC
-  capture on by itself when the open tab needs it.
+  frame. Acquisition and the oscilloscope do not run together — the device
+  has one mode. **The tabs only switch the view:** opening “Oscilloscope”
+  does not start it. “Start” there, while acquisition is running, first
+  warns that acquisition will stop (the accumulated spectrum is kept), and
+  only after you agree stops acquisition and starts the oscilloscope; “Start”
+  on “Spectrum” returns the device to acquisition. The device mode used to
+  change as soon as the tab was opened: the oscilloscope started by itself,
+  and acquisition silently paused. The header chip shows what the device is
+  actually doing.
 - **Diagnostics** — the “ADC diagnostics” section on the “Settings” page:
   sample stream and its real rate, per-bit statistics of the data lines,
   last-second profile (including processing busy time and CPU cycles per
@@ -774,10 +804,11 @@ on other ESP32-S3 boards:
 
 ## Tools (`tools/`)
 
-- `test_dsp.py` — 10 levels of processing checks on a model, including the
+- `test_dsp.py` — 11 levels of processing checks on a model, including the
   vector version against the plain one, the oscilloscope frame compression
-  against the page decoder and the splitting of the CPS history into
-  intervals (the page functions run in node). `python tools/test_dsp.py`.
+  against the page decoder, the splitting of the CPS history into intervals
+  and the timing of its samples under network delay (the page functions run
+  in node). `python tools/test_dsp.py`.
 - `dspmodel.py`, `scopemodel.py`, `scopecodec.py` — models of the
   processing, the oscilloscope and its frame compression.
 - `hotloop.py` — hot-loop cycle estimate from the disassembly.

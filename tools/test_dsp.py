@@ -567,6 +567,82 @@ console.log(JSON.stringify(r));"""
         check("в интервалы не попал только незаконченный хвост",
               sum(kc) + tail == sum(C10), f"хвост {tail}")
 
+# ------------------------------------------------------------------ L11
+print("\n=== УРОВЕНЬ 11: мониторинг CPS - время отсчётов без разрывов ===")
+print("  Прибор кладёт отсчёт раз в секунду со своим временем (0.1 с), страница")
+print("  дочитывает их порциями и переводит в часы браузера (mofs). Порции")
+print("  приходят с задержкой сети; от неё время соседних отсчётов не должно")
+print("  гулять - иначе секунда остаётся пустой, и график рвётся.\n")
+
+def page_fn(name):
+    """текст функции страницы по имени (скобки считаются до парной)"""
+    i = page9.find('function ' + name + '(') if page9 else -1
+    if i < 0:
+        return None
+    depth, j = 0, i
+    while True:
+        ch = page9[j]
+        depth += ch == '{'
+        depth -= ch == '}'
+        j += 1
+        if ch == '}' and depth == 0:
+            return page9[i:j]
+
+
+r12 = random.Random(12)
+# часы браузера минус часы прибора, мс: фаза секунды у них случайная (тут
+# 870 мс) - от неё зависит, доходит ли разброс задержки до границы секунды
+OFS12 = 1_700_000_000_870
+batches12, T12true = [], []
+dev_ms = 5_000                     # время прибора, мс
+pending = []
+for i in range(1800):              # 30 минут непрерывного набора
+    dev_ms += 1000
+    pending.append(dev_ms // 100)  # end_ds - как mca_hist_push
+    # запрос страницы раз в секунду, в случайный момент секунды
+    t_resp = dev_ms + r12.randint(0, 999)
+    nds = t_resp // 100            # время прибора в ответе, до 0.1 с
+    now = OFS12 + t_resp + r12.randint(5, 300)   # пришёл с задержкой сети
+    batches12.append((now, nds, pending))
+    T12true += [OFS12 + e * 100 for e in pending]
+    pending = []
+
+js12 = (page_fn('mofs') or '') + '\n' + (page_fn('mbuck') or '')
+check("mofs и mbuck найдены на странице",
+      'function mofs(' in js12 and 'function mbuck(' in js12)
+js12 = "var MH={o:null};\n" + js12 + """
+var fs=require('fs'),a=JSON.parse(fs.readFileSync(process.argv[2],'utf8')),T=[],C=[],D=[];
+a.forEach(function(b){var o0=mofs(b[0],b[1]);b[2].forEach(function(e){T.push(o0+e*100);C.push(100);D.push(1000)})});
+var B=mbuck(T,C,D,1000);console.log(JSON.stringify({T:T,bt:B.t}));"""
+
+
+def gaps12(bt):
+    return sum(1 for i in range(1, len(bt)) if bt[i] - bt[i - 1] > 1500)
+
+
+with tempfile.TemporaryDirectory() as td:
+    jf = os.path.join(td, 'mon.js')
+    df = os.path.join(td, 'in.json')
+    open(jf, 'w', encoding='utf-8').write(js12)
+    json.dump(batches12, open(df, 'w'))
+    r = subprocess.run(['node', jf, df], capture_output=True, text=True)
+    out12 = json.loads(r.stdout) if r.returncode == 0 else None
+if out12 is None:
+    check("node запустил mofs/mbuck", False, r.stderr[-300:])
+else:
+    sh = [t - u for t, u in zip(out12['T'], T12true)]
+    # прежний расчёт: «сейчас минус возраст» для каждой порции отдельно
+    T_old = [now - (nds - e) * 100 for now, nds, ends in batches12 for e in ends]
+    bt_old = sorted({t // 1000 * 1000 for t in T_old})
+    print(f"  разрывов внутри 30 мин набора: прежний расчёт {gaps12(bt_old)}, "
+          f"страница сейчас {gaps12(out12['bt'])}")
+    check("прежний расчёт времени давал разрывы (проверка самой проверки)",
+          gaps12(bt_old) > 0)
+    check("время отсчётов на странице идёт ровно через 1 с",
+          max(sh) - min(sh) == 0, f"разброс сдвига {max(sh) - min(sh)} мс")
+    check("в непрерывном наборе нет пустых секунд", gaps12(out12['bt']) == 0,
+          f"разрывов {gaps12(out12['bt'])}")
+
 print("\n" + "=" * 62)
 if fails:
     print(f"ПРОВАЛЕНО: {len(fails)}")
