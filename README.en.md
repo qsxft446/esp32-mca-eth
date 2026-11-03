@@ -376,7 +376,7 @@ BecqMoni (answers to commands).
     highlighted) — errors, yellow — warnings, light — messages, grey —
     debug. The tag is coloured by subsystem: ADC, network, firmware,
     settings, display, emulation, system; numbers, addresses and values in
-    the text are highlighted. The E/W/I/D checkboxes and the subsystem
+    the text are highlighted. The level and subsystem
     checkboxes (with line counts) hide what is not needed, “follow” scrolls
     to new lines, “Save” writes the log to a file.
     The log is visible even when the console is silent because of MCA
