@@ -2,6 +2,7 @@
 #include "mca_dsp.h"
 #include "adc_clk.h"
 
+#include <stddef.h>
 #include "nvs.h"
 #include "esp_log.h"
 
@@ -12,8 +13,12 @@ static const char *TAG = "settings";
 /* Увеличивать при ЛЮБОЙ правке mca_params_t. Запись от прошивки с другой
  * структурой будет отброшена целиком, а не прочитана вкривь: совпадение
  * размера ещё не значит, что поля лежат на тех же местах. */
-#define PARAMS_VER 4        /* 2: полярность; 3: убран архив форм;
-                               4: «кодов на канал» вместо усиления */
+#define PARAMS_VER 5        /* 2: полярность; 3: убран архив форм;
+                               4: «кодов на канал» вместо усиления;
+                               5: фильтр формы (поля в конце) */
+/* Версия 4 - та же структура без полей фильтра формы в конце: читаем её
+ * как начало новой, фильтр получает значения по умолчанию (выключен). */
+#define PARAMS_V4_LEN offsetof(mca_params_t, shape_on)
 
 /* ЧАСТОТА ХРАНИТСЯ В ГЕРЦАХ (ключ "fhz").
  *
@@ -48,11 +53,20 @@ void mca_settings_load(void)
 
     uint8_t ver = 0;
     mca_params_t p;
+    mca_dsp_get_params(&p);         /* дефолты - для полей, которых нет в v4 */
     size_t len = sizeof(p);
-    if (nvs_get_u8(h, "pver", &ver) == ESP_OK && ver == PARAMS_VER &&
+    const bool vok = nvs_get_u8(h, "pver", &ver) == ESP_OK;
+    if (vok && ver == PARAMS_VER &&
         nvs_get_blob(h, "params", &p, &len) == ESP_OK && len == sizeof(p)) {
         mca_dsp_set_params(&p);     /* пройдут ту же проверку, что из веба */
         ESP_LOGI(TAG, "настройки обработки загружены");
+    } else if (vok && ver == 4 &&
+               nvs_get_blob(h, "params", NULL, &len) == ESP_OK &&
+               len == PARAMS_V4_LEN &&
+               nvs_get_blob(h, "params", &p, &len) == ESP_OK) {
+        mca_dsp_set_params(&p);
+        ESP_LOGI(TAG, "настройки обработки загружены (прежняя версия, "
+                      "фильтр формы выключен)");
     } else {
         ESP_LOGW(TAG, "настроек обработки нет или они от другой версии "
                       "прошивки - значения по умолчанию");

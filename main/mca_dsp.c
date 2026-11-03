@@ -133,6 +133,22 @@ static uint64_t s_last_events;
  * набирается; потерянные чанки в него не входят, как и в сам спектр. */
 static uint64_t s_run_ns;
 
+/* --- фильтр формы (см. shape_check и mca_dsp.h) --- */
+static int32_t   s_cross_pos;           /* где трапеция пробила порог (s_work) */
+static uint16_t *s_map;                 /* карта SHAPE_YB x SHAPE_XB, PSRAM */
+static int32_t   s_map_win;             /* окно, на котором строится карта  */
+static bool      s_req_map_clear;       /* под LOCK                         */
+static uint32_t  s_shp_chk_pend, s_shp_rej_pend;
+/* Набор эталона. Пишет задача обработки: s_learn[s_learn_n++], пока
+ * s_learn_n < s_learn_need. Начало, отмену и итог ведут другие задачи под
+ * LOCK; s_learn_gen отличает набор, начатый заново, от досчитываемого. */
+static int16_t  *s_learn;
+static volatile int32_t s_learn_n, s_learn_need;
+static uint32_t  s_learn_gen;
+static int32_t   s_learn_win, s_learn_hz;  /* условия, при которых набираем */
+static int32_t   s_lp10, s_lp50, s_lp90;   /* итог последнего набора        */
+static volatile int32_t s_watch_s;         /* страница смотрит карту, секунд */
+
 void mca_dsp_init(void)
 {
     s_hist = heap_caps_calloc(MCA_CHANNELS, sizeof(uint32_t),
@@ -186,7 +202,19 @@ void mca_dsp_init(void)
          * для всех амплитуд, уходит в калибровку и ширину пиков
          * не портит. */
         .flat_avg        = 0,
+        /* Фильтр формы выключен: с хорошим ФЭУ и его родным питанием он
+         * не нужен. Допуск 25 %: на шумном ФЭУ этого прибора (2026-11-03,
+         * 20 МГц) ширина сцинтилляций держится в ±8 %, а шумовые всплески
+         * втрое уже. */
+        .shape_on        = 0,
+        .shape_tol       = 25,
     };
+    s_map   = heap_caps_calloc(SHAPE_XB * SHAPE_YB, sizeof(uint16_t),
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_learn = heap_caps_calloc(SHAPE_LEARN_N, sizeof(int16_t),
+                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_map || !s_learn)
+        ESP_LOGE(TAG, "нет памяти под фильтр формы - он работать не будет");
 
     memset(s_work, 0, sizeof(s_work));
     s_trap = 0; s_state = ST_IDLE;
@@ -205,6 +233,9 @@ static void stats_clear_locked(void)
     s_st.samples_processed = 0;
     s_st.overflow          = 0;  /* раньше не сбрасывался: «отброшенные» для
                                     программ на ПК копились через «Сброс» */
+    s_st.shape_checked     = 0;
+    s_st.skipped_shape     = 0;
+    s_req_map_clear        = true;
     s_last_events = 0;
     s_run_ns      = 0;
     s_st.run_ms   = 0;          /* страница увидит ноль сразу, не через тик */
@@ -231,7 +262,11 @@ void mca_dsp_service(bool idle)
     const bool prime = s_req_prime, clear = s_req_clear;
     s_req_prime = s_req_clear = false;
     if (clear) stats_clear_locked();
+    const bool map_clear = s_req_map_clear;
+    s_req_map_clear = false;
     UNLOCK();
+    /* 13 КБ в PSRAM - десятки микросекунд, в запас очереди укладывается */
+    if (map_clear && s_map) memset(s_map, 0, SHAPE_XB * SHAPE_YB * sizeof(uint16_t));
 
     if (prime || clear) {
         s_trap       = 0;
@@ -321,6 +356,86 @@ static void record_event(int64_t num, int32_t den, const mca_params_t *p)
     }
     s_hist[ch]++;
     s_ev_pend++;
+}
+
+/* Столбец карты формы: канал по логарифму, 8 столбцов на октаву. */
+static inline int shape_xbin(int64_t ch)
+{
+    if (ch < 1) return 0;
+    const int o = 31 - __builtin_clz((uint32_t)ch);
+    const int m = o >= 3 ? (int)(ch >> (o - 3)) & 7 : (int)(ch << (3 - o)) & 7;
+    const int x = o * 8 + m;
+    return x < SHAPE_XB ? x : SHAPE_XB - 1;
+}
+
+/* ФИЛЬТР ФОРМЫ. Зовётся раз на событие, а не на отсчёт: ~150 тактов на
+ * поиск вершины и сумму окна в 50 отсчётов.
+ *
+ * Вершина - максимум сырого сигнала от «порог пробит минус L» до вершины
+ * трапеции: сигнал достигает вершины после начала фронта, а порог
+ * пробивается не позже, чем через L отсчётов после него. Окно - «до /
+ * после вершины» (int_rise, int_fall, те же, что у интегрирования), база -
+ * среднее восьми отсчётов прямо перед окном: так хвост предыдущего
+ * импульса не влияет. Ширина = площадь / высота, x10.
+ *
+ * Зовётся, только когда мера нужна: фильтр, набор эталона или карта на
+ * экране. Карта пополняется всегда; learn - идёт набор эталона; filt -
+ * фильтр действует. true - событие идёт в спектр. Окно, не легшее в буфер
+ * (событие у самого конца чанка), не судим: событие проходит. */
+static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
+                        const mca_params_t *p, bool filt, bool learn)
+{
+    int lo = s_cross_pos - p->trap_L, hi = tpk + 4;
+    if (lo < 1) lo = 1;
+    if (hi > end - 1) hi = end - 1;
+    int32_t mx = -1;
+    int pk = lo;
+    for (int i = lo; i <= hi; i++)
+        if (s_work[i] > mx) { mx = s_work[i]; pk = i; }
+    const int a = pk - p->int_rise, b = pk + p->int_fall;
+    if (a - 8 < 0 || b >= end) return true;
+
+    int32_t base8 = 0, sum = 0;
+    for (int i = a - 8; i < a; i++) base8 += s_work[i];
+    for (int i = a; i <= b; i++) sum += s_work[i];
+    const int32_t n  = b - a + 1;
+    const int32_t h8 = mx * 8 - base8;              /* высота x8  */
+    const int32_t s8 = sum * 8 - n * base8;         /* площадь x8 */
+    int32_t w10 = h8 > 0 && s8 > 0 ? (int32_t)((int64_t)s8 * 10 / h8) : 0;
+    if (w10 > 10 * n) w10 = 10 * n;
+
+    /* карта: событие с амплитудой в пределах шкалы */
+    const int64_t d  = (int64_t)den * p->cpc_milli;
+    const int64_t ch = (d > 0 && num > 0) ? num * 1000 / d : 0;
+    if (s_map && ch < MCA_CHANNELS) {
+        if (s_map_win != n) {           /* окно сменилось - карта о другом */
+            memset(s_map, 0, SHAPE_XB * SHAPE_YB * sizeof(uint16_t));
+            s_map_win = n;
+        }
+        int y = (int)(w10 * SHAPE_YB / (10 * n));
+        if (y >= SHAPE_YB) y = SHAPE_YB - 1;
+        uint16_t *c = &s_map[y * SHAPE_XB + shape_xbin(ch)];
+        if (*c != 0xFFFF) (*c)++;
+    }
+
+    /* эталон: только заметно выше порога, там шумовых всплесков мало */
+    if (learn && s_learn && n == s_learn_win &&
+        num >= (int64_t)3 * p->threshold * den) {
+        const int32_t k = s_learn_n;
+        if (k < s_learn_need) {
+            s_learn[k] = (int16_t)(w10 > 32767 ? 32767 : w10);
+            s_learn_n = k + 1;
+        }
+    }
+
+    if (!filt) return true;
+    s_shp_chk_pend++;
+    const int32_t tol = p->shape_ref * p->shape_tol / 100;
+    if (w10 < p->shape_ref - tol || w10 > p->shape_ref + tol) {
+        s_shp_rej_pend++;
+        return false;
+    }
+    return true;
 }
 
 /* ---- РАЗНОСТЬ ТРАПЕЦИИ ДЛЯ ВСЕГО ЧАНКА ----
@@ -541,6 +656,16 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
     int32_t base_fp = s_base_fp;
     uint64_t pile = 0, dead = 0;
 
+    /* Фильтр формы: эталон годится, только если набран на том же окне и
+     * той же частоте - иначе ширина в отсчётах другая, и отбрасывалось бы
+     * всё подряд. Мера считается, только когда она кому-то нужна. */
+    const uint32_t fclk0 = adc_clk_get_freq();
+    const int32_t  swin  = p.int_rise + p.int_fall + 1;
+    const bool shape_filt = p.shape_on && p.shape_ref > 0 &&
+                            p.shape_win == swin && p.shape_hz == (int32_t)fclk0;
+    const bool shape_learn = s_learn_need > 0 && s_learn_hz == (int32_t)fclk0;
+    const bool shape_need = shape_filt || shape_learn || s_watch_s > 0;
+
     const int end = DSP_TAIL + (int)n;
     int i = DSP_TAIL;
 
@@ -641,6 +766,7 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
             s_pre_trap = trap;
             s_peak     = trap;
             s_peak_pos = i;
+            s_cross_pos = i;
             s_since    = 0;
             s_flat_sum = 0;
             s_flat_cnt = 0;
@@ -694,18 +820,22 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
                     if (bad) {
                         pile++;
                     } else {
+                        int64_t num;
+                        int32_t den;
                         if (p.algo == 1) {
-                            int32_t cnt;
-                            int64_t s = amp_integrate(s_peak_pos, p.int_rise,
-                                                      p.int_fall, L, G,
-                                                      base_fp >> 8, &cnt);
-                            record_event(s, cnt, &p);
+                            num = amp_integrate(s_peak_pos, p.int_rise,
+                                                p.int_fall, L, G,
+                                                base_fp >> 8, &den);
                         } else {
-                            int32_t amp = (s_flat_cnt > 0)
-                                        ? (int32_t)(s_flat_sum / s_flat_cnt)
-                                        : s_peak;
-                            record_event(amp, L, &p);   /* вершина / L */
+                            num = (s_flat_cnt > 0)
+                                ? (int32_t)(s_flat_sum / s_flat_cnt)
+                                : s_peak;
+                            den = L;                    /* вершина / L */
                         }
+                        if (!shape_need ||
+                            shape_check(s_peak_pos, end, num, den, &p,
+                                        shape_filt, shape_learn))
+                            record_event(num, den, &p);
                     }
                     s_since = 0;
                     s_state = ST_REARM;
@@ -750,7 +880,8 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
      * Такие события уходили в нулевой канал - на модели это 4 % при
      * search=70 и чанке 1024 (порог срабатывал ближе к концу чанка). */
     if (s_state == ST_PEAK) {
-        s_peak_pos -= (int32_t)(end - DSP_TAIL);
+        s_peak_pos  -= (int32_t)(end - DSP_TAIL);
+        s_cross_pos -= (int32_t)(end - DSP_TAIL);
         /* Если пик уехал за пределы сохранённого хвоста, мерить
          * нечего: событие бросаем, а не считаем по мусору. */
         if (s_peak_pos < L + G + 1) {
@@ -775,6 +906,8 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
     s_st.baseline           = base_fp >> 8;
     s_st.total_events      += s_ev_pend;
     s_st.overflow          += s_ovf_pend;
+    s_st.shape_checked     += s_shp_chk_pend;
+    s_st.skipped_shape     += s_shp_rej_pend;
     s_busy_cyc   += (uint32_t)(cyc3 - cyc0);
     s_cyc_acc[0] += (uint32_t)(cyc1 - cyc0);   /* копия чанка          */
     s_cyc_acc[1] += (uint32_t)(cyc2 - cyc1);   /* разность трапеции    */
@@ -782,6 +915,7 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
     s_cyc_n      += n;
     UNLOCK();
     s_ev_pend = s_ovf_pend = 0;
+    s_shp_chk_pend = s_shp_rej_pend = 0;
 }
 
 void mca_dsp_tick_1s(void)
@@ -827,6 +961,92 @@ void mca_dsp_tick_1s(void)
     }
     s_cyc_n = 0;
     UNLOCK();
+    if (s_watch_s > 0) s_watch_s--;
+}
+
+/* ---- фильтр формы: управление из других задач ---- */
+void mca_dsp_shape_learn(bool start)
+{
+    mca_params_t p;
+    LOCK();
+    p = s_par;
+    s_learn_gen++;
+    s_learn_n    = 0;
+    s_learn_win  = p.int_rise + p.int_fall + 1;
+    s_learn_hz   = (int32_t)adc_clk_get_freq();
+    s_learn_need = start && s_learn ? SHAPE_LEARN_N : 0;
+    UNLOCK();
+    ESP_LOGI(TAG, "фильтр формы: набор эталона %s (окно %ld)",
+             start ? "начат" : "прерван", (long)s_learn_win);
+}
+
+void mca_dsp_shape_clear_map(void)
+{
+    LOCK();
+    s_req_map_clear = true;
+    UNLOCK();
+}
+
+void mca_dsp_shape_watch(void) { s_watch_s = 10; }
+
+void mca_dsp_shape_info(mca_shape_info_t *o)
+{
+    LOCK();
+    const mca_params_t p = s_par;
+    o->learn_n    = s_learn_n;
+    o->learn_need = s_learn_need;
+    o->p10 = s_lp10; o->p50 = s_lp50; o->p90 = s_lp90;
+    UNLOCK();
+    o->win    = p.int_rise + p.int_fall + 1;
+    o->active = p.shape_on && p.shape_ref > 0 && p.shape_win == o->win &&
+                p.shape_hz == (int32_t)adc_clk_get_freq();
+}
+
+/* Без блокировки, как и спектр: пишет только задача обработки, а
+ * недописанная клетка картинке не вредит. */
+void mca_dsp_shape_map(uint16_t *dst)
+{
+    if (s_map) memcpy(dst, s_map, SHAPE_XB * SHAPE_YB * sizeof(uint16_t));
+    else       memset(dst, 0, SHAPE_XB * SHAPE_YB * sizeof(uint16_t));
+}
+
+static int cmp_i16(const void *a, const void *b)
+{
+    return *(const int16_t *)a - *(const int16_t *)b;
+}
+
+/* Набор закончен - медиана в эталон. Сортировка 2000 чисел - миллисекунды,
+ * поэтому здесь, в главной задаче, а не в задаче обработки: та писать в
+ * буфер уже перестала (s_learn_n дошёл до s_learn_need). */
+bool mca_dsp_shape_poll(void)
+{
+    static int16_t v[SHAPE_LEARN_N];
+    LOCK();
+    const int32_t n = s_learn_n, need = s_learn_need;
+    const uint32_t gen = s_learn_gen;
+    UNLOCK();
+    if (need <= 0 || n < need) return false;
+    memcpy(v, s_learn, (size_t)n * sizeof(int16_t));
+    qsort(v, (size_t)n, sizeof(int16_t), cmp_i16);
+    bool ok = false;
+    LOCK();
+    if (gen == s_learn_gen) {           /* набор не начат заново */
+        s_lp10 = v[n / 10];
+        s_lp50 = v[n / 2];
+        s_lp90 = v[n * 9 / 10];
+        s_learn_need   = 0;
+        s_par.shape_ref = s_lp50;
+        s_par.shape_win = s_learn_win;
+        s_par.shape_hz  = s_learn_hz;
+        ok = true;
+    }
+    UNLOCK();
+    if (ok)
+        ESP_LOGI(TAG, "фильтр формы: эталон %ld.%ld отсч. (10-90 %%: %ld.%ld-%ld.%ld), окно %ld",
+                 (long)(s_lp50 / 10), (long)(s_lp50 % 10), (long)(s_lp10 / 10),
+                 (long)(s_lp10 % 10), (long)(s_lp90 / 10), (long)(s_lp90 % 10),
+                 (long)s_learn_win);
+    return ok;
 }
 
 void mca_dsp_last_second(uint32_t *counts, uint32_t *dur_ms)
@@ -886,6 +1106,11 @@ void mca_dsp_set_params(const mca_params_t *in)
     if (s_par.int_fall > 400) s_par.int_fall = 400;
     if (s_par.baseline_win < 1)    s_par.baseline_win = 1;
     if (s_par.baseline_win > 4095) s_par.baseline_win = 4095;
+    s_par.shape_on = s_par.shape_on ? 1 : 0;
+    if (s_par.shape_tol < 1)   s_par.shape_tol = 1;
+    if (s_par.shape_tol > 200) s_par.shape_tol = 200;
+    if (s_par.shape_ref < 0)     s_par.shape_ref = 0;
+    if (s_par.shape_ref > 10000) s_par.shape_ref = 10000;
 
     /* Смена L или G меняет саму передаточную функцию: накопленный
      * аккумулятор становится бессмысленным (в нём слагаемые от старых

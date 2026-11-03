@@ -194,6 +194,12 @@ void app_main(void)
             if (now_us - next_tick_us > 1000000)   /* сильно отстали - не догоняем */
                 next_tick_us = now_us + 1000000;
             mca_dsp_tick_1s();
+            /* набор эталона формы закончен - эталон в память прибора */
+            if (mca_dsp_shape_poll()) {
+                mca_params_t sp;
+                mca_dsp_get_params(&sp);
+                mca_settings_save_params(&sp);
+            }
             mca_oled_tick_1s();
             /* история CPS: секунда, в которую шёл набор спектра */
             {

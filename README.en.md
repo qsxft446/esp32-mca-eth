@@ -311,6 +311,24 @@ BecqMoni (answers to commands).
   16 MHz with L = 14, 20 and 28 samples gave the same 6.9–7.0 % resolution on
   the ~358 peak — on this board the trapezoid noise is much smaller than the
   peak width, and the resolution is set by the detector.
+- **Pulse shape filter** — a card on the “Settings” page, enabled on
+  demand and off by default: with a good PMT and its own power supply it is
+  not needed. The shape measure is the effective pulse width: area / height
+  in the “before / after peak” window (the same two numbers as for
+  integration; with the filter on they are not dimmed in the table).
+  Scintillations have almost the same width at any energy, PMT noise bursts
+  are narrower. “Learn reference” — with a running acquisition (background
+  is enough, a source is faster)
+  the device takes 2000 pulses above three thresholds, the median of their
+  width becomes the reference and is saved in the device memory. The filter
+  rejects pulses whose width is farther from the reference than the
+  “tolerance” (25 % by default). The reference is valid only for the window
+  and ADC rate it was learned at: if they change, the filter passes
+  everything and the card asks to learn the reference again. The map below
+  the buttons is the number of pulses by channel (logarithmic) and width, the
+  green band is reference ± tolerance; the card shows how many pulses were
+  checked and rejected since “Reset” (`/stat`: `shchk`, `shrej`). Details
+  and measurements — “Found while debugging”, “Pulse shape filter”.
 - **CPS monitor** — on the same tab, below the spectrum: current CPS, mean
   over the whole history with its error, last interval, a plot by averaging
   intervals with a moving average, an interval table and CSV export. The
@@ -709,6 +727,44 @@ pre-allocated memory.
   after drawing, at most every 50 ms. The device prepares snapshots at
   most every 25 ms.
 
+### Pulse shape filter
+
+- **What PMT noise looks like** (noisy PMT, background without a source,
+  2026-11-03, 20 MHz, 360
+  oscilloscope frames of 32768 samples, ~0.6 s). Baseline: σ ≈ 1.6 codes,
+  swing over 26 µs — 10 codes, 0.4 ms — 15, 1.6 ms — 18 (the baseline also
+  wanders slowly by a few codes). Single spikes of 1–2 samples, ~3300 per
+  second, 8–9 codes high: the trapezoid with L = 12 damps them L times, they
+  do not reach the spectrum. Above the threshold there are two kinds of
+  pulses: scintillations — FWHM ~40 samples, rise ~10, area / height 50 ± 4
+  at any height from 40 to 4000 codes; and narrow ones — width ~10, rise ~3,
+  area / height 15–33, nearly all 15–60 codes high: they make the pile at
+  the start of the spectrum. That the narrow ones are PMT noise or pickup and
+  not events is a conclusion from their shape; their source was not checked.
+- **Why the measure is area / height.** It is computed once per event, not
+  per sample: peak, window sum, division — on the order of a hundred cycles.
+  At ~330 cps and 20 MHz the processing core load is 84.5 % without the
+  measure and 84.6 % with it and the filter on (`/stat`, `load`, 3 min
+  each). The measure's baseline is the eight samples right before the
+  window, not the common baseline: so the tail of the previous pulse does
+  not change the width.
+- **What it rejects.** Everything below is on background, ~330 cps. The
+  reference on this PMT, learned on background, is 34.1 samples (window
+  13 + 36 + 1, 10–90 % spread 28.7–36.1), tolerance 25 %: 25.7 % of the
+  checked pulses were rejected (3 min, 59 870 pulses). From the device map:
+  channels 1–15 — 89 %, 15–40 — 11–14 %, 40–100 — 6–9 %, 100–200 — 3.5 %,
+  above 200 — under 1 %, and all rejected ones are narrower than the band,
+  none wider. The model (`dspmodel.py`) on the captured frames with the same
+  reference: reference from its own events 33.6, rejected 18.3 % (32 of 175 —
+  few events), also almost all below channel 25.
+- **A chunk loss that did not repeat.** In the first run on the device, 31
+  chunks were lost ~1 s before the reference learning finished: one chunk
+  took 14.4 ms to process against a budget of ~0.1 ms (loss log,
+  `/diag/data`). A second learning run, each action one at a time (saving
+  settings, “Reset”, clearing the map, enabling the filter) and two 3-minute
+  acquisitions (filter with the map and without) gave no losses. The cause
+  was not found.
+
 ### Other
 
 - Pinning the TCP/IP task to core 0 made things worse: the web waited
@@ -817,11 +873,12 @@ on other ESP32-S3 boards:
 
 ## Tools (`tools/`)
 
-- `test_dsp.py` — 11 levels of processing checks on a model, including the
+- `test_dsp.py` — 12 levels of processing checks on a model, including the
   vector version against the plain one, the oscilloscope frame compression
   against the page decoder, the splitting of the CPS history into intervals
   and the timing of its samples under network delay (the page functions run
-  in node). `python tools/test_dsp.py`.
+  in node), the shape filter on a signal with scintillations and noise
+  bursts. `python tools/test_dsp.py`.
 - `dspmodel.py`, `scopemodel.py`, `scopecodec.py` — models of the
   processing, the oscilloscope and its frame compression.
 - `hotloop.py` — hot-loop cycle estimate from the disassembly.

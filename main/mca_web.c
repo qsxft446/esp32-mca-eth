@@ -1115,6 +1115,45 @@ static esp_err_t h_scope(httpd_req_t *r)
     return e;
 }
 
+/* /shape - фильтр формы: состояние набора эталона и карта «амплитуда x
+ * ширина». do=learn - начать набор эталона, do=stop - прервать, do=clear -
+ * очистить карту. Каждый запрос продлевает расчёт меры на 10 с: пока
+ * страница с картой открыта, форма меряется и при выключенном фильтре.
+ * Ответ двоичный, little-endian: 16 x int32 (см. ниже), затем карта
+ * SHAPE_YB строк по SHAPE_XB uint16, строка 0 - ширина 0. */
+static esp_err_t h_shape(httpd_req_t *r)
+{
+    char q[48], v[12];
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK &&
+        httpd_query_key_value(q, "do", v, sizeof(v)) == ESP_OK) {
+        if (!strcmp(v, "learn"))      mca_dsp_shape_learn(true);
+        else if (!strcmp(v, "stop"))  mca_dsp_shape_learn(false);
+        else if (!strcmp(v, "clear")) mca_dsp_shape_clear_map();
+    }
+    mca_dsp_shape_watch();
+    mca_shape_info_t si;
+    mca_dsp_shape_info(&si);
+    mca_params_t p;
+    mca_dsp_get_params(&p);
+    mca_stats_t st;
+    mca_dsp_get_stats(&st);
+    const int32_t h[16] = {
+        si.learn_n, si.learn_need, si.p10, si.p50, si.p90, si.win, si.active,
+        p.shape_ref, p.shape_tol, p.shape_on, p.shape_win, p.shape_hz,
+        (int32_t)adc_clk_get_freq(), (int32_t)st.shape_checked,
+        (int32_t)st.skipped_shape, SHAPE_XB
+    };
+    /* 13 КБ: веб-сервер обрабатывает запросы по одному - общий буфер */
+    static uint16_t map[SHAPE_XB * SHAPE_YB];
+    mca_dsp_shape_map(map);
+    httpd_resp_set_type(r, "application/octet-stream");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    esp_err_t e = httpd_resp_send_chunk(r, (const char *)h, sizeof(h));
+    if (e == ESP_OK) e = httpd_resp_send_chunk(r, (const char *)map, sizeof(map));
+    if (e == ESP_OK) e = httpd_resp_send_chunk(r, NULL, 0);
+    return e;
+}
+
 static esp_err_t h_stat(httpd_req_t *r)
 {
     mca_prof_web_begin(PROF_EP_STAT);
@@ -1129,7 +1168,8 @@ static esp_err_t h_stat(httpd_req_t *r)
         "\"base\":%ld,\"lost\":%llu,\"over\":%llu,"
         "\"samp\":%llu,\"freq\":%lu,"
         "\"run\":%d,\"ms\":%lu,\"mode\":%d,\"load\":%lu,\"vec\":%d,"
-        "\"srun\":%d,\"cap\":%d,\"tnow\":%lld,\"tsrc\":%d}",
+        "\"srun\":%d,\"cap\":%d,\"tnow\":%lld,\"tsrc\":%d,"
+        "\"shchk\":%llu,\"shrej\":%llu}",
         (unsigned long long)s.total_events, (unsigned long)s.cps,
         (unsigned long long)s.skipped_pileup,
         (unsigned long long)s.skipped_deadtime,
@@ -1142,7 +1182,9 @@ static esp_err_t h_stat(httpd_req_t *r)
         (int)mca_mode, (unsigned long)s.load_pm, mca_dsp_vec_ok() ? 1 : 0,
         mca_scope_run ? 1 : 0, adc_cap_is_running() ? 1 : 0,
         /* часы прибора: мс Unix-времени (0 - не заданы) и откуда время */
-        (long long)mca_time_now_ms(), (int)mca_time_source());
+        (long long)mca_time_now_ms(), (int)mca_time_source(),
+        /* фильтр формы: проверено и отброшено с «Сброса» */
+        (unsigned long long)s.shape_checked, (unsigned long long)s.skipped_shape);
     httpd_resp_set_type(r, "application/json");
     /* snprintf возвращает длину, которая ПОТРЕБОВАЛАСЬ БЫ. При нехватке
      * места это больше размера буфера, и отправка читала бы за его
@@ -1195,6 +1237,8 @@ static esp_err_t h_cfg(httpd_req_t *r)
         q_int(q, "flat_avg",        &p.flat_avg);
         q_int(q, "pileup_pre_pct",  &p.pileup_pre_pct);
         q_int(q, "pileup_post_pct", &p.pileup_post_pct);
+        q_int(q, "shape_on",        &p.shape_on);
+        q_int(q, "shape_tol",       &p.shape_tol);
         mca_dsp_set_params(&p);
         mca_dsp_get_params(&p);
 
@@ -1212,7 +1256,9 @@ static esp_err_t h_cfg(httpd_req_t *r)
         "\"baseline_shift\":%ld,\"baseline_win\":%ld,"
         "\"flat_avg\":%ld,"
         "\"pileup_pre_pct\":%ld,"
-        "\"pileup_post_pct\":%ld,\"emu\":%lu,\"fl\":[",
+        "\"pileup_post_pct\":%ld,\"shape_on\":%ld,\"shape_tol\":%ld,"
+        "\"shape_ref\":%ld,\"shape_win\":%ld,\"shape_hz\":%ld,"
+        "\"emu\":%lu,\"fl\":[",
         (long)p.threshold, (long)p.cpc_milli, (long)p.nch,
         (long)p.algo, (long)p.polarity, (long)p.int_rise, (long)p.int_fall,
         (long)p.hysteresis, (long)p.trap_L,
@@ -1220,7 +1266,9 @@ static esp_err_t h_cfg(httpd_req_t *r)
         (long)p.baseline_shift, (long)p.baseline_win,
         (long)p.flat_avg,
         (long)p.pileup_pre_pct,
-        (long)p.pileup_post_pct, (unsigned long)mca_emu_baud());
+        (long)p.pileup_post_pct, (long)p.shape_on, (long)p.shape_tol,
+        (long)p.shape_ref, (long)p.shape_win, (long)p.shape_hz,
+        (unsigned long)mca_emu_baud());
     /* snprintf возвращает длину, которая ПОТРЕБОВАЛАСЬ БЫ. При нехватке
      * места это больше размера буфера, и отправка читала бы за его
      * границей. Ограничиваем после каждого шага. */
@@ -1561,6 +1609,29 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "в прибор значения уходят только по этой кнопке и "
 "сохраняются в его памяти</span></div>"
 "</section>"
+/* фильтр формы (mca_dsp.c, shape_check): включается здесь же, сразу */
+"<section class='panel pad'>"
+"<h3 data-en='Pulse shape filter'>Фильтр формы импульса</h3>"
+"<p class=n style=margin-top:0 data-en='Rejects pulses whose width (area / height in the “before / after peak” window) "
+"differs from the reference by more than the tolerance: PMT noise bursts are narrower than scintillations, pile-ups are wider. "
+"Not needed with a good PMT and its own power supply. The reference is learned from detector pulses while the spectrum is being acquired: background will do, a source is faster.'>"
+"Отбрасывает импульсы, ширина которых (площадь / высота в окне «до / после вершины») отличается от эталона "
+"больше допуска: шумовые всплески ФЭУ уже сцинтилляций, наложения шире. С хорошим ФЭУ и его родным питанием "
+"не нужен. Эталон набирается из импульсов детектора, пока идёт набор спектра: подойдёт и фон, с источником быстрее.</p>"
+"<div class=grp style='margin:8px 0'>"
+"<label><input type=checkbox id=sh_on onchange=shSet()> <span data-en='filter on'>фильтр включён</span></label>"
+"<label><span data-en='tolerance, %'>допуск, %</span> <input id=sh_tol type=number min=1 max=200 style=width:70px onchange=shSet()></label>"
+"<button class='btn green sm' onclick=shLearn() id=sh_lb></button>"
+"<button class='btn sm' onclick=shClr() data-en='Clear map'>Очистить карту</button></div>"
+"<div id=sh_st class=n style=line-height:1.6></div>"
+"<canvas id=sh_cv style='width:100%;height:260px;display:block;margin-top:8px'></canvas>"
+"<div class=mut style=font-size:11.5px;margin-top:4px data-en='Map: horizontally - channel (logarithmic), vertically - width in samples, "
+"brighter - more pulses. Green band - reference ± tolerance: everything outside it is rejected when the filter is on. "
+"Pulses are counted while the spectrum is being acquired; “Reset” of the spectrum clears the map.'>"
+"Карта: по горизонтали - канал (логарифм), по вертикали - ширина в отсчётах, ярче - больше импульсов. "
+"Зелёная полоса - эталон ± допуск: всё вне её при включённом фильтре отбрасывается. Импульсы "
+"считаются, пока идёт набор спектра; «Сброс» спектра очищает карту.</div>"
+"</section>"
 "</div>"
 "<script>i18n();"
 /* Список частот присылает прибор (/cfg, поле fl): он зависит от
@@ -1605,8 +1676,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "[L('Амплитуда','Amplitude'),["
 "['algo',L('Способ измерения','Method'),'',L('Трапеция или интегрирование. Смена очищает спектр','Trapezoid or integration. Changing it clears the spectrum')],"
 "['flat_avg',L('Средн. по плато','Flat-top avg'),'t',L('1 - среднее по плоской вершине вместо максимума. Работает только при G−L ≥ 16','1 - mean over the flat top instead of the maximum. Works only when G−L ≥ 16')],"
-"['int_rise',L('До вершины','Before peak'),'i',L('Отсч. до вершины в среднем. Линейка: B−A','Samples before the peak, on average. Ruler: B−A')],"
-"['int_fall',L('После вершины','After peak'),'i',L('Отсч. после вершины. Линейка: C−B. Длиннее окно - пик левее','Samples after the peak. Ruler: C−B. Longer window - the peak moves left')],"
+"['int_rise',L('До вершины','Before peak'),'i',L('Отсч. до вершины в среднем. Линейка: B−A. Это же окно - у фильтра формы','Samples before the peak, on average. Ruler: B−A. Also the shape filter window')],"
+"['int_fall',L('После вершины','After peak'),'i',L('Отсч. после вершины. Линейка: C−B. Длиннее окно - пик левее. Это же окно - у фильтра формы','Samples after the peak. Ruler: C−B. Longer window - the peak moves left. Also the shape filter window')],"
 "['baseline_shift',L('База 2^N','Baseline 2^N'),'i',L('Скорость слежения за базовой линией (трапеции база не нужна)','Baseline tracking speed (the trapezoid does not need a baseline)')],"
 "['baseline_win',L('Окно базы','Baseline window'),'i',L('Отсчёты дальше этого от базы в неё не берутся, коды','Samples farther than this from the baseline are not used for it, codes')]"
 "],1],"
@@ -1697,8 +1768,10 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "advShow();"
 "document.getElementById('fqslot').appendChild(fs);"
 /* способ измерения: строки другого способа приглушаются */
-"function showFields(){var al=+document.getElementById('p_algo').value;"
+/* окно «до / после вершины» нужно и фильтру формы - при нём не приглушаем */
+"function showFields(){var al=+document.getElementById('p_algo').value,so=document.getElementById('sh_on').checked;"
 "GR.forEach(function(g){g[1].forEach(function(r){var w=document.getElementById('w_'+r[0]);"
+"if(so&&(r[0]=='int_rise'||r[0]=='int_fall'))r=[r[0],r[1],'b'];"
 "if(w)w.className=(r[2]=='t'&&al!=0)||(r[2]=='i'&&al!=1)?'off':''})})}"
 "showFields();"
 /* «Кодов на канал»: в описании сразу виден верх шкалы - каналов x кодов */
@@ -1720,6 +1793,7 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "function fillCfg(p){if(p.fl){FHZ=p.fl;fillFq()}"
 "if(p.emu!==undefined){window.EMU=String(p.emu);document.getElementById('p_emu').value=window.EMU}"
 "P.forEach(function(k){document.getElementById('p_'+k).value=k=='cpc'?p[k]/1000:p[k]});"
+"if(p.shape_on!==undefined){document.getElementById('sh_on').checked=p.shape_on==1;document.getElementById('sh_tol').value=p.shape_tol}"
 "showFields();cpcTop()}"
 "function ldcfg(){fetch('/stat').then(function(r){return r.json()}).then(function(j){window.REALHZ=j.freq})"
 ".catch(function(){}).then(function(){return fetch('/cfg')}).then(function(r){return r.json()})"
@@ -1769,6 +1843,53 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "p.textContent=L('прибор перезапущен, работает версия ','device restarted, running version ')+j.ver})"
 ".catch(function(){p.textContent=L('жду перезапуска прибора...','waiting for the device to restart...');setTimeout(fww,2000)})}"
 "ldcfg();ld();fwi();"
+/* ФИЛЬТР ФОРМЫ. /shape: 16 x int32 (набрано, нужно, p10, p50, p90 - x10,
+   окно, действует, эталон x10, допуск, включён, окно эталона, частота
+   эталона, частота сейчас, проверено, отброшено, столбцов), затем карта
+   uint16: строки снизу вверх - ширина от 0 до окна. Опрос раз в 2 с:
+   пока он идёт, прибор меряет форму и при выключенном фильтре. */
+"var SH={busy:0,d:null};"
+"function shSet(){var on=document.getElementById('sh_on').checked?1:0,t=+document.getElementById('sh_tol').value||25;"
+"fetch('/cfg?shape_on='+on+'&shape_tol='+t).then(function(r){return r.json()}).then(fillCfg).then(function(){shLoad()}).catch(function(){})}"
+"function shLearn(){var lr=SH.d&&SH.d.need>0;"
+"if(!lr&&!confirm(L('Набрать эталон формы? Нужен запущенный набор спектра (подойдёт и фон, с источником быстрее): прибор возьмёт 2000 импульсов выше трёх порогов, медиана их ширины станет эталоном и сохранится в памяти прибора.',"
+"'Learn the shape reference? A running spectrum acquisition is needed (background will do, a source is faster): the device takes 2000 pulses above three thresholds, the median of their width becomes the reference and is saved in the device memory.')))return;"
+"shLoad(lr?'stop':'learn')}"
+"function shClr(){shLoad('clear')}"
+"function shLoad(dd){if(SH.busy&&!dd)return;SH.busy=1;"
+"fetch('/shape'+(dd?'?do='+dd:'')).then(function(r){return r.arrayBuffer()}).then(function(b){SH.busy=0;"
+"if(b.byteLength<64)return;var v=new DataView(b),h=[];for(var i=0;i<16;i++)h.push(v.getInt32(4*i,true));"
+"var XB=h[15]||104;SH.d={n:h[0],need:h[1],p10:h[2],p50:h[3],p90:h[4],win:h[5],act:h[6],ref:h[7],tol:h[8],on:h[9],"
+"swin:h[10],shz:h[11],hz:h[12],chk:h[13]>>>0,rej:h[14]>>>0,XB:XB,YB:Math.floor((b.byteLength-64)/2/XB),m:new Uint16Array(b.slice(64))};"
+"shStat();shDraw()}).catch(function(){SH.busy=0})}"
+"function f1(x){return (x/10).toFixed(1)}"
+"function shStat(){var d=SH.d,t=[],lb=document.getElementById('sh_lb');"
+"lb.textContent=d.need>0?L('Прервать набор','Stop learning'):L('Набрать эталон','Learn reference');"
+"if(d.need>0)t.push('<b style=color:#f0c45a>'+L('набор эталона: ','learning the reference: ')+d.n+L(' из ',' of ')+d.need+'</b> '+"
+"L('(импульсы идут, только пока набирается спектр)','(pulses come only while the spectrum is being acquired)'));"
+"if(d.ref>0)t.push(L('эталон: ','reference: ')+'<b>'+f1(d.ref)+L(' отсч.',' samples')+'</b> ('+L('окно ','window ')+d.swin+L(' отсч., ',' samples, ')+"
+"(d.shz/1e6).toFixed(2)+L(' МГц',' MHz')+')'+(d.p50==d.ref&&d.p90>0?L(', разброс 10-90 %: ',', 10-90 % spread: ')+f1(d.p10)+'-'+f1(d.p90):''));"
+"else t.push(L('эталон не набран','no reference yet'));"
+"if(d.on&&!d.act)t.push('<b style=color:#ff8a82>'+(d.ref<=0?L('фильтр включён, но эталона нет - импульсы проходят все','the filter is on, but there is no reference - all pulses pass'):"
+"d.swin!=d.win?L('окно «до / после вершины» сменилось после набора эталона - наберите его заново, пока фильтр пропускает всё','the “before / after peak” window changed after the reference was learned - learn it again, until then the filter passes everything'):"
+"L('частота АЦП сменилась после набора эталона - наберите его заново, пока фильтр пропускает всё','the ADC rate changed after the reference was learned - learn it again, until then the filter passes everything'))+'</b>');"
+"if(d.act)t.push('<b style=color:#9fe0a0>'+L('фильтр действует','filter active')+'</b>: '+L('с «Сброса» проверено ','since “Reset” checked ')+d.chk+L(', отброшено ',', rejected ')+d.rej+"
+"(d.chk?' ('+(d.rej*100/d.chk).toFixed(1)+' %)':''));"
+"document.getElementById('sh_st').innerHTML=t.join('<br>')}"
+"function shDraw(){var d=SH.d;if(!d||!d.YB)return;var c=document.getElementById('sh_cv'),dpr=window.devicePixelRatio||1,"
+"W=c.clientWidth,H=c.clientHeight;c.width=W*dpr;c.height=H*dpr;var x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);"
+"var ml=34,mb=18,mt=6,mr=8,pw=W-ml-mr,ph=H-mt-mb,mx=0,i;x.fillStyle='#0b0f0b';x.fillRect(0,0,W,H);"
+"for(i=0;i<d.m.length;i++)if(d.m[i]>mx)mx=d.m[i];var cw=pw/d.XB,chh=ph/d.YB,lm=Math.log(1+mx)||1;"
+"for(var yy=0;yy<d.YB;yy++)for(var xx=0;xx<d.XB;xx++){var n=d.m[yy*d.XB+xx];if(!n)continue;var q=Math.log(1+n)/lm;"
+"x.fillStyle='hsl('+Math.round(150-110*q)+',75%,'+Math.round(22+50*q)+'%)';"
+"x.fillRect(ml+xx*cw,mt+ph-(yy+1)*chh,Math.ceil(cw),Math.ceil(chh))}"
+"if(d.ref>0&&d.swin==d.win){var r=d.ref/10,tl=r*d.tol/100,Y=function(w){return mt+ph-Math.min(w,d.win)/d.win*ph};"
+"x.fillStyle='rgba(127,216,138,.13)';x.fillRect(ml,Y(r+tl),pw,Y(Math.max(r-tl,0))-Y(r+tl));"
+"x.strokeStyle='#7fd88a';x.setLineDash([4,3]);x.beginPath();x.moveTo(ml,Y(r));x.lineTo(ml+pw,Y(r));x.stroke();x.setLineDash([])}"
+"x.strokeStyle='#3a443a';x.strokeRect(ml+.5,mt+.5,pw,ph);x.fillStyle='#8a948a';x.font='10.5px monospace';"
+"for(var o=0;o<=12;o+=2)x.fillText(String(1<<o),ml+o*8*cw+2,H-5);"
+"for(var k=0;k<=4;k++)x.fillText(String(Math.round(d.win*k/4)),4,mt+ph-ph*k/4+(k==4?9:-1))}"
+"shLoad();setInterval(function(){shLoad()},2000);window.addEventListener('resize',shDraw);"
 "</script></body></html>";
 
 static esp_err_t h_set_page(httpd_req_t *r)
@@ -2416,6 +2537,12 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "параметры обработки; в прибор уходят кнопкой «Применить». Смена «Кодов на "
 "канал» и способа измерения очищает спектр, смена L, G и полярности "
 "перезапускает фильтр.</td></tr>"
+"<tr><td>Фильтр формы</td><td>На странице «Настройки», по желанию. Отбрасывает импульсы, ширина "
+"которых (площадь / высота в окне «до / после вершины») дальше от эталона, чем допуск: шумовые "
+"всплески ФЭУ уже сцинтилляций. «Набрать эталон» &mdash; при запущенном наборе (хватит и фона), "
+"прибор берёт 2000 импульсов. Эталон годится для того окна и той частоты, на которых набран. "
+"Карта показывает импульсы по каналу и ширине, полоса &mdash; эталон ± допуск. С хорошим ФЭУ "
+"фильтр не нужен.</td></tr>"
 "<tr><td>Диагностика</td><td>Отдельная страница. <b>Лог прибора</b> &mdash; сообщения "
 "прошивки с начала работы (последние 256 строк), цвет по уровню: красные &mdash; "
 "ошибки, жёлтые &mdash; предупреждения, тег окрашен по подсистеме (АЦП, сеть, прошивка...); "
@@ -2583,6 +2710,12 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "the “Advanced” block, all processing parameters; they go to the device with the "
 "“Apply” button. Changing “Codes per channel” or the method clears the spectrum, "
 "changing L, G or polarity restarts the filter.</td></tr>"
+"<tr><td>Shape filter</td><td>On the “Settings” page, on demand. Rejects pulses whose width "
+"(area / height in the “before / after peak” window) is farther from the reference than the "
+"tolerance: PMT noise bursts are narrower than scintillations. “Learn reference” &mdash; with a "
+"running acquisition (background is enough), the device takes 2000 pulses. The reference is valid for the "
+"window and rate it was learned at. The map shows pulses by channel and width, the band is "
+"reference ± tolerance. With a good PMT the filter is not needed.</td></tr>"
 "<tr><td>Diagnostics</td><td>A separate page. <b>Device log</b> &mdash; firmware "
 "messages since start (the last 256 lines), coloured by level: red &mdash; errors, "
 "yellow &mdash; warnings, the tag is coloured by subsystem (ADC, network, firmware...); "
@@ -2919,7 +3052,7 @@ esp_err_t mca_web_start(void)
 
     httpd_handle_t srv = NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 40;          /* 31 свой + 2 у /ota, с запасом */
+    cfg.max_uri_handlers = 40;          /* 32 своих + 2 у /ota, с запасом */
     cfg.stack_size       = 8192;
     cfg.core_id          = 0;           /* веб на ядро 0, DSP на ядро 1 */
     cfg.lru_purge_enable = true;
@@ -2943,6 +3076,7 @@ esp_err_t mca_web_start(void)
         URI("/settings", h_set_page, NULL),
         URI("/diag", h_diag_page, NULL),
         URI("/log", h_log, NULL),
+        URI("/shape", h_shape, NULL),
         URI("/net", h_set_page, NULL),     /* прежние адреса страницы сети */
         URI("/wifi", h_set_page, NULL),
         URI("/net/status", h_net_status, NULL),

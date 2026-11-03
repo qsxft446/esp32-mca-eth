@@ -32,6 +32,11 @@ TRAP_G_MAX = _D['TRAP_G_MAX']
 CAP_CHUNK_SAMPLES = _D['CAP_CHUNK_SAMPLES']
 MCA_CHANNELS = _D['MCA_CHANNELS']
 MCA_ADC_MAX = _D['MCA_ADC_MAX']
+# размеры карты и эталона фильтра формы - из mca_dsp.h
+_DS = _defines(os.path.join(os.path.dirname(_HDR), 'mca_dsp.h'))
+SHAPE_XB = _DS['SHAPE_XB']
+SHAPE_YB = _DS['SHAPE_YB']
+SHAPE_LEARN_N = _DS['SHAPE_LEARN_N']
 
 DSP_TAIL = TRAP_L_MAX + TRAP_G_MAX + 8
 WORK = DSP_TAIL + CAP_CHUNK_SAMPLES
@@ -59,6 +64,12 @@ class Params:
         self.baseline_shift = 10
         self.baseline_win = 150
         self.flat_avg = 0
+        # фильтр формы (shape_check в mca_dsp.c): выключен, допуск 25 %
+        self.shape_on = 0
+        self.shape_tol = 25
+        self.shape_ref = 0
+        self.shape_win = 0
+        self.shape_hz = 0
         self.__dict__.update(kw)
 
 
@@ -68,13 +79,16 @@ class DSP:
        guard_end=True - запрет чтения за концом свежих данных."""
 
     def __init__(self, p, rebase=True, guard_end=False, vec=False,
-                 word_invert=False):
+                 word_invert=False, fclk=None, shape_watch=False):
         """vec         - как в прошивке: разность трапеции d для всего
                          чанка заранее, в 16-битной арифметике с насыщением
                          (векторные команды), цикл ожидания восьмёрками с
                          проверкой порога по максимуму;
            word_invert - переворот полярности словами по два отсчёта.
-        Без флагов - прежний поштучный вариант: тест сравнивает оба."""
+        Без флагов - прежний поштучный вариант: тест сравнивает оба.
+           fclk        - частота АЦП для сверки с частотой эталона формы
+                         (None - не сверять);
+           shape_watch - карта на экране: мера формы считается всегда."""
         self.p = p
         self.rebase = rebase
         self.guard_end = guard_end
@@ -98,6 +112,18 @@ class DSP:
         self.overflow = 0
         self.events = []
         self.valid_end = WORK
+        # фильтр формы
+        self.fclk = fclk
+        self.shape_watch = shape_watch
+        self.cross_pos = 0
+        self.map = {}             # (строка, столбец) -> число событий
+        self.map_win = 0
+        self.learn = []           # набранные ширины x10
+        self.learn_need = 0
+        self.learn_win = 0
+        self.shape_chk = 0
+        self.shape_rej = 0
+        self.widths = []          # (канал, ширина x10, принято) - для проверок
 
     # ---- расчёт амплитуды (порт функций из mca_dsp.c) ----
     def amp_integrate(self, peak_pos, rise, fall, L, G, base):
@@ -125,6 +151,72 @@ class DSP:
             return
         self.hist[ch] += 1
         self.events.append((ch, num / den))
+
+    # ---- фильтр формы (порт shape_xbin и shape_check) ----
+    def start_learn(self):
+        p = self.p
+        self.learn = []
+        self.learn_need = SHAPE_LEARN_N
+        self.learn_win = p.int_rise + p.int_fall + 1
+
+    def finish_learn(self):
+        """Как mca_dsp_shape_poll: медиана - в эталон."""
+        v = sorted(self.learn)
+        n = len(v)
+        p = self.p
+        p.shape_ref = v[n // 2]
+        p.shape_win = self.learn_win
+        p.shape_hz = self.fclk or 0
+        self.learn_need = 0
+        return v[n // 10], v[n // 2], v[n * 9 // 10]
+
+    @staticmethod
+    def shape_xbin(ch):
+        if ch < 1:
+            return 0
+        o = ch.bit_length() - 1
+        m = (ch >> (o - 3)) & 7 if o >= 3 else (ch << (3 - o)) & 7
+        return min(o * 8 + m, SHAPE_XB - 1)
+
+    def shape_check(self, tpk, end, num, den, filt, learn):
+        p, w = self.p, self.w
+        lo = max(self.cross_pos - p.trap_L, 1)
+        hi = min(tpk + 4, end - 1)
+        mx, pk = -1, lo
+        for i in range(lo, hi + 1):
+            if w[i] > mx:
+                mx, pk = w[i], i
+        a, b = pk - p.int_rise, pk + p.int_fall
+        if a - 8 < 0 or b >= end:
+            return True
+        base8 = sum(w[a - 8:a])
+        ssum = sum(w[a:b + 1])
+        n = b - a + 1
+        h8 = mx * 8 - base8
+        s8 = ssum * 8 - n * base8
+        w10 = (s8 * 10) // h8 if (h8 > 0 and s8 > 0) else 0
+        w10 = min(w10, 10 * n)
+        d = den * p.cpc
+        ch = (num * 1000) // d if (d > 0 and num > 0) else 0
+        if ch < MCA_CHANNELS:
+            if self.map_win != n:
+                self.map = {}
+                self.map_win = n
+            y = min(w10 * SHAPE_YB // (10 * n), SHAPE_YB - 1)
+            key = (y, self.shape_xbin(ch))
+            self.map[key] = min(self.map.get(key, 0) + 1, 0xFFFF)
+        if learn and n == self.learn_win and num >= 3 * p.threshold * den:
+            if len(self.learn) < self.learn_need:
+                self.learn.append(min(w10, 32767))
+        ok = True
+        if filt:
+            self.shape_chk += 1
+            tol = p.shape_ref * p.shape_tol // 100
+            if w10 < p.shape_ref - tol or w10 > p.shape_ref + tol:
+                self.shape_rej += 1
+                ok = False
+        self.widths.append((ch, w10, ok))
+        return ok
 
     # ---- порт mca_dsp_process ----
     def process(self, data):
@@ -157,6 +249,13 @@ class DSP:
         base_fp = self.base_fp
         end = DSP_TAIL + n
         i = DSP_TAIL
+
+        swin = p.int_rise + p.int_fall + 1
+        hz_ok = self.fclk is None or p.shape_hz == self.fclk
+        shape_filt = (p.shape_on and p.shape_ref > 0 and p.shape_win == swin
+                      and hz_ok)
+        shape_learn = self.learn_need > 0
+        shape_need = shape_filt or shape_learn or self.shape_watch
 
         if self.vec:
             # Как diff_vec в прошивке: три операции с насыщением 16 бит
@@ -240,6 +339,7 @@ class DSP:
                 self.pre_trap = trap
                 self.peak = trap
                 self.peak_pos = i
+                self.cross_pos = i
                 self.since = 0
                 self.state = ST_PEAK
                 i += 1
@@ -253,12 +353,15 @@ class DSP:
                     self.since += 1
                     if self.since >= p.search:
                         if p.algo == 1:
-                            s, cnt = self.amp_integrate(
+                            num, den = self.amp_integrate(
                                 self.peak_pos, p.int_rise, p.int_fall,
                                 L, G, base_fp >> 8)
-                            self.record_event(s, cnt)
                         else:
-                            self.record_event(self.peak, L)
+                            num, den = self.peak, L
+                        if (not shape_need or
+                                self.shape_check(self.peak_pos, end, num, den,
+                                                 shape_filt, shape_learn)):
+                            self.record_event(num, den)
                         self.since = 0
                         self.state = ST_REARM
                         i += 1
@@ -282,6 +385,7 @@ class DSP:
         w[0:DSP_TAIL] = w[shift:shift + DSP_TAIL]
         if self.rebase and self.state == ST_PEAK:
             self.peak_pos -= shift
+            self.cross_pos -= shift
             if self.peak_pos < L + G + 1:
                 self.state = ST_IDLE
                 self.since = 0

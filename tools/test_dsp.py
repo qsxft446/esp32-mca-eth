@@ -5,6 +5,7 @@
 Модель берёт константы прямо из main/mca_config.h, поэтому тесты
 следуют за прошивкой при изменении размера чанка и числа каналов.
 """
+import math
 import os
 import random
 import statistics
@@ -642,6 +643,94 @@ else:
           max(sh) - min(sh) == 0, f"разброс сдвига {max(sh) - min(sh)} мс")
     check("в непрерывном наборе нет пустых секунд", gaps12(out12['bt']) == 0,
           f"разрывов {gaps12(out12['bt'])}")
+
+# ------------------------------------------------------------------ L12
+print("\n=== УРОВЕНЬ 12: фильтр формы импульса ===")
+print("  Сигнал как у шумного ФЭУ (замер 2026-11-03, 20 МГц): сцинтилляции -")
+print("  фронт 10 отсч., спад 50 отсч.; шумовые всплески - фронт 3, спад 7, ниже")
+print("  по амплитуде. Эталон набирается из сигнала, фильтр должен убрать всплески")
+print("  и оставить сцинтилляции. Классы различаются амплитудой (всплески 20-60")
+print("  кодов, сцинтилляции от 150), поэтому проверка не зависит от самой меры.\n")
+FS12 = 20e6
+rnd12 = random.Random(12)
+N_REAL, N_NOISE, STEP12 = 1200, 400, 300
+kinds12 = [1] * N_REAL + [0] * N_NOISE
+rnd12.shuffle(kinds12)
+pos12 = [200 + k * STEP12 + rnd12.randint(0, 40) for k in range(len(kinds12))]
+ra = [rnd12.uniform(150, 1000) if k else 0 for k in kinds12]
+na = [0 if k else rnd12.uniform(20, 60) for k in kinds12]
+n12 = pos12[-1] + 1000
+real12 = make_pulse_train(n12, [a for a in ra if a], [p for p, k in zip(pos12, kinds12) if k],
+                          fs_hz=FS12, rise_ns=500, tau_us=2.5, clip=False)
+noise12 = make_pulse_train(n12, [a for a in na if a], [p for p, k in zip(pos12, kinds12) if not k],
+                           fs_hz=FS12, rise_ns=150, tau_us=0.35, baseline=0, clip=False)
+g12 = random.Random(7)
+sig12 = [max(0, min(MCA_ADC_MAX, r + n + int(round(g12.gauss(0, 1.6)))))
+         for r, n in zip(real12, noise12)]
+cfg12 = dict(threshold=10, trap_L=12, trap_G=122, rearm=23, search=56,
+             int_rise=13, int_fall=36, cpc=1000, nch=2048)
+
+
+def run12(p, learn=False, **kw):
+    d = DSP(p, **kw)
+    if learn:
+        d.start_learn()
+    for off in range(0, len(sig12) - CAP_CHUNK_SAMPLES + 1, CAP_CHUNK_SAMPLES):
+        d.process(sig12[off:off + CAP_CHUNK_SAMPLES])
+    return d
+
+
+def cls12(d):
+    """(всплесков всего, принято; сцинтилляций всего, принято) - по каналу"""
+    lo = [ok for ch, w, ok in d.widths if ch < 100]
+    hi = [ok for ch, w, ok in d.widths if ch >= 100]
+    return len(lo), sum(lo), len(hi), sum(hi)
+
+
+# ширина сцинтилляции из формы генератора (независимо от прошивки):
+# площадь в окне вокруг вершины / высота
+rs12, tau12 = int(500e-9 * FS12), 2.5e-6 * FS12
+shape12 = [0.0] * 20 + [(k + 1) / rs12 if k < rs12 else math.exp(-(k - rs12) / tau12)
+                        for k in range(400)]
+pk12 = max(range(len(shape12)), key=lambda k: shape12[k])
+w_true12 = sum(shape12[pk12 - 13:pk12 + 37])
+p_off = Params(**cfg12)
+d_off = run12(p_off, shape_watch=True)
+p_l = Params(**cfg12)
+d_l = run12(p_l, learn=True)
+q10, q50, q90 = d_l.finish_learn()
+print(f"  эталон: {q50 / 10:.1f} отсч. (10-90 %: {q10 / 10:.1f}-{q90 / 10:.1f}), "
+      f"из {len(d_l.learn)} событий; по форме генератора {w_true12:.1f}")
+check("эталон совпал с шириной сцинтилляции по форме генератора (±5 %)",
+      abs(q50 / 10 - w_true12) <= 0.05 * w_true12, f"{q50 / 10:.1f} против {w_true12:.1f}")
+p_on = Params(**cfg12, shape_on=1, shape_tol=25, shape_ref=p_l.shape_ref,
+              shape_win=p_l.shape_win)
+d_on = run12(p_on)
+a0, b0, c0, e0 = cls12(d_off)
+a1, b1, c1, e1 = cls12(d_on)
+print(f"  без фильтра: всплесков {a0} (в спектре {b0}), сцинтилляций {c0} (в спектре {e0}), "
+      f"событий в спектре {len(d_off.events)}")
+print(f"  с фильтром:  всплесков {a1} (в спектре {b1}), сцинтилляций {c1} (в спектре {e1}), "
+      f"событий в спектре {len(d_on.events)}, отброшено {d_on.shape_rej}")
+check("без фильтра всплески попадают в спектр (проверка самой проверки)",
+      a0 >= 0.3 * N_NOISE and b0 == a0, f"всплесков {a0}, в спектре {b0}")
+check("фильтр убрал не меньше 95 % всплесков", a1 > 0 and b1 <= 0.05 * a1, f"осталось {b1} из {a1}")
+check("фильтр оставил не меньше 99 % сцинтилляций", c1 > 0 and e1 >= 0.99 * c1,
+      f"осталось {e1} из {c1}")
+acc12 = sum(1 for ch, w, ok in d_on.widths if ok and ch < MCA_CHANNELS)
+check("в спектре ровно принятые фильтром события", len(d_on.events) == acc12,
+      f"{len(d_on.events)} против {acc12}")
+p_w = Params(**cfg12, shape_on=1, shape_tol=25, shape_ref=p_l.shape_ref,
+             shape_win=p_l.shape_win)
+p_w.int_fall = 30
+d_w = run12(p_w)
+check("окно сменилось после набора эталона - фильтр ничего не отбрасывает",
+      d_w.shape_rej == 0 and d_w.shape_chk == 0, f"отброшено {d_w.shape_rej}")
+p_h = Params(**cfg12, shape_on=1, shape_tol=25, shape_ref=p_l.shape_ref,
+             shape_win=p_l.shape_win, shape_hz=16000000)
+d_h = run12(p_h, fclk=20000000)
+check("частота сменилась после набора эталона - фильтр ничего не отбрасывает",
+      d_h.shape_rej == 0, f"отброшено {d_h.shape_rej}")
 
 print("\n" + "=" * 62)
 if fails:
