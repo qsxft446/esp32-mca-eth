@@ -137,13 +137,15 @@ class DSP:
     # ---- расчёт амплитуды (порт функций из mca_dsp.c) ----
     def amp_integrate(self, peak_pos, rise, fall, L, G, base):
         total = self.valid_end if self.guard_end else WORK
-        lo = max(peak_pos - L - G, 1)
+        # не раньше, чем «порог пробит минус L» - как в прошивке
+        lo = max(peak_pos - L - G, self.cross_pos - L, 1)
         hi = min(peak_pos + 4, total - 1)
         w = self.w
         mx, pk = -32768, lo
         for i in range(lo, hi + 1):
             if w[i] > mx:
                 mx, pk = w[i], i
+        self.int_pk = pk          # вершина - её берёт фильтр формы
         a = max(pk - rise, 0)
         b = min(pk + fall, total - 1)
         ssum = sum(w[i] - base for i in range(a, b + 1))
@@ -186,19 +188,24 @@ class DSP:
         self.learn_need = 0
         return v[n // 10], v[n // 2], v[n * 9 // 10]
 
-    def shape_check(self, tpk, end, num, den, cmp, filt, learn):
+    def shape_check(self, tpk, end, num, den, cmp, filt, learn, ipk=-1, isum=0):
+        """ipk >= 0 - вершину и сумму окна (isum, без вычета базы) уже
+        нашло интегрирование, как в прошивке."""
         p, w = self.p, self.w
-        lo = max(self.cross_pos - p.trap_L, 1)
-        hi = min(tpk + 4, end - 1)
-        mx, pk = -1, lo
-        for i in range(lo, hi + 1):
-            if w[i] > mx:
-                mx, pk = w[i], i
+        if ipk >= 0:
+            pk, mx = ipk, w[ipk]
+        else:
+            lo = max(self.cross_pos - p.trap_L, 1)
+            hi = min(tpk + 4, end - 1)
+            mx, pk = -1, lo
+            for i in range(lo, hi + 1):
+                if w[i] > mx:
+                    mx, pk = w[i], i
         a, b = pk - p.int_rise, pk + p.int_fall
         if a - 8 < 0 or b >= end:
             return True
         base8 = sum(w[a - 8:a])
-        ssum = sum(w[a:b + 1])
+        ssum = isum if ipk >= 0 else sum(w[a:b + 1])
         n = b - a + 1
         h8 = mx * 8 - base8
         s8 = ssum * 8 - n * base8
@@ -363,15 +370,19 @@ class DSP:
                         self.peak, self.peak_pos = trap, i
                     self.since += 1
                     if self.since >= p.search:
+                        ipk, isum = -1, 0
                         if p.algo == 1:
+                            ib = base_fp >> 8
                             num, den = self.amp_integrate(
                                 self.peak_pos, p.int_rise, p.int_fall,
-                                L, G, base_fp >> 8)
+                                L, G, ib)
+                            ipk, isum = self.int_pk, num + den * ib
                         else:
                             num, den = self.peak, L
                         if (not shape_need or
                                 self.shape_check(self.peak_pos, end, num, den,
-                                                 shape_cmp, shape_filt, shape_learn)):
+                                                 shape_cmp, shape_filt, shape_learn,
+                                                 ipk, isum)):
                             self.record_event(num, den)
                         self.since = 0
                         self.state = ST_REARM

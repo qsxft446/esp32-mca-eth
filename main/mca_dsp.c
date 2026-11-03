@@ -323,17 +323,24 @@ void mca_dsp_service(bool idle)
  *
  * Возвращает сумму, а число отсчётов - в *out_n. Амплитуда - их
  * отношение, средняя высота импульса в окне в кодах АЦП; делится она
- * уже при записи в канал, целиком, без округления до кода.
+ * уже при записи в канал, целиком, без округления до кода. В *out_pk -
+ * найденная вершина: её и сумму окна берёт фильтр формы, чтобы не искать
+ * и не складывать то же самое второй раз.
  */
 static int64_t amp_integrate(int32_t peak_pos, int32_t rise, int32_t fall,
                              int32_t L, int32_t G, int32_t base,
-                             int32_t *out_n)
+                             int32_t *out_n, int32_t *out_pk)
 {
     int total = DSP_TAIL + CAP_CHUNK_SAMPLES;
 
     /* Вершина трапеции отстаёт от вершины сигнала примерно на L,
-     * поэтому настоящий максимум ищем левее. */
+     * поэтому настоящий максимум ищем левее - но не раньше, чем «порог
+     * пробит минус L»: порог пробивается не позже, чем через L отсчётов
+     * после начала фронта. Раньше поиск шёл от вершины трапеции минус L+G
+     * (~100 отсчётов, ~700 тактов на событие - замер 2026-11-04, 20 МГц) и
+     * при наложении мог взять вершину предыдущего импульса. */
     int lo = peak_pos - L - G;
+    if (lo < s_cross_pos - L) lo = s_cross_pos - L;
     int hi = peak_pos + 4;
     if (lo < 1) lo = 1;
     if (hi >= total) hi = total - 1;
@@ -342,6 +349,7 @@ static int64_t amp_integrate(int32_t peak_pos, int32_t rise, int32_t fall,
     for (int i = lo; i <= hi; i++)
         if (s_work[i] > mx) { mx = s_work[i]; pk = i; }
 
+    *out_pk = pk;
     int a = pk - rise, b = pk + fall;
     if (a < 0) a = 0;
     if (b >= total) b = total - 1;
@@ -396,27 +404,41 @@ static int32_t s_shape_lo, s_shape_hi;
  * среднее восьми отсчётов прямо перед окном: так хвост предыдущего
  * импульса не влияет. Ширина = площадь / высота, x10.
  *
+ * При интегрировании (ipk >= 0) вершину и сумму окна уже нашёл
+ * amp_integrate - в том же окне «до / после вершины»: они и берутся (isum -
+ * сумма отсчётов окна без вычета базы). Иначе поиск и сумма - здесь; это
+ * ~580 из ~650 тактов меры (замер 2026-11-04), и при ~5000 имп/с на 20 МГц
+ * повтор этой работы переполнял бюджет ядра.
+ *
  * Зовётся, только когда мера нужна: фильтр, набор эталона или открытая
  * страница. Гистограмма ширины пополняется всегда; learn - идёт набор
  * эталона; cmp - эталон годится для сравнения (окно и частота те же);
  * filt - фильтр действует. true - событие идёт в спектр. Окно, не легшее
  * в буфер (событие у самого конца чанка), не судим: событие проходит. */
 static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
-                        const mca_params_t *p, bool cmp, bool filt, bool learn)
+                        const mca_params_t *p, bool cmp, bool filt, bool learn,
+                        int32_t ipk, int32_t isum)
 {
-    int lo = s_cross_pos - p->trap_L, hi = tpk + 4;
-    if (lo < 1) lo = 1;
-    if (hi > end - 1) hi = end - 1;
     int32_t mx = -1;
-    int pk = lo;
-    for (int i = lo; i <= hi; i++)
-        if (s_work[i] > mx) { mx = s_work[i]; pk = i; }
+    int pk;
+    if (ipk >= 0) {
+        pk = ipk;
+        mx = s_work[pk];
+    } else {
+        int lo = s_cross_pos - p->trap_L, hi = tpk + 4;
+        if (lo < 1) lo = 1;
+        if (hi > end - 1) hi = end - 1;
+        pk = lo;
+        for (int i = lo; i <= hi; i++)
+            if (s_work[i] > mx) { mx = s_work[i]; pk = i; }
+    }
     const int a = pk - p->int_rise, b = pk + p->int_fall;
     if (a - 8 < 0 || b >= end) return true;
 
     int32_t base8 = 0, sum = 0;
     for (int i = a - 8; i < a; i++) base8 += s_work[i];
-    for (int i = a; i <= b; i++) sum += s_work[i];
+    if (ipk >= 0) sum = isum;
+    else for (int i = a; i <= b; i++) sum += s_work[i];
     const int32_t n  = b - a + 1;
     const int32_t h8 = mx * 8 - base8;              /* высота x8  */
     const int32_t s8 = sum * 8 - n * base8;         /* площадь x8 */
@@ -857,11 +879,14 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
                         pile++;
                     } else {
                         int64_t num;
-                        int32_t den;
+                        int32_t den, ipk = -1, isum = 0;
                         if (p.algo == 1) {
+                            const int32_t ib = base_fp >> 8;
                             num = amp_integrate(s_peak_pos, p.int_rise,
-                                                p.int_fall, L, G,
-                                                base_fp >> 8, &den);
+                                                p.int_fall, L, G, ib,
+                                                &den, &ipk);
+                            /* сумма окна без вычета базы - для меры формы */
+                            isum = (int32_t)(num + (int64_t)den * ib);
                         } else {
                             num = (s_flat_cnt > 0)
                                 ? (int32_t)(s_flat_sum / s_flat_cnt)
@@ -870,7 +895,8 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
                         }
                         if (!shape_need ||
                             shape_check(s_peak_pos, end, num, den, &p,
-                                        shape_cmp, shape_filt, shape_learn))
+                                        shape_cmp, shape_filt, shape_learn,
+                                        ipk, isum))
                             record_event(num, den, &p);
                     }
                     s_since = 0;

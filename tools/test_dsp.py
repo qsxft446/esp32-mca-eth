@@ -680,10 +680,12 @@ def run12(p, learn=False, **kw):
     return d
 
 
-def cls12(d):
-    """(всплесков всего, принято; сцинтилляций всего, принято) - по каналу"""
-    lo = [ok for ch, w, ok in d.widths if ch < 100]
-    hi = [ok for ch, w, ok in d.widths if ch >= 100]
+def cls12(d, split=100):
+    """(всплесков всего, принято; сцинтилляций всего, принято) - по каналу.
+    При интегрировании амплитуда - средняя высота в окне (~0.6 высоты у
+    сцинтилляции, ~0.3 у всплеска), граница - 50."""
+    lo = [ok for ch, w, ok in d.widths if ch < split]
+    hi = [ok for ch, w, ok in d.widths if ch >= split]
     return len(lo), sum(lo), len(hi), sum(hi)
 
 
@@ -735,6 +737,22 @@ check("фильтр оставил не меньше 99 % сцинтилляци
 acc12 = sum(1 for ch, w, ok in d_on.widths if ok and ch < MCA_CHANNELS)
 check("в спектре ровно принятые фильтром события", len(d_on.events) == acc12,
       f"{len(d_on.events)} против {acc12}")
+# интегрирование: вершину и сумму окна фильтр берёт у amp_integrate -
+# разделение классов должно остаться тем же
+p_il = Params(**cfg12, algo=1)
+d_il = run12(p_il, learn=True)
+qi10, qi50, qi90 = d_il.finish_learn()
+p_ion = Params(**cfg12, algo=1, shape_on=1, shape_tol=25, shape_ref=p_il.shape_ref,
+               shape_win=p_il.shape_win)
+d_ion = run12(p_ion)
+ai, bi, ci, ei = cls12(d_ion, 50)
+print(f"  интегрирование: эталон {qi50 / 10:.1f} отсч.; всплесков {ai} (в спектре {bi}), "
+      f"сцинтилляций {ci} (в спектре {ei})")
+check("интегрирование: эталон тот же (±5 % от формы генератора)",
+      abs(qi50 / 10 - w_true12) <= 0.05 * w_true12, f"{qi50 / 10:.1f} против {w_true12:.1f}")
+check("интегрирование: убрано не меньше 95 % всплесков, оставлено не меньше 99 % сцинтилляций",
+      ai > 0 and bi <= 0.05 * ai and ci > 0 and ei >= 0.99 * ci,
+      f"всплесков осталось {bi} из {ai}, сцинтилляций {ei} из {ci}")
 p_w = Params(**cfg12, shape_on=1, shape_tol=25, shape_ref=p_l.shape_ref,
              shape_win=p_l.shape_win)
 p_w.int_fall = 30

@@ -333,9 +333,9 @@ BecqMoni (answers to commands).
   area / height: green within the tolerance, red outside, the band is
   reference ± tolerance, the share outside the tolerance below. The card
   shows how many pulses were checked and rejected since “Reset” (`/stat`:
-  `shchk`, `shrej`). At 20 MHz with a high count rate the filter does not fit
-  into the core budget and loses chunks, at 16 MHz it does not (measurements
-  — “Found while debugging”, “Pulse shape filter”).
+  `shchk`, `shrej`). At 20 MHz and ~5000 cps the filter works without chunk
+  losses, but the core headroom is small (measurements — “Found while
+  debugging”, “Pulse shape filter”).
 - **CPS monitor** — on the same tab, below the spectrum: current CPS, mean
   over the whole history with its error, last interval, a plot by averaging
   intervals with a moving average, an interval table and CSV export. The
@@ -752,24 +752,41 @@ pre-allocated memory.
   per sample. The measure's baseline is the eight samples right before the
   window, not the common baseline: so the tail of the previous pulse does
   not change the width.
-- **What it costs.** Temporary cycle counters (2026-11-04, 20 MHz): ~650
-  cycles per event — peak search 323 (48 samples), window sum 259 (58
-  samples), the rest ~64. 64-bit division is not the cause: replacing it
-  with 32-bit did not change the cost; a narrower peak search and summing
-  two samples per read did not help either — it got slower (460 and 280),
-  reverted. On background (~330 cps, 20 MHz) this is invisible: load 84.5 %
-  without the measure and 84.6 % with the filter, no losses (3 min each).
-  With a source (~5000 cps, filter off / on alternately for 20 s, twice):
+- **What it costs and how it fit into 20 MHz.** Temporary cycle counters
+  (2026-11-04, 20 MHz): ~650 cycles per event — peak search 323 (48
+  samples), window sum 259 (58 samples), the rest ~64. With a source (~5000
+  cps) at 20 MHz the filter lost ~130 chunks per second. What did not help:
+  32-bit division instead of 64-bit (same cost); a two-pass peak search and
+  summing two samples per read (slower: 460 and 280); vector instructions for
+  the maximum and the sum (no better than plain code in cycles per sample,
+  and the build with them by itself added +0.07 cycles and losses without the
+  filter) — all reverted. What helped:
+  - with integration, the peak and the sum of the “before / after peak”
+    window are already found by `amp_integrate` — the filter takes them
+    instead of searching again;
+  - both `amp_integrate` and the filter look for the signal peak no earlier
+    than “threshold crossed minus L” (the threshold is crossed no later than
+    L samples after the start of the rise). Integration used to search
+    L + G + 5 samples back from the trapezoid peak (~100 samples). On the model
+    the spectrum does not change.
 
-  | Rate | Filter | Chunks lost | Load | Cycles per sample |
-  |---|---|---|---|---|
-  | 20 MHz | off | 0 | 91.0 % | 10.90 of 12 |
-  | 20 MHz | on | ~2400–3000 per 20 s | 91.5 % | 11.11 of 12 |
-  | 16 MHz | off | 0 | 73.8 % | 11.05 of 15 |
-  | 16 MHz | on | 0 | 75.1 % | 11.24 of 15 |
+  Measurements at 20 MHz with a source, filter off / on for 20 s (device
+  settings: integration, L = 21, G = 78, tolerance 10 %):
 
-  The filter adds ~0.2 cycles per sample; at 20 MHz with such a count rate
-  there is no headroom for that. With the filter and a strong source — 16 MHz.
+  | Build | Filter | Chunks lost | Cycles per sample (of 12) |
+  |---|---|---|---|
+  | before | off | 0 | 10.91 |
+  | before | on | ~2700 per 21 s | 11.08–11.13 |
+  | peak and sum from integration | on | 113–155 per 21 s | 10.95–10.97 |
+  | + search from the threshold crossing | off | 0 | 10.84 |
+  | + search from the threshold crossing | on | 0 | 10.88 |
+  | same, trapezoid | off / on | 0 / 0 | 10.64 / 10.82 |
+
+  Five minutes at 20 MHz with the filter (~5000 cps, 1.58 million checked
+  pulses): 0 losses, load at most 90.8 %. The headroom is about 1.1 cycles
+  per sample: with a noticeably higher count rate 20 MHz may not be enough
+  even without the filter. At 16 MHz (budget 15 cycles) with the filter it is
+  11.24 cycles, no losses.
 - **What it rejects.** Everything below is on background, ~330 cps. The
   reference on this PMT, learned on background, is 34.1 samples (window
   13 + 36 + 1, 10–90 % spread 28.7–36.1), tolerance 25 %: 25.7 % of the
