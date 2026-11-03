@@ -34,9 +34,14 @@ MCA_CHANNELS = _D['MCA_CHANNELS']
 MCA_ADC_MAX = _D['MCA_ADC_MAX']
 # размеры карты и эталона фильтра формы - из mca_dsp.h
 _DS = _defines(os.path.join(os.path.dirname(_HDR), 'mca_dsp.h'))
-SHAPE_XB = _DS['SHAPE_XB']
-SHAPE_YB = _DS['SHAPE_YB']
+SHAPE_HB = _DS['SHAPE_HB']
 SHAPE_LEARN_N = _DS['SHAPE_LEARN_N']
+
+
+def cdiv(a, b):
+    """Деление как в C: с отбрасыванием дробной части к нулю."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
 
 DSP_TAIL = TRAP_L_MAX + TRAP_G_MAX + 8
 WORK = DSP_TAIL + CAP_CHUNK_SAMPLES
@@ -116,11 +121,15 @@ class DSP:
         self.fclk = fclk
         self.shape_watch = shape_watch
         self.cross_pos = 0
-        self.map = {}             # (строка, столбец) -> число событий
-        self.map_win = 0
+        self.whist = [0] * SHAPE_HB   # гистограмма ширины
+        self.whist_win = 0
         self.learn = []           # набранные ширины x10
+        self.wsum = []            # сумма импульсов набора над базой, x8
         self.learn_need = 0
         self.learn_win = 0
+        self.learn_pre = 0
+        self.wave = None          # эталонный импульс: (отсчёты x1000, вершина, импульсов)
+        self.examples = [None, None]  # последние в допуске / вне: (отсчёты, вершина, высота, ширина x10)
         self.shape_chk = 0
         self.shape_rej = 0
         self.widths = []          # (канал, ширина x10, принято) - для проверок
@@ -152,33 +161,32 @@ class DSP:
         self.hist[ch] += 1
         self.events.append((ch, num / den))
 
-    # ---- фильтр формы (порт shape_xbin и shape_check) ----
+    # ---- фильтр формы (порт shape_check, набора эталона и mca_dsp_shape_poll) ----
     def start_learn(self):
+        """Как запрос набора, выполненный mca_dsp_service."""
         p = self.p
         self.learn = []
-        self.learn_need = SHAPE_LEARN_N
         self.learn_win = p.int_rise + p.int_fall + 1
+        self.learn_pre = 8 + p.int_rise
+        self.wsum = [0] * (self.learn_win + 8)
+        self.learn_need = SHAPE_LEARN_N
 
     def finish_learn(self):
-        """Как mca_dsp_shape_poll: медиана - в эталон."""
+        """Как mca_dsp_shape_poll: медиана - в эталон, средний импульс -
+        в тысячных от его вершины. Модель берёт столько, сколько набрано."""
         v = sorted(self.learn)
         n = len(v)
         p = self.p
+        top = self.wsum[self.learn_pre] if self.wsum[self.learn_pre] > 0 else 1
+        wv = [max(-32768, min(32767, cdiv(x * 1000, top))) for x in self.wsum]
+        self.wave = (wv, self.learn_pre, n)
         p.shape_ref = v[n // 2]
         p.shape_win = self.learn_win
         p.shape_hz = self.fclk or 0
         self.learn_need = 0
         return v[n // 10], v[n // 2], v[n * 9 // 10]
 
-    @staticmethod
-    def shape_xbin(ch):
-        if ch < 1:
-            return 0
-        o = ch.bit_length() - 1
-        m = (ch >> (o - 3)) & 7 if o >= 3 else (ch << (3 - o)) & 7
-        return min(o * 8 + m, SHAPE_XB - 1)
-
-    def shape_check(self, tpk, end, num, den, filt, learn):
+    def shape_check(self, tpk, end, num, den, cmp, filt, learn):
         p, w = self.p, self.w
         lo = max(self.cross_pos - p.trap_L, 1)
         hi = min(tpk + 4, end - 1)
@@ -196,27 +204,30 @@ class DSP:
         s8 = ssum * 8 - n * base8
         w10 = (s8 * 10) // h8 if (h8 > 0 and s8 > 0) else 0
         w10 = min(w10, 10 * n)
-        d = den * p.cpc
-        ch = (num * 1000) // d if (d > 0 and num > 0) else 0
-        if ch < MCA_CHANNELS:
-            if self.map_win != n:
-                self.map = {}
-                self.map_win = n
-            y = min(w10 * SHAPE_YB // (10 * n), SHAPE_YB - 1)
-            key = (y, self.shape_xbin(ch))
-            self.map[key] = min(self.map.get(key, 0) + 1, 0xFFFF)
+        if self.whist_win != n:
+            self.whist = [0] * SHAPE_HB
+            self.whist_win = n
+        self.whist[min(w10 * SHAPE_HB // (10 * n), SHAPE_HB - 1)] += 1
         if learn and n == self.learn_win and num >= 3 * p.threshold * den:
             if len(self.learn) < self.learn_need:
                 self.learn.append(min(w10, 32767))
+                for j, i in enumerate(range(a - 8, b + 1)):
+                    self.wsum[j] += w[i] * 8 - base8
         ok = True
+        if cmp:
+            tol = p.shape_ref * p.shape_tol // 100
+            ok = p.shape_ref - tol <= w10 <= p.shape_ref + tol
+        self.examples[0 if ok else 1] = (
+            [cdiv(w[i] * 8 - base8, 8) for i in range(a - 8, b + 1)],
+            8 + p.int_rise, h8 // 8, w10)
+        d = den * p.cpc
+        ch = (num * 1000) // d if (d > 0 and num > 0) else 0
         if filt:
             self.shape_chk += 1
-            tol = p.shape_ref * p.shape_tol // 100
-            if w10 < p.shape_ref - tol or w10 > p.shape_ref + tol:
+            if not ok:
                 self.shape_rej += 1
-                ok = False
-        self.widths.append((ch, w10, ok))
-        return ok
+        self.widths.append((ch, w10, ok or not filt))
+        return ok or not filt
 
     # ---- порт mca_dsp_process ----
     def process(self, data):
@@ -252,8 +263,8 @@ class DSP:
 
         swin = p.int_rise + p.int_fall + 1
         hz_ok = self.fclk is None or p.shape_hz == self.fclk
-        shape_filt = (p.shape_on and p.shape_ref > 0 and p.shape_win == swin
-                      and hz_ok)
+        shape_cmp = p.shape_ref > 0 and p.shape_win == swin and hz_ok
+        shape_filt = shape_cmp and p.shape_on
         shape_learn = self.learn_need > 0
         shape_need = shape_filt or shape_learn or self.shape_watch
 
@@ -360,7 +371,7 @@ class DSP:
                             num, den = self.peak, L
                         if (not shape_need or
                                 self.shape_check(self.peak_pos, end, num, den,
-                                                 shape_filt, shape_learn)):
+                                                 shape_cmp, shape_filt, shape_learn)):
                             self.record_event(num, den)
                         self.since = 0
                         self.state = ST_REARM

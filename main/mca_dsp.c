@@ -135,19 +135,29 @@ static uint64_t s_run_ns;
 
 /* --- фильтр формы (см. shape_check и mca_dsp.h) --- */
 static int32_t   s_cross_pos;           /* где трапеция пробила порог (s_work) */
-static uint16_t *s_map;                 /* карта SHAPE_YB x SHAPE_XB, PSRAM */
-static int32_t   s_map_win;             /* окно, на котором строится карта  */
-static bool      s_req_map_clear;       /* под LOCK                         */
+static uint32_t  s_whist[SHAPE_HB];     /* гистограмма ширины               */
+static int32_t   s_whist_win;           /* окно, на котором она копится     */
+static bool      s_req_hist_clear;      /* под LOCK                         */
 static uint32_t  s_shp_chk_pend, s_shp_rej_pend;
-/* Набор эталона. Пишет задача обработки: s_learn[s_learn_n++], пока
- * s_learn_n < s_learn_need. Начало, отмену и итог ведут другие задачи под
- * LOCK; s_learn_gen отличает набор, начатый заново, от досчитываемого. */
+/* Набор эталона. Пишет только задача обработки: ширины в s_learn и сумму
+ * импульсов в s_wsum, пока s_learn_n < s_learn_need. Начать или прервать
+ * его просят другие задачи (s_req_learn: 1 - начать, 2 - прервать), а
+ * выполняет mca_dsp_service - так обнуление сумм не встретится с записью в
+ * них. Итог досчитывает mca_dsp_shape_poll; s_learn_gen отличает набор,
+ * начатый заново, от досчитываемого. */
 static int16_t  *s_learn;
+static int32_t   s_wsum[SHAPE_WAVE_MAX];   /* сумма импульсов над базой, x8 */
 static volatile int32_t s_learn_n, s_learn_need;
+static int32_t   s_req_learn;              /* под LOCK                      */
 static uint32_t  s_learn_gen;
-static int32_t   s_learn_win, s_learn_hz;  /* условия, при которых набираем */
+static int32_t   s_learn_win, s_learn_hz, s_learn_pre;  /* условия набора  */
 static int32_t   s_lp10, s_lp50, s_lp90;   /* итог последнего набора        */
-static volatile int32_t s_watch_s;         /* страница смотрит карту, секунд */
+static mca_shape_wave_t s_wave;            /* эталонный импульс, под LOCK   */
+/* Примеры для страницы: [0] - в допуске, [1] - вне. Задача обработки
+ * пишет в слот, только пока s_ex_want, потом ставит s_ex_new (под LOCK). */
+static mca_shape_ex_t s_ex[2];
+static bool      s_ex_want[2] = { true, true }, s_ex_new[2];
+static volatile int32_t s_watch_s;         /* страница открыта, секунд      */
 
 void mca_dsp_init(void)
 {
@@ -209,12 +219,10 @@ void mca_dsp_init(void)
         .shape_on        = 0,
         .shape_tol       = 25,
     };
-    s_map   = heap_caps_calloc(SHAPE_XB * SHAPE_YB, sizeof(uint16_t),
-                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     s_learn = heap_caps_calloc(SHAPE_LEARN_N, sizeof(int16_t),
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_map || !s_learn)
-        ESP_LOGE(TAG, "нет памяти под фильтр формы - он работать не будет");
+    if (!s_learn)
+        ESP_LOGE(TAG, "нет памяти под эталон формы - набрать его не выйдет");
 
     memset(s_work, 0, sizeof(s_work));
     s_trap = 0; s_state = ST_IDLE;
@@ -235,7 +243,7 @@ static void stats_clear_locked(void)
                                     программ на ПК копились через «Сброс» */
     s_st.shape_checked     = 0;
     s_st.skipped_shape     = 0;
-    s_req_map_clear        = true;
+    s_req_hist_clear       = true;
     s_last_events = 0;
     s_run_ns      = 0;
     s_st.run_ms   = 0;          /* страница увидит ноль сразу, не через тик */
@@ -262,11 +270,25 @@ void mca_dsp_service(bool idle)
     const bool prime = s_req_prime, clear = s_req_clear;
     s_req_prime = s_req_clear = false;
     if (clear) stats_clear_locked();
-    const bool map_clear = s_req_map_clear;
-    s_req_map_clear = false;
+    const bool hist_clear = s_req_hist_clear;
+    s_req_hist_clear = false;
+    const int32_t rl = s_req_learn;
+    s_req_learn = 0;
+    if (rl == 2) s_learn_need = 0;
     UNLOCK();
-    /* 13 КБ в PSRAM - десятки микросекунд, в запас очереди укладывается */
-    if (map_clear && s_map) memset(s_map, 0, SHAPE_XB * SHAPE_YB * sizeof(uint16_t));
+    if (hist_clear) memset(s_whist, 0, sizeof(s_whist));
+    if (rl == 1 && s_learn) {
+        /* 2.4 КБ во внутренней памяти - микросекунды */
+        memset(s_wsum, 0, sizeof(s_wsum));
+        LOCK();
+        s_learn_gen++;
+        s_learn_n    = 0;
+        s_learn_win  = s_par.int_rise + s_par.int_fall + 1;
+        s_learn_pre  = 8 + s_par.int_rise;
+        s_learn_hz   = (int32_t)adc_clk_get_freq();
+        s_learn_need = SHAPE_LEARN_N;
+        UNLOCK();
+    }
 
     if (prime || clear) {
         s_trap       = 0;
@@ -358,18 +380,14 @@ static void record_event(int64_t num, int32_t den, const mca_params_t *p)
     s_ev_pend++;
 }
 
-/* Столбец карты формы: канал по логарифму, 8 столбцов на октаву. */
-static inline int shape_xbin(int64_t ch)
-{
-    if (ch < 1) return 0;
-    const int o = 31 - __builtin_clz((uint32_t)ch);
-    const int m = o >= 3 ? (int)(ch >> (o - 3)) & 7 : (int)(ch << (3 - o)) & 7;
-    const int x = o * 8 + m;
-    return x < SHAPE_XB ? x : SHAPE_XB - 1;
-}
+/* Границы допуска фильтра формы (ширина x10): считаются раз на чанк. */
+static int32_t s_shape_lo, s_shape_hi;
 
-/* ФИЛЬТР ФОРМЫ. Зовётся раз на событие, а не на отсчёт: ~150 тактов на
- * поиск вершины и сумму окна в 50 отсчётов.
+/* ФИЛЬТР ФОРМЫ. Зовётся раз на событие, а не на отсчёт. Деления - только
+ * 32-битные: 64-битное на Xtensa - вызов библиотеки на сотни тактов, а на
+ * 20 МГц при ~5000 имп/с запаса у ядра почти нет (замер 2026-11-04: с
+ * 64-битным делением и допуском, считаемым на каждое событие, мера стоила
+ * 0.20 такта на отсчёт из бюджета 12, и терялось ~145 чанков в секунду).
  *
  * Вершина - максимум сырого сигнала от «порог пробит минус L» до вершины
  * трапеции: сигнал достигает вершины после начала фронта, а порог
@@ -378,12 +396,13 @@ static inline int shape_xbin(int64_t ch)
  * среднее восьми отсчётов прямо перед окном: так хвост предыдущего
  * импульса не влияет. Ширина = площадь / высота, x10.
  *
- * Зовётся, только когда мера нужна: фильтр, набор эталона или карта на
- * экране. Карта пополняется всегда; learn - идёт набор эталона; filt -
- * фильтр действует. true - событие идёт в спектр. Окно, не легшее в буфер
- * (событие у самого конца чанка), не судим: событие проходит. */
+ * Зовётся, только когда мера нужна: фильтр, набор эталона или открытая
+ * страница. Гистограмма ширины пополняется всегда; learn - идёт набор
+ * эталона; cmp - эталон годится для сравнения (окно и частота те же);
+ * filt - фильтр действует. true - событие идёт в спектр. Окно, не легшее
+ * в буфер (событие у самого конца чанка), не судим: событие проходит. */
 static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
-                        const mca_params_t *p, bool filt, bool learn)
+                        const mca_params_t *p, bool cmp, bool filt, bool learn)
 {
     int lo = s_cross_pos - p->trap_L, hi = tpk + 4;
     if (lo < 1) lo = 1;
@@ -401,41 +420,55 @@ static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
     const int32_t n  = b - a + 1;
     const int32_t h8 = mx * 8 - base8;              /* высота x8  */
     const int32_t s8 = sum * 8 - n * base8;         /* площадь x8 */
-    int32_t w10 = h8 > 0 && s8 > 0 ? (int32_t)((int64_t)s8 * 10 / h8) : 0;
+    /* s8 не больше 609 * 4095 * 8, x10 - в пределах int32 */
+    int32_t w10 = h8 > 0 && s8 > 0 ? s8 * 10 / h8 : 0;
     if (w10 > 10 * n) w10 = 10 * n;
 
-    /* карта: событие с амплитудой в пределах шкалы */
-    const int64_t d  = (int64_t)den * p->cpc_milli;
-    const int64_t ch = (d > 0 && num > 0) ? num * 1000 / d : 0;
-    if (s_map && ch < MCA_CHANNELS) {
-        if (s_map_win != n) {           /* окно сменилось - карта о другом */
-            memset(s_map, 0, SHAPE_XB * SHAPE_YB * sizeof(uint16_t));
-            s_map_win = n;
-        }
-        int y = (int)(w10 * SHAPE_YB / (10 * n));
-        if (y >= SHAPE_YB) y = SHAPE_YB - 1;
-        uint16_t *c = &s_map[y * SHAPE_XB + shape_xbin(ch)];
-        if (*c != 0xFFFF) (*c)++;
+    /* гистограмма ширины */
+    if (s_whist_win != n) {             /* окно сменилось - она о другом */
+        memset(s_whist, 0, sizeof(s_whist));
+        s_whist_win = n;
     }
+    int hb = (int)(w10 * SHAPE_HB / (10 * n));
+    if (hb >= SHAPE_HB) hb = SHAPE_HB - 1;
+    s_whist[hb]++;
 
-    /* эталон: только заметно выше порога, там шумовых всплесков мало */
+    /* эталон: только заметно выше порога, там шумовых всплесков мало;
+     * импульс копится в среднюю форму целиком - база и окно */
     if (learn && s_learn && n == s_learn_win &&
         num >= (int64_t)3 * p->threshold * den) {
         const int32_t k = s_learn_n;
         if (k < s_learn_need) {
             s_learn[k] = (int16_t)(w10 > 32767 ? 32767 : w10);
+            for (int i = a - 8, j = 0; i <= b; i++, j++)
+                s_wsum[j] += (int32_t)s_work[i] * 8 - base8;
             s_learn_n = k + 1;
         }
     }
 
+    const bool ok = !cmp || (w10 >= s_shape_lo && w10 <= s_shape_hi);
+
+    /* пример для страницы - только если его ждут */
+    const int ek = ok ? 0 : 1;
+    if (s_ex_want[ek]) {
+        mca_shape_ex_t *e = &s_ex[ek];
+        e->len = (int16_t)(n + 8);
+        e->pre = (int16_t)(8 + p->int_rise);
+        e->h   = h8 / 8;
+        e->w10 = w10;
+        e->ok  = ok;
+        for (int i = a - 8, j = 0; i <= b; i++, j++)
+            e->v[j] = (int16_t)(((int32_t)s_work[i] * 8 - base8) / 8);
+        LOCK();
+        s_ex_want[ek] = false;
+        s_ex_new[ek]  = true;
+        UNLOCK();
+    }
+
     if (!filt) return true;
     s_shp_chk_pend++;
-    const int32_t tol = p->shape_ref * p->shape_tol / 100;
-    if (w10 < p->shape_ref - tol || w10 > p->shape_ref + tol) {
-        s_shp_rej_pend++;
-        return false;
-    }
-    return true;
+    if (!ok) s_shp_rej_pend++;
+    return ok;
 }
 
 /* ---- РАЗНОСТЬ ТРАПЕЦИИ ДЛЯ ВСЕГО ЧАНКА ----
@@ -661,10 +694,13 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
      * всё подряд. Мера считается, только когда она кому-то нужна. */
     const uint32_t fclk0 = adc_clk_get_freq();
     const int32_t  swin  = p.int_rise + p.int_fall + 1;
-    const bool shape_filt = p.shape_on && p.shape_ref > 0 &&
-                            p.shape_win == swin && p.shape_hz == (int32_t)fclk0;
+    const bool shape_cmp  = p.shape_ref > 0 && p.shape_win == swin &&
+                            p.shape_hz == (int32_t)fclk0;
+    const bool shape_filt = shape_cmp && p.shape_on;
     const bool shape_learn = s_learn_need > 0 && s_learn_hz == (int32_t)fclk0;
     const bool shape_need = shape_filt || shape_learn || s_watch_s > 0;
+    s_shape_lo = p.shape_ref - p.shape_ref * p.shape_tol / 100;
+    s_shape_hi = p.shape_ref + p.shape_ref * p.shape_tol / 100;
 
     const int end = DSP_TAIL + (int)n;
     int i = DSP_TAIL;
@@ -834,7 +870,7 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
                         }
                         if (!shape_need ||
                             shape_check(s_peak_pos, end, num, den, &p,
-                                        shape_filt, shape_learn))
+                                        shape_cmp, shape_filt, shape_learn))
                             record_event(num, den, &p);
                     }
                     s_since = 0;
@@ -967,23 +1003,18 @@ void mca_dsp_tick_1s(void)
 /* ---- фильтр формы: управление из других задач ---- */
 void mca_dsp_shape_learn(bool start)
 {
-    mca_params_t p;
     LOCK();
-    p = s_par;
-    s_learn_gen++;
-    s_learn_n    = 0;
-    s_learn_win  = p.int_rise + p.int_fall + 1;
-    s_learn_hz   = (int32_t)adc_clk_get_freq();
-    s_learn_need = start && s_learn ? SHAPE_LEARN_N : 0;
+    s_req_learn = start ? 1 : 2;
+    const int32_t win = s_par.int_rise + s_par.int_fall + 1;
     UNLOCK();
     ESP_LOGI(TAG, "фильтр формы: набор эталона %s (окно %ld)",
-             start ? "начат" : "прерван", (long)s_learn_win);
+             start ? "начат" : "прерван", (long)win);
 }
 
-void mca_dsp_shape_clear_map(void)
+void mca_dsp_shape_clear_hist(void)
 {
     LOCK();
-    s_req_map_clear = true;
+    s_req_hist_clear = true;
     UNLOCK();
 }
 
@@ -994,7 +1025,7 @@ void mca_dsp_shape_info(mca_shape_info_t *o)
     LOCK();
     const mca_params_t p = s_par;
     o->learn_n    = s_learn_n;
-    o->learn_need = s_learn_need;
+    o->learn_need = s_req_learn == 1 ? SHAPE_LEARN_N : s_learn_need;
     o->p10 = s_lp10; o->p50 = s_lp50; o->p90 = s_lp90;
     UNLOCK();
     o->win    = p.int_rise + p.int_fall + 1;
@@ -1003,11 +1034,42 @@ void mca_dsp_shape_info(mca_shape_info_t *o)
 }
 
 /* Без блокировки, как и спектр: пишет только задача обработки, а
- * недописанная клетка картинке не вредит. */
-void mca_dsp_shape_map(uint16_t *dst)
+ * недописанный столбец картинке не вредит. */
+void mca_dsp_shape_hist(uint32_t *dst)
 {
-    if (s_map) memcpy(dst, s_map, SHAPE_XB * SHAPE_YB * sizeof(uint16_t));
-    else       memset(dst, 0, SHAPE_XB * SHAPE_YB * sizeof(uint16_t));
+    memcpy(dst, s_whist, sizeof(s_whist));
+}
+
+void mca_dsp_shape_wave(mca_shape_wave_t *o)
+{
+    LOCK();
+    *o = s_wave;
+    UNLOCK();
+}
+
+void mca_dsp_shape_set_wave(const mca_shape_wave_t *w)
+{
+    if (w->len < 0 || w->len > SHAPE_WAVE_MAX || w->pre < 0 || w->pre >= w->len)
+        return;
+    LOCK();
+    s_wave = *w;
+    UNLOCK();
+}
+
+bool mca_dsp_shape_example(int k, mca_shape_ex_t *o)
+{
+    if (k < 0 || k > 1) return false;
+    bool got = false;
+    LOCK();
+    if (s_ex_new[k]) {
+        /* слот не трогается, пока s_ex_want ложно - копия цельная */
+        *o = s_ex[k];
+        s_ex_new[k]  = false;
+        s_ex_want[k] = true;
+        got = true;
+    }
+    UNLOCK();
+    return got;
 }
 
 static int cmp_i16(const void *a, const void *b)
@@ -1021,6 +1083,7 @@ static int cmp_i16(const void *a, const void *b)
 bool mca_dsp_shape_poll(void)
 {
     static int16_t v[SHAPE_LEARN_N];
+    static mca_shape_wave_t wv;
     LOCK();
     const int32_t n = s_learn_n, need = s_learn_need;
     const uint32_t gen = s_learn_gen;
@@ -1028,6 +1091,16 @@ bool mca_dsp_shape_poll(void)
     if (need <= 0 || n < need) return false;
     memcpy(v, s_learn, (size_t)n * sizeof(int16_t));
     qsort(v, (size_t)n, sizeof(int16_t), cmp_i16);
+    /* средний импульс - в тысячных от его вершины */
+    const int len = s_learn_win + 8, pre = s_learn_pre;
+    const int32_t top = s_wsum[pre] > 0 ? s_wsum[pre] : 1;
+    wv.len = (int16_t)len;
+    wv.pre = (int16_t)pre;
+    wv.n   = (int16_t)n;
+    for (int i = 0; i < len; i++) {
+        int64_t x = (int64_t)s_wsum[i] * 1000 / top;
+        wv.v[i] = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
+    }
     bool ok = false;
     LOCK();
     if (gen == s_learn_gen) {           /* набор не начат заново */
@@ -1038,6 +1111,7 @@ bool mca_dsp_shape_poll(void)
         s_par.shape_ref = s_lp50;
         s_par.shape_win = s_learn_win;
         s_par.shape_hz  = s_learn_hz;
+        s_wave = wv;
         ok = true;
     }
     UNLOCK();

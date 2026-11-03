@@ -196,9 +196,12 @@ void app_main(void)
             mca_dsp_tick_1s();
             /* набор эталона формы закончен - эталон в память прибора */
             if (mca_dsp_shape_poll()) {
+                static mca_shape_wave_t sw;
                 mca_params_t sp;
                 mca_dsp_get_params(&sp);
                 mca_settings_save_params(&sp);
+                mca_dsp_shape_wave(&sw);
+                mca_settings_save_shape(&sw);
             }
             mca_oled_tick_1s();
             /* история CPS: секунда, в которую шёл набор спектра */

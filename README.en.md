@@ -324,11 +324,18 @@ BecqMoni (answers to commands).
   rejects pulses whose width is farther from the reference than the
   “tolerance” (25 % by default). The reference is valid only for the window
   and ADC rate it was learned at: if they change, the filter passes
-  everything and the card asks to learn the reference again. The map below
-  the buttons is the number of pulses by channel (logarithmic) and width, the
-  green band is reference ± tolerance; the card shows how many pulses were
-  checked and rejected since “Reset” (`/stat`: `shchk`, `shrej`). Details
-  and measurements — “Found while debugging”, “Pulse shape filter”.
+  everything and the card asks to learn the reference again. Below the
+  buttons there are two plots. “Reference pulse” — the mean shape of the
+  learned pulses (saved in the device memory together with the reference),
+  with the last pulse within the tolerance (green) and the last one outside
+  it (red) on top, each scaled to its height, with height and width; the
+  light band is the measurement window. “Pulse width” — a histogram of
+  area / height: green within the tolerance, red outside, the band is
+  reference ± tolerance, the share outside the tolerance below. The card
+  shows how many pulses were checked and rejected since “Reset” (`/stat`:
+  `shchk`, `shrej`). At 20 MHz with a high count rate the filter does not fit
+  into the core budget and loses chunks, at 16 MHz it does not (measurements
+  — “Found while debugging”, “Pulse shape filter”).
 - **CPS monitor** — on the same tab, below the spectrum: current CPS, mean
   over the whole history with its error, last interval, a plot by averaging
   intervals with a moving average, an interval table and CSV export. The
@@ -742,28 +749,47 @@ pre-allocated memory.
   the start of the spectrum. That the narrow ones are PMT noise or pickup and
   not events is a conclusion from their shape; their source was not checked.
 - **Why the measure is area / height.** It is computed once per event, not
-  per sample: peak, window sum, division — on the order of a hundred cycles.
-  At ~330 cps and 20 MHz the processing core load is 84.5 % without the
-  measure and 84.6 % with it and the filter on (`/stat`, `load`, 3 min
-  each). The measure's baseline is the eight samples right before the
+  per sample. The measure's baseline is the eight samples right before the
   window, not the common baseline: so the tail of the previous pulse does
   not change the width.
+- **What it costs.** Temporary cycle counters (2026-11-04, 20 MHz): ~650
+  cycles per event — peak search 323 (48 samples), window sum 259 (58
+  samples), the rest ~64. 64-bit division is not the cause: replacing it
+  with 32-bit did not change the cost; a narrower peak search and summing
+  two samples per read did not help either — it got slower (460 and 280),
+  reverted. On background (~330 cps, 20 MHz) this is invisible: load 84.5 %
+  without the measure and 84.6 % with the filter, no losses (3 min each).
+  With a source (~5000 cps, filter off / on alternately for 20 s, twice):
+
+  | Rate | Filter | Chunks lost | Load | Cycles per sample |
+  |---|---|---|---|---|
+  | 20 MHz | off | 0 | 91.0 % | 10.90 of 12 |
+  | 20 MHz | on | ~2400–3000 per 20 s | 91.5 % | 11.11 of 12 |
+  | 16 MHz | off | 0 | 73.8 % | 11.05 of 15 |
+  | 16 MHz | on | 0 | 75.1 % | 11.24 of 15 |
+
+  The filter adds ~0.2 cycles per sample; at 20 MHz with such a count rate
+  there is no headroom for that. With the filter and a strong source — 16 MHz.
 - **What it rejects.** Everything below is on background, ~330 cps. The
   reference on this PMT, learned on background, is 34.1 samples (window
   13 + 36 + 1, 10–90 % spread 28.7–36.1), tolerance 25 %: 25.7 % of the
-  checked pulses were rejected (3 min, 59 870 pulses). From the device map:
+  checked pulses were rejected (3 min, 59 870 pulses). From the device map
+  (later replaced by the reference pulse and the width histogram):
   channels 1–15 — 89 %, 15–40 — 11–14 %, 40–100 — 6–9 %, 100–200 — 3.5 %,
   above 200 — under 1 %, and all rejected ones are narrower than the band,
   none wider. The model (`dspmodel.py`) on the captured frames with the same
   reference: reference from its own events 33.6, rejected 18.3 % (32 of 175 —
-  few events), also almost all below channel 25.
+  few events), also almost all below channel 25. With a source (~5000 cps)
+  13–14 % are outside the tolerance; the reference at 20 MHz is 34.0 samples,
+  at 16 MHz 31.1 (the same pulse, fewer samples on it).
 - **A chunk loss that did not repeat.** In the first run on the device, 31
   chunks were lost ~1 s before the reference learning finished: one chunk
   took 14.4 ms to process against a budget of ~0.1 ms (loss log,
   `/diag/data`). A second learning run, each action one at a time (saving
   settings, “Reset”, clearing the map, enabling the filter) and two 3-minute
   acquisitions (filter with the map and without) gave no losses. The cause
-  was not found.
+  was not found. (This is on background; the losses with a source at 20 MHz
+  are a different matter, see “What it costs”.)
 
 ### Other
 

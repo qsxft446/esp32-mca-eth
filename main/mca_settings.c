@@ -85,7 +85,29 @@ void mca_settings_load(void)
         ESP_LOGI(TAG, "частота из сохранённых: %.3f МГц",
                  mca_freq_table[i] / 1e6);
     }
+
+    /* эталонный импульс фильтра формы: заголовок и len отсчётов */
+    static mca_shape_wave_t w;
+    size_t wl = sizeof(w);
+    if (nvs_get_blob(h, "shw", &w, &wl) == ESP_OK &&
+        wl == offsetof(mca_shape_wave_t, v) + (size_t)w.len * sizeof(int16_t))
+        mca_dsp_shape_set_wave(&w);
     nvs_close(h);
+}
+
+void mca_settings_save_shape(const mca_shape_wave_t *w)
+{
+    if (w->len <= 0 || w->len > SHAPE_WAVE_MAX) return;
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
+    if (e == ESP_OK) {
+        e = nvs_set_blob(h, "shw", w, offsetof(mca_shape_wave_t, v) +
+                                      (size_t)w->len * sizeof(int16_t));
+        if (e == ESP_OK) e = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (e != ESP_OK)
+        ESP_LOGW(TAG, "эталонный импульс не сохранён: %s", esp_err_to_name(e));
 }
 
 void mca_settings_save_params(const mca_params_t *p)

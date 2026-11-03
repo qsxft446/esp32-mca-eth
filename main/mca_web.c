@@ -1115,12 +1115,14 @@ static esp_err_t h_scope(httpd_req_t *r)
     return e;
 }
 
-/* /shape - фильтр формы: состояние набора эталона и карта «амплитуда x
- * ширина». do=learn - начать набор эталона, do=stop - прервать, do=clear -
- * очистить карту. Каждый запрос продлевает расчёт меры на 10 с: пока
- * страница с картой открыта, форма меряется и при выключенном фильтре.
- * Ответ двоичный, little-endian: 16 x int32 (см. ниже), затем карта
- * SHAPE_YB строк по SHAPE_XB uint16, строка 0 - ширина 0. */
+/* /shape - фильтр формы: состояние набора эталона, гистограмма ширины,
+ * эталонный импульс и последние импульсы в допуске и вне его. do=learn -
+ * начать набор эталона, do=stop - прервать, do=clear - очистить
+ * гистограмму. Каждый запрос продлевает расчёт меры на 10 с: пока страница
+ * открыта, форма меряется и при выключенном фильтре.
+ * Ответ двоичный, little-endian: 32 x int32 (порядок - ниже), затем
+ * гистограмма SHAPE_HB x uint32, эталон и два примера по int16 (их длины -
+ * в заголовке). */
 static esp_err_t h_shape(httpd_req_t *r)
 {
     char q[48], v[12];
@@ -1128,7 +1130,7 @@ static esp_err_t h_shape(httpd_req_t *r)
         httpd_query_key_value(q, "do", v, sizeof(v)) == ESP_OK) {
         if (!strcmp(v, "learn"))      mca_dsp_shape_learn(true);
         else if (!strcmp(v, "stop"))  mca_dsp_shape_learn(false);
-        else if (!strcmp(v, "clear")) mca_dsp_shape_clear_map();
+        else if (!strcmp(v, "clear")) mca_dsp_shape_clear_hist();
     }
     mca_dsp_shape_watch();
     mca_shape_info_t si;
@@ -1137,19 +1139,45 @@ static esp_err_t h_shape(httpd_req_t *r)
     mca_dsp_get_params(&p);
     mca_stats_t st;
     mca_dsp_get_stats(&st);
-    const int32_t h[16] = {
+
+    /* веб-сервер обрабатывает запросы по одному - буферы общие; примеры
+     * держим до следующего нового, чтобы картинка не мигала */
+    static uint32_t hist[SHAPE_HB];
+    static mca_shape_wave_t wv;
+    static mca_shape_ex_t ex[2], tmp;
+    static int64_t ex_t[2];
+    const int64_t now = esp_timer_get_time();
+    for (int k = 0; k < 2; k++)
+        if (mca_dsp_shape_example(k, &tmp)) { ex[k] = tmp; ex_t[k] = now; }
+    mca_dsp_shape_hist(hist);
+    mca_dsp_shape_wave(&wv);
+
+    int32_t h[32] = {
         si.learn_n, si.learn_need, si.p10, si.p50, si.p90, si.win, si.active,
         p.shape_ref, p.shape_tol, p.shape_on, p.shape_win, p.shape_hz,
         (int32_t)adc_clk_get_freq(), (int32_t)st.shape_checked,
-        (int32_t)st.skipped_shape, SHAPE_XB
+        (int32_t)st.skipped_shape, SHAPE_HB,
+        wv.len, wv.pre, wv.n,
     };
-    /* 13 КБ: веб-сервер обрабатывает запросы по одному - общий буфер */
-    static uint16_t map[SHAPE_XB * SHAPE_YB];
-    mca_dsp_shape_map(map);
+    for (int k = 0; k < 2; k++) {       /* 19..23 и 24..28 */
+        int32_t *o = &h[19 + 5 * k];
+        o[0] = ex_t[k] ? ex[k].len : 0;
+        o[1] = ex[k].pre;
+        o[2] = ex[k].h;
+        o[3] = ex[k].w10;
+        o[4] = ex_t[k] ? (int32_t)((now - ex_t[k]) / 1000000) : -1;
+    }
+    h[29] = p.int_rise;
     httpd_resp_set_type(r, "application/octet-stream");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     esp_err_t e = httpd_resp_send_chunk(r, (const char *)h, sizeof(h));
-    if (e == ESP_OK) e = httpd_resp_send_chunk(r, (const char *)map, sizeof(map));
+    if (e == ESP_OK) e = httpd_resp_send_chunk(r, (const char *)hist, sizeof(hist));
+    if (e == ESP_OK && wv.len > 0)
+        e = httpd_resp_send_chunk(r, (const char *)wv.v, wv.len * sizeof(int16_t));
+    for (int k = 0; k < 2 && e == ESP_OK; k++)
+        if (h[19 + 5 * k] > 0)
+            e = httpd_resp_send_chunk(r, (const char *)ex[k].v,
+                                      ex[k].len * sizeof(int16_t));
     if (e == ESP_OK) e = httpd_resp_send_chunk(r, NULL, 0);
     return e;
 }
@@ -1614,23 +1642,25 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "<h3 data-en='Pulse shape filter'>Фильтр формы импульса</h3>"
 "<p class=n style=margin-top:0 data-en='Rejects pulses whose width (area / height in the “before / after peak” window) "
 "differs from the reference by more than the tolerance: PMT noise bursts are narrower than scintillations, pile-ups are wider. "
-"Not needed with a good PMT and its own power supply. The reference is learned from detector pulses while the spectrum is being acquired: background will do, a source is faster.'>"
+"Not needed with a good PMT and its own power supply. The reference is learned from detector pulses while the spectrum is being acquired: background will do, a source is faster. At 20 MHz with thousands of pulses per second the filter does not fit into the core budget and loses chunks (see “Diagnostics”), at 16 MHz it does not.'>"
 "Отбрасывает импульсы, ширина которых (площадь / высота в окне «до / после вершины») отличается от эталона "
 "больше допуска: шумовые всплески ФЭУ уже сцинтилляций, наложения шире. С хорошим ФЭУ и его родным питанием "
-"не нужен. Эталон набирается из импульсов детектора, пока идёт набор спектра: подойдёт и фон, с источником быстрее.</p>"
+"не нужен. Эталон набирается из импульсов детектора, пока идёт набор спектра: подойдёт и фон, с источником быстрее. "
+"На 20 МГц при счёте в тысячи импульсов в секунду фильтр не укладывается в бюджет ядра и теряет чанки "
+"(смотрите «Диагностику»), на 16 МГц - нет.</p>"
 "<div class=grp style='margin:8px 0'>"
 "<label><input type=checkbox id=sh_on onchange=shSet()> <span data-en='filter on'>фильтр включён</span></label>"
 "<label><span data-en='tolerance, %'>допуск, %</span> <input id=sh_tol type=number min=1 max=200 style=width:70px onchange=shSet()></label>"
 "<button class='btn green sm' onclick=shLearn() id=sh_lb></button>"
-"<button class='btn sm' onclick=shClr() data-en='Clear map'>Очистить карту</button></div>"
+"<button class='btn sm' onclick=shClr() data-en='Clear histogram'>Очистить гистограмму</button></div>"
 "<div id=sh_st class=n style=line-height:1.6></div>"
-"<canvas id=sh_cv style='width:100%;height:260px;display:block;margin-top:8px'></canvas>"
-"<div class=mut style=font-size:11.5px;margin-top:4px data-en='Map: horizontally - channel (logarithmic), vertically - width in samples, "
-"brighter - more pulses. Green band - reference ± tolerance: everything outside it is rejected when the filter is on. "
-"Pulses are counted while the spectrum is being acquired; “Reset” of the spectrum clears the map.'>"
-"Карта: по горизонтали - канал (логарифм), по вертикали - ширина в отсчётах, ярче - больше импульсов. "
-"Зелёная полоса - эталон ± допуск: всё вне её при включённом фильтре отбрасывается. Импульсы "
-"считаются, пока идёт набор спектра; «Сброс» спектра очищает карту.</div>"
+"<div style='display:flex;gap:14px;flex-wrap:wrap;margin-top:8px'>"
+"<div style='flex:1 1 380px'><div class=n style=margin-bottom:4px><b data-en='Reference pulse'>Эталонный импульс</b></div>"
+"<canvas id=sh_wv style='width:100%;height:230px;display:block'></canvas>"
+"<div id=sh_wl class=mut style=font-size:11.5px;margin-top:4px;line-height:1.6></div></div>"
+"<div style='flex:1 1 380px'><div class=n style=margin-bottom:4px><b data-en='Pulse width'>Ширина импульсов</b></div>"
+"<canvas id=sh_hg style='width:100%;height:230px;display:block'></canvas>"
+"<div id=sh_hl class=mut style=font-size:11.5px;margin-top:4px;line-height:1.6></div></div></div>"
 "</section>"
 "</div>"
 "<script>i18n();"
@@ -1843,11 +1873,13 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "p.textContent=L('прибор перезапущен, работает версия ','device restarted, running version ')+j.ver})"
 ".catch(function(){p.textContent=L('жду перезапуска прибора...','waiting for the device to restart...');setTimeout(fww,2000)})}"
 "ldcfg();ld();fwi();"
-/* ФИЛЬТР ФОРМЫ. /shape: 16 x int32 (набрано, нужно, p10, p50, p90 - x10,
+/* ФИЛЬТР ФОРМЫ. /shape: 32 x int32 (набрано, нужно, p10, p50, p90 - x10,
    окно, действует, эталон x10, допуск, включён, окно эталона, частота
-   эталона, частота сейчас, проверено, отброшено, столбцов), затем карта
-   uint16: строки снизу вверх - ширина от 0 до окна. Опрос раз в 2 с:
-   пока он идёт, прибор меряет форму и при выключенном фильтре. */
+   эталона, частота сейчас, проверено, отброшено, столбцов гистограммы;
+   эталон: длина, вершина, импульсов; два примера: длина, вершина, высота,
+   ширина x10, возраст с; «до вершины»), затем гистограмма uint32, эталон
+   и примеры int16. Опрос раз в 2 с: пока он идёт, прибор меряет форму и
+   при выключенном фильтре. */
 "var SH={busy:0,d:null};"
 "function shSet(){var on=document.getElementById('sh_on').checked?1:0,t=+document.getElementById('sh_tol').value||25;"
 "fetch('/cfg?shape_on='+on+'&shape_tol='+t).then(function(r){return r.json()}).then(fillCfg).then(function(){shLoad()}).catch(function(){})}"
@@ -1858,37 +1890,75 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "function shClr(){shLoad('clear')}"
 "function shLoad(dd){if(SH.busy&&!dd)return;SH.busy=1;"
 "fetch('/shape'+(dd?'?do='+dd:'')).then(function(r){return r.arrayBuffer()}).then(function(b){SH.busy=0;"
-"if(b.byteLength<64)return;var v=new DataView(b),h=[];for(var i=0;i<16;i++)h.push(v.getInt32(4*i,true));"
-"var XB=h[15]||104;SH.d={n:h[0],need:h[1],p10:h[2],p50:h[3],p90:h[4],win:h[5],act:h[6],ref:h[7],tol:h[8],on:h[9],"
-"swin:h[10],shz:h[11],hz:h[12],chk:h[13]>>>0,rej:h[14]>>>0,XB:XB,YB:Math.floor((b.byteLength-64)/2/XB),m:new Uint16Array(b.slice(64))};"
-"shStat();shDraw()}).catch(function(){SH.busy=0})}"
+"if(b.byteLength<128)return;var v=new DataView(b),h=[],i,o;for(i=0;i<32;i++)h.push(v.getInt32(4*i,true));"
+"o=128;var HB=h[15];function rd(n,sz){var a=[];for(var k=0;k<n;k++)a.push(sz==4?v.getUint32(o+4*k,true):v.getInt16(o+2*k,true));o+=n*sz;return a}"
+"var d={n:h[0],need:h[1],p10:h[2],p50:h[3],p90:h[4],win:h[5],act:h[6],ref:h[7],tol:h[8],on:h[9],"
+"swin:h[10],shz:h[11],hz:h[12],chk:h[13]>>>0,rej:h[14]>>>0,HB:HB,wpre:h[17],wn:h[18],rise:h[29]};"
+"d.hist=rd(HB,4);d.wave=h[16]>0?rd(h[16],2):null;d.ex=[];"
+"for(var k=0;k<2;k++){var q=19+5*k;d.ex.push(h[q]>0?{pre:h[q+1],h:h[q+2],w:h[q+3],age:h[q+4],v:rd(h[q],2)}:null)}"
+"SH.d=d;shStat();shDraw()}).catch(function(){SH.busy=0})}"
 "function f1(x){return (x/10).toFixed(1)}"
+/* эталон годится для сравнения: тот же размер окна и та же частота */
+"function shCmp(d){return d.ref>0&&d.swin==d.win&&d.shz==d.hz}"
 "function shStat(){var d=SH.d,t=[],lb=document.getElementById('sh_lb');"
 "lb.textContent=d.need>0?L('Прервать набор','Stop learning'):L('Набрать эталон','Learn reference');"
 "if(d.need>0)t.push('<b style=color:#f0c45a>'+L('набор эталона: ','learning the reference: ')+d.n+L(' из ',' of ')+d.need+'</b> '+"
 "L('(импульсы идут, только пока набирается спектр)','(pulses come only while the spectrum is being acquired)'));"
-"if(d.ref>0)t.push(L('эталон: ','reference: ')+'<b>'+f1(d.ref)+L(' отсч.',' samples')+'</b> ('+L('окно ','window ')+d.swin+L(' отсч., ',' samples, ')+"
-"(d.shz/1e6).toFixed(2)+L(' МГц',' MHz')+')'+(d.p50==d.ref&&d.p90>0?L(', разброс 10-90 %: ',', 10-90 % spread: ')+f1(d.p10)+'-'+f1(d.p90):''));"
-"else t.push(L('эталон не набран','no reference yet'));"
+"if(d.ref<=0)t.push(L('эталон не набран','no reference yet'));"
 "if(d.on&&!d.act)t.push('<b style=color:#ff8a82>'+(d.ref<=0?L('фильтр включён, но эталона нет - импульсы проходят все','the filter is on, but there is no reference - all pulses pass'):"
 "d.swin!=d.win?L('окно «до / после вершины» сменилось после набора эталона - наберите его заново, пока фильтр пропускает всё','the “before / after peak” window changed after the reference was learned - learn it again, until then the filter passes everything'):"
 "L('частота АЦП сменилась после набора эталона - наберите его заново, пока фильтр пропускает всё','the ADC rate changed after the reference was learned - learn it again, until then the filter passes everything'))+'</b>');"
 "if(d.act)t.push('<b style=color:#9fe0a0>'+L('фильтр действует','filter active')+'</b>: '+L('с «Сброса» проверено ','since “Reset” checked ')+d.chk+L(', отброшено ',', rejected ')+d.rej+"
 "(d.chk?' ('+(d.rej*100/d.chk).toFixed(1)+' %)':''));"
+"else if(!d.on&&d.ref>0)t.push(L('фильтр выключен: импульсы вне допуска показаны, но в спектр идут','filter off: pulses outside the tolerance are shown but still go into the spectrum'));"
 "document.getElementById('sh_st').innerHTML=t.join('<br>')}"
-"function shDraw(){var d=SH.d;if(!d||!d.YB)return;var c=document.getElementById('sh_cv'),dpr=window.devicePixelRatio||1,"
-"W=c.clientWidth,H=c.clientHeight;c.width=W*dpr;c.height=H*dpr;var x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);"
-"var ml=34,mb=18,mt=6,mr=8,pw=W-ml-mr,ph=H-mt-mb,mx=0,i;x.fillStyle='#0b0f0b';x.fillRect(0,0,W,H);"
-"for(i=0;i<d.m.length;i++)if(d.m[i]>mx)mx=d.m[i];var cw=pw/d.XB,chh=ph/d.YB,lm=Math.log(1+mx)||1;"
-"for(var yy=0;yy<d.YB;yy++)for(var xx=0;xx<d.XB;xx++){var n=d.m[yy*d.XB+xx];if(!n)continue;var q=Math.log(1+n)/lm;"
-"x.fillStyle='hsl('+Math.round(150-110*q)+',75%,'+Math.round(22+50*q)+'%)';"
-"x.fillRect(ml+xx*cw,mt+ph-(yy+1)*chh,Math.ceil(cw),Math.ceil(chh))}"
-"if(d.ref>0&&d.swin==d.win){var r=d.ref/10,tl=r*d.tol/100,Y=function(w){return mt+ph-Math.min(w,d.win)/d.win*ph};"
-"x.fillStyle='rgba(127,216,138,.13)';x.fillRect(ml,Y(r+tl),pw,Y(Math.max(r-tl,0))-Y(r+tl));"
-"x.strokeStyle='#7fd88a';x.setLineDash([4,3]);x.beginPath();x.moveTo(ml,Y(r));x.lineTo(ml+pw,Y(r));x.stroke();x.setLineDash([])}"
-"x.strokeStyle='#3a443a';x.strokeRect(ml+.5,mt+.5,pw,ph);x.fillStyle='#8a948a';x.font='10.5px monospace';"
-"for(var o=0;o<=12;o+=2)x.fillText(String(1<<o),ml+o*8*cw+2,H-5);"
-"for(var k=0;k<=4;k++)x.fillText(String(Math.round(d.win*k/4)),4,mt+ph-ph*k/4+(k==4?9:-1))}"
+/* холст под размер на экране; возвращает контекст и размеры */
+"function shCv(id){var c=document.getElementById(id),dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;"
+"c.width=W*dpr;c.height=H*dpr;var x=c.getContext('2d');x.setTransform(dpr,0,0,dpr,0,0);"
+"x.fillStyle='#0b0f0b';x.fillRect(0,0,W,H);x.font='10.5px monospace';return [x,W,H]}"
+"var SHC={ref:'#e8efe2',ok:'#6fd38a',bad:'#ff8a82'};"
+/* ЭТАЛОННЫЙ ИМПУЛЬС: средний импульс набора и последние примеры, каждый
+   своей высотой к 1; по горизонтали - отсчёты от вершины. Примеры - в
+   окне текущей настройки, эталон - в окне, на котором набран. */
+"function shDrawWave(){var d=SH.d,g=shCv('sh_wv'),x=g[0],W=g[1],H=g[2],ml=30,mr=8,mt=8,mb=18,pw=W-ml-mr,ph=H-mt-mb;"
+"var cur=[];if(d.wave)cur.push([d.wave.map(function(y){return y/1000}),d.wpre,SHC.ref,2.2]);"
+"for(var k=0;k<2;k++){var e=d.ex[k];if(e&&e.h>0)cur.push([e.v.map(function(y){return y/e.h}),e.pre,k?SHC.bad:SHC.ok,1.2])}"
+"var x0=-8-d.rise,x1=d.win-1-d.rise;cur.forEach(function(c){x0=Math.min(x0,-c[1]);x1=Math.max(x1,c[0].length-1-c[1])});"
+"var y0=-0.2,y1=1.15;function X(t){return ml+(t-x0)/(x1-x0||1)*pw}function Y(y){return mt+(y1-y)/(y1-y0)*ph}"
+"x.strokeStyle='#283024';x.lineWidth=1;[0,0.5,1].forEach(function(y){x.beginPath();x.moveTo(ml,Y(y));x.lineTo(ml+pw,Y(y));x.stroke()});"
+/* окно меры: база (8 отсчётов) и «до / после вершины» */
+"x.fillStyle='rgba(127,216,138,.07)';x.fillRect(X(-d.rise),mt,X(d.win-1-d.rise)-X(-d.rise),ph);"
+"x.strokeStyle='#3a443a';x.setLineDash([3,3]);[-d.rise,0,d.win-1-d.rise].forEach(function(t){x.beginPath();x.moveTo(X(t),mt);x.lineTo(X(t),mt+ph);x.stroke()});x.setLineDash([]);"
+"cur.slice().reverse().forEach(function(c){x.strokeStyle=c[2];x.lineWidth=c[3];x.beginPath();"
+"c[0].forEach(function(y,i){var px=X(i-c[1]),py=Y(Math.max(y0,Math.min(y1,y)));if(i)x.lineTo(px,py);else x.moveTo(px,py)});x.stroke()});"
+"x.lineWidth=1;x.fillStyle='#8a948a';x.fillText('1',4,Y(1)+4);x.fillText('0',4,Y(0)+4);"
+"var st=Math.max(1,Math.round((x1-x0)/8/5)*5);for(var t=Math.ceil(x0/st)*st;t<=x1;t+=st)x.fillText(String(t),X(t)-6,H-5);"
+"if(!cur.length){x.fillStyle='#8a948a';x.fillText(L('нет импульсов: запустите набор спектра','no pulses: start the spectrum acquisition'),ml+10,mt+20)}"
+"var us=1e6/(d.hz||1),l=[];"
+"l.push('<span style=color:'+SHC.ref+'>━</span> '+(d.wave?L('эталон: среднее ','reference: mean of ')+d.wn+L(' импульсов',' pulses')+(d.ref>0?', '+L('ширина ','width ')+f1(d.ref)+L(' отсч.',' samples'):''):L('эталон не набран','no reference yet')));"
+"var nm=[[L('последний в допуске','last within tolerance'),SHC.ok],[L('последний вне допуска','last outside tolerance'),SHC.bad]];"
+"for(k=0;k<2;k++){var e2=d.ex[k];if(k==1&&!shCmp(d))continue;"
+"l.push('<span style=color:'+nm[k][1]+'>━</span> '+nm[k][0]+': '+(e2?L('высота ','height ')+e2.h+L(' кодов, ширина ',' codes, width ')+f1(e2.w)+L(' отсч.',' samples')+"
+"(e2.age>2?', '+e2.age+L(' с назад',' s ago'):''):L('пока не было','none yet')))}"
+"l.push(L('по горизонтали - отсчёты от вершины (1 отсч. = ','horizontally - samples from the peak (1 sample = ')+(us*1000).toFixed(0)+L(' нс), каждый импульс своей высотой к 1; светлая полоса - окно меры',' ns), each pulse scaled to its height; the light band is the measurement window'));"
+"document.getElementById('sh_wl').innerHTML=l.join('<br>')}"
+/* ШИРИНА ИМПУЛЬСОВ: гистограмма площадь / высота от 0 до окна, зелёным -
+   в допуске, красным - вне его, полоса - эталон ± допуск */
+"function shDrawHist(){var d=SH.d,g=shCv('sh_hg'),x=g[0],W=g[1],H=g[2],ml=30,mr=8,mt=8,mb=18,pw=W-ml-mr,ph=H-mt-mb;"
+"var mx=0,tot=0,out=0,cmp=shCmp(d),r=d.ref/10,tl=r*d.tol/100,bw=d.win/d.HB;"
+"d.hist.forEach(function(n){if(n>mx)mx=n;tot+=n});"
+"function X(w){return ml+w/d.win*pw}"
+"if(cmp){x.fillStyle='rgba(127,216,138,.12)';x.fillRect(X(r-tl),mt,X(r+tl)-X(r-tl),ph)}"
+"d.hist.forEach(function(n,i){if(!n)return;var w=(i+0.5)*bw,ins=!cmp||(w>=r-tl&&w<=r+tl);if(!ins)out+=n;"
+"var hh=Math.max(1,n/mx*ph);x.fillStyle=ins?SHC.ok:SHC.bad;x.fillRect(X(i*bw)+0.5,mt+ph-hh,Math.max(1,X(bw)-X(0)-1),hh)});"
+"if(cmp){x.strokeStyle=SHC.ref;x.setLineDash([4,3]);x.beginPath();x.moveTo(X(r),mt);x.lineTo(X(r),mt+ph);x.stroke();x.setLineDash([])}"
+"x.strokeStyle='#3a443a';x.strokeRect(ml+.5,mt+.5,pw,ph);x.fillStyle='#8a948a';"
+"for(var k=0;k<=5;k++){var w=Math.round(d.win*k/5);x.fillText(String(w),X(w)-6,H-5)}"
+"if(!tot){x.fillText(L('нет импульсов: запустите набор спектра','no pulses: start the spectrum acquisition'),ml+10,mt+20)}"
+"document.getElementById('sh_hl').innerHTML=L('по горизонтали - ширина (площадь / высота), отсчётов; по высоте - сколько импульсов. ','horizontally - width (area / height), samples; vertically - how many pulses. ')+"
+"(cmp?L('Полоса - эталон ± допуск, красное - вне допуска. ','The band is reference ± tolerance, red is outside the tolerance. '):'')+"
+"L('С «Сброса»: ','Since “Reset”: ')+tot+L(' импульсов',' pulses')+(cmp&&tot?L(', вне допуска ',', outside the tolerance ')+out+' ('+(out*100/tot).toFixed(1)+' %)':'')}"
+"function shDraw(){if(SH.d){shDrawWave();shDrawHist()}}"
 "shLoad();setInterval(function(){shLoad()},2000);window.addEventListener('resize',shDraw);"
 "</script></body></html>";
 
@@ -2541,7 +2611,9 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "которых (площадь / высота в окне «до / после вершины») дальше от эталона, чем допуск: шумовые "
 "всплески ФЭУ уже сцинтилляций. «Набрать эталон» &mdash; при запущенном наборе (хватит и фона), "
 "прибор берёт 2000 импульсов. Эталон годится для того окна и той частоты, на которых набран. "
-"Карта показывает импульсы по каналу и ширине, полоса &mdash; эталон ± допуск. С хорошим ФЭУ "
+"Графики: средний эталонный импульс с последними импульсами в допуске и вне его и гистограмма "
+"ширины, полоса &mdash; эталон ± допуск. На 20 МГц при высоком счёте фильтр теряет чанки, на 16 МГц "
+"&mdash; нет. С хорошим ФЭУ "
 "фильтр не нужен.</td></tr>"
 "<tr><td>Диагностика</td><td>Отдельная страница. <b>Лог прибора</b> &mdash; сообщения "
 "прошивки с начала работы (последние 256 строк), цвет по уровню: красные &mdash; "
@@ -2714,8 +2786,10 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "(area / height in the “before / after peak” window) is farther from the reference than the "
 "tolerance: PMT noise bursts are narrower than scintillations. “Learn reference” &mdash; with a "
 "running acquisition (background is enough), the device takes 2000 pulses. The reference is valid for the "
-"window and rate it was learned at. The map shows pulses by channel and width, the band is "
-"reference ± tolerance. With a good PMT the filter is not needed.</td></tr>"
+"window and rate it was learned at. Plots: the mean reference pulse with the last pulses within "
+"and outside the tolerance, and a width histogram, the band is reference ± tolerance. At 20 MHz "
+"with a high count rate the filter loses chunks, at 16 MHz it does not. With a good PMT the filter "
+"is not needed.</td></tr>"
 "<tr><td>Diagnostics</td><td>A separate page. <b>Device log</b> &mdash; firmware "
 "messages since start (the last 256 lines), coloured by level: red &mdash; errors, "
 "yellow &mdash; warnings, the tag is coloured by subsystem (ADC, network, firmware...); "
