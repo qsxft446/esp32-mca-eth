@@ -334,7 +334,7 @@ BecqMoni (answers to commands).
   reference ± tolerance, the share outside the tolerance below. The card
   shows how many pulses were checked and rejected since “Reset” (`/stat`:
   `shchk`, `shrej`). At 20 MHz and ~5000 cps the filter works without chunk
-  losses, but the core headroom is small (measurements — “Found while
+  losses, but the core headroom is small (measurements — “Findings from
   debugging”, “Pulse shape filter”).
 - **CPS monitor** — on the same tab, below the spectrum: current CPS, mean
   over the whole history with its error, last interval, a plot by averaging
@@ -428,6 +428,73 @@ consecutive pulses.*
 
 *Time base 32768 samples (2 ms at 16 MHz) and the processing settings table:
 parameters of the other measurement method are dimmed.*
+
+## Pulse shape filter
+
+**Why.** A noisy PMT or a noisy high-voltage supply adds short pulses of a
+different shape to the scintillations: dark pulses at the threshold and rare
+fast bursts of large height. By amplitude the trapezoid cannot tell them from
+real events, and they land in the spectrum — as a mountain at the threshold
+that hides low-energy lines, and as a flat background over the whole scale.
+The shape filter looks not at the height but at the pulse width — area /
+height in the “before / after peak” window. Scintillations have almost the
+same width at any energy (set by the crystal and the amplifier), noise
+bursts are 2–3 times narrower. Pulses whose width is farther from the
+reference than the tolerance do not go into the spectrum.
+
+**When it is not needed.** Factory detection units with a precision
+low-noise high-voltage supply and a good PMT do not need the filter: they
+have few noise pulses above the threshold, and the extra check only costs
+core time. That is why it is off by default. Turn it on when the spectrum
+has a mountain at the threshold that does not go away with the threshold and
+the oscilloscope shows narrow single bursts.
+
+**How to enable.** “Settings” page, “Pulse shape filter” card: start the
+acquisition (background will do, a source is faster), “Learn reference”
+(the device takes 2000 pulses above three thresholds and saves the mean
+width and shape), tick “filter on”. The default tolerance is 25 %. The
+reference is valid for the “before / after peak” window and the ADC rate it
+was learned at; if they change, the filter passes everything and asks to
+learn the reference again. The card shows the reference pulse with the last
+accepted and rejected ones and a width histogram with the tolerance band.
+
+**Check on the device** (2026-11-04): noisy PMT, weak Cs-137 in a lead
+castle, 20 MHz, trapezoid L = 10, G = 51, threshold 16, tolerance 32 %; 333 s
+each with and without the filter, the spectrum reset before each run.
+
+![Cs-137 spectrum with and without the shape filter](docs/shape-filter-spectrum.en.png)
+
+| Channels | Without filter, cps | With filter, cps | Kept |
+|---|---|---|---|
+| below 12 (at the threshold) | 14.17 ± 0.21 | 0.70 | 5 % |
+| 12–25 (Ba X-ray 32 keV) | 7.17 ± 0.15 | 4.03 | 56 % |
+| 26–99 | 16.73 ± 0.22 | 12.33 | 74 % |
+| 100–369 (Compton) | 29.07 ± 0.30 | 27.30 | 94 % |
+| 370–454 (662 keV peak) | 18.30 ± 0.23 | 18.02 | 98.5 % |
+| above the peak | 4.27 ± 0.11 | 4.01 | 94 % |
+
+Without the filter the barium X-ray (32 keV) drowned in the noise at the
+threshold; with the filter it is a separate peak (peak / valley 2.04 → 2.39).
+The 662 keV peak is almost untouched: by a Gaussian fit 16.92 → 16.56 cps
+(−2 %), resolution 9.57 → 9.43 %. In total 25 % of pulses are rejected. No
+chunk losses, core load 84 % in both runs.
+
+![Pulse shape: reference, accepted and rejected](docs/shape-filter-pulses.en.png)
+
+The reference is the mean of 2000 pulses: rise ~0.6 µs, decay to half in
+~1.3 µs. The rejected ones are the mean of 71 pulses, one per page request:
+rise ~0.4 µs, decay to half in ~0.45 µs; among them there are small ones at
+the threshold (20–30 codes) and tall ones, up to the top of the ADC. Where the
+tall fast pulses come from was not checked (an assumption — muons in the PMT
+glass or discharges in it).
+
+**Cost.** The measure is computed once per event. With integration the filter
+takes the peak and the window sum from the integration itself. At 20 MHz and
+~5000 cps there are no losses with the filter (5 min), but the core headroom
+is small — about 1.1 cycles per sample out of 12; with a noticeably higher
+count rate watch chunk losses on the “Diagnostics” page, if there are losses
+use 16 MHz. Details and measurements — “Findings from debugging”, “Pulse
+shape filter”.
 
 ## Architecture
 
