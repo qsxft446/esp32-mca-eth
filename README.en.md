@@ -495,30 +495,40 @@ both integration and the trapezoid — see “Findings from debugging”,
 “Convolution with the reference: model versus device”. The reference is
 learned only from running acquisition: after a reboot press “Start” first.
 
-**Check on the device** (2026-11-04): noisy PMT, weak Cs-137 in a lead
-castle, 20 MHz, trapezoid L = 10, G = 51, threshold 16, tolerance 32 %; 333 s
-each with and without the filter, the spectrum reset before each run. *This
-was measured before the width baseline fix (see “Findings from debugging”,
-“Pulse shape filter”): the filter then also rejected some real small
-pulses, so the losses in the table for the barium X-ray and channels 26–99
-are larger than they really are. Not rechecked on Cs-137 after the fix.*
+**Check on the device** (2026-11-05): noisy PMT, weak Cs-137 in a lead
+castle, 20 MHz, trapezoid L = 10, G = 51, threshold 16, window 13 + 36,
+tolerance 32 %; reference learned anew, 900 s each with and without the
+filter, the spectrum reset before each run. Alongside — the same measurement
+before the width baseline fix (2026-11-04, 333 s each, same settings, the
+source placed nearly the same — 662 keV peak without the filter 16.9 and
+16.1 cps).
 
 ![Cs-137 spectrum with and without the shape filter](docs/shape-filter-spectrum.en.png)
 
-| Channels | Without filter, cps | With filter, cps | Kept |
-|---|---|---|---|
-| below 12 (at the threshold) | 14.17 ± 0.21 | 0.70 | 5 % |
-| 12–25 (Ba X-ray 32 keV) | 7.17 ± 0.15 | 4.03 | 56 % |
-| 26–99 | 16.73 ± 0.22 | 12.33 | 74 % |
-| 100–369 (Compton) | 29.07 ± 0.30 | 27.30 | 94 % |
-| 370–454 (662 keV peak) | 18.30 ± 0.23 | 18.02 | 98.5 % |
-| above the peak | 4.27 ± 0.11 | 4.01 | 94 % |
+| Channels | Without filter, cps | With filter, cps | Kept | Before the baseline fix |
+|---|---|---|---|---|
+| below 12 (at the threshold) | 14.45 ± 0.13 | 0.82 | 6 % | 5 % |
+| 12–25 (Ba X-ray 32 keV) | 7.27 ± 0.09 | 4.42 | 61 % | 56 % |
+| 26–99 | 15.67 ± 0.13 | 13.06 | 83 % | 74 % |
+| 100–369 (Compton) | 26.98 ± 0.17 | 26.26 | 97 % | 94 % |
+| 370–454 (662 keV peak) | 17.24 ± 0.14 | 17.30 | 100 % | 98.5 % |
+| above the peak | 4.16 ± 0.07 | 3.92 | 94 % | 94 % |
 
-Without the filter the barium X-ray (32 keV) drowned in the noise at the
-threshold; with the filter it is a separate peak (peak / valley 2.04 → 2.39).
-The 662 keV peak is almost untouched: by a Gaussian fit 16.92 → 16.56 cps
-(−2 %), resolution 9.57 → 9.43 %. In total 25 % of pulses are rejected. No
-chunk losses, core load 84 % in both runs.
+Without the filter the barium X-ray (32 keV) drowns in the noise at the
+threshold; with the filter it is a separate peak (Gaussian fit 2.35 cps,
+2.26 before the fix). The filter now does not touch the 662 keV peak at all:
+by a Gaussian fit 16.12 → 15.87 cps, resolution 9.94 → 9.65 %. In total 23 %
+of pulses are rejected (25 % before the fix). No chunk losses.
+
+Why the fix gave less here than on Ra-226: this check has a “before peak”
+window of 13, not 10, and the old baseline (8 samples before the window,
+13–21 samples before the peak) reached the rise less often. The model on raw
+Ra-226 frames with these same settings: the old baseline rejected 6.5 % of
+events, the new one 2.9 %, above channel 160 1.4 % and 0.2 % — as for the
+662 keV peak on the device. What the filter still removes in channels 12–99
+is mostly the noise of this PMT (on Ra-226 real pulses of this height lose
+1–7 %); the share of real pulses on Cs-137 was not measured directly — the
+source is too weak for raw frames.
 
 ![Pulse shape: reference, accepted and rejected](docs/shape-filter-pulses.en.png)
 
