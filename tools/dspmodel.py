@@ -276,7 +276,10 @@ class DSP:
         a, b = pk - p.int_rise, pk + p.int_fall
         if a - 8 < 0 or b >= end:
             return True
-        base8 = sum(w[a - 8:a])
+        # база - от «пробой - L», как у свёртки (база перед окном ложилась
+        # на фронт при максимуме, сдвинутом шумом позже)
+        e = self.cross_pos - p.trap_L
+        base8 = sum(w[e - 32:e]) // 4 if e - 32 >= 0 else sum(w[a - 8:a])
         ssum = isum if (ipk >= 0 and isum >= 0) else sum(w[a:b + 1])
         n = b - a + 1
         h8 = mx * 8 - base8
@@ -295,10 +298,7 @@ class DSP:
             if len(self.learn) < self.learn_need and not clip:
                 self.learn.append(min(w10, 32767))
                 self.learn_h.append(h8)
-                # средняя форма - с базой от «пробой - L», как у свёртки
-                e = self.cross_pos - p.trap_L
-                bx8 = sum(w[e - 32:e]) // 4 if e - 32 >= 0 else base8
-                hx8 = mx * 8 - bx8
+                bx8, hx8 = base8, h8
                 if hx8 > 0:
                     c50 = pk            # середина фронта, как в прошивке
                     while c50 > e and c50 > a - 8 and w[c50 - 1] * 16 - 2 * bx8 > hx8:

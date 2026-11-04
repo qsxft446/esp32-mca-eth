@@ -456,6 +456,13 @@ the oscilloscope shows narrow single bursts.
 acquisition (background will do, a source is faster), “Learn reference”
 (the device takes 2000 pulses above three thresholds and saves the mean
 width and shape), tick “filter on”. The default tolerance is 25 %. The
+width is measured from the baseline before the rise — 32 samples ending L
+before the threshold crossing. A narrow tolerance also cuts real small
+pulses: on Ra-226 (model on raw frames) 12 % loses a quarter of the pulses
+in channels 25–40, 25 % loses 5 %, above channel 40 about 1 %. After
+updating from v1.2.0 or earlier the reference must be learned anew: the
+width was measured differently there, and the old reference is dropped on
+load. The
 reference is valid for the “before / after peak” window and the ADC rate it
 was learned at; if they change, the filter passes everything and asks to
 learn the reference again. The card shows the reference pulse with the last
@@ -490,7 +497,11 @@ learned only from running acquisition: after a reboot press “Start” first.
 
 **Check on the device** (2026-11-04): noisy PMT, weak Cs-137 in a lead
 castle, 20 MHz, trapezoid L = 10, G = 51, threshold 16, tolerance 32 %; 333 s
-each with and without the filter, the spectrum reset before each run.
+each with and without the filter, the spectrum reset before each run. *This
+was measured before the width baseline fix (see “Findings from debugging”,
+“Pulse shape filter”): the filter then also rejected some real small
+pulses, so the losses in the table for the barium X-ray and channels 26–99
+are larger than they really are. Not rechecked on Cs-137 after the fix.*
 
 ![Cs-137 spectrum with and without the shape filter](docs/shape-filter-spectrum.en.png)
 
@@ -809,7 +820,49 @@ pre-allocated memory.
   | 5 samples | 26.4–36.3 | 23.1 / 31.6 | 1.21 |
 
   Gap — 5 % of accepted widths to 95 % of rejected. The tolerance (25–40 %)
-  covers the narrower width of small pulses.
+  covers the narrower width of small pulses. *The real cause of the
+  narrower width is the baseline lying on the rise; below.*
+- **The width baseline lay on the rise** (analysis 2026-11-04: 2200 raw
+  Ra-226 frames, 20 MHz, 17 872 events through the firmware model with the
+  device settings). The width was taken from a baseline of “8 samples right
+  before the ‘before peak’ window”. The pulse top is rounded, noise shifts
+  the maximum a few samples later, and those 8 samples landed on the rise —
+  on average at 60 % of the height: the width came out ~11 instead of ~33,
+  and the filter rejected a real pulse. The mean shape of such “narrow”
+  pulses matches the accepted ones, the width with the baseline before the
+  rise is 32.5 versus 33.2; real bursts with that baseline — ~15. Now the
+  baseline is 32 samples ending L before the threshold crossing, as in
+  convolution.
+
+  Share of real pulses rejected (tail 15–25 samples after the peak ≥ 0.42 of
+  the height, no pile-up; tolerance 40 %, window 10 + 36):
+
+  | Height, codes | 16–25 | 25–37 | 37–60 | 60–100 | 100–400 | 400+ |
+  |---|---|---|---|---|---|---|
+  | baseline before the window (old) | 55 % | 44 % | 17 % | 12 % | 5 % | 0.4 % |
+  | baseline from the threshold crossing | 0 % | 0 % | 0 % | 0 % | 0 % | 0 % |
+
+  The “tail” yardstick also takes its baseline before the rise, so the
+  zeros are somewhat optimistic; the main evidence is the identical shape
+  of rejected and accepted pulses. Bursts (tail < 0.30) near the threshold
+  are passed as before: 3.5–4 % versus 5–7 %.
+
+  Device versus model (device settings: threshold 20, window 12 + 40,
+  tolerance 12 %, Ra-226): the model on raw frames rejects 21.7 % with the
+  old baseline and 5.5 % with the new one; the device with the new firmware
+  — 5.6 % (300 s, 1.43 million events), reference width 36.3 on the device
+  and 36.1 in the model. The Ra-226 peak with and without the filter is the
+  same (FWHM 9.75 %), above channel 80 99 % remains. The test is
+  `tools/test_dsp.py`, “rounded top”: it goes red on the old baseline (5.8 %
+  rejected at 20 codes versus 0).
+- **Pearson correlation instead of width** (as BecqMoni selects) was checked
+  on the same events and not adopted. Threshold 0.8: it loses 7 % of small
+  real pulses (16–25 codes), catches bursts near the threshold slightly
+  better (passes 2–3 % versus 3.5–4 %), pile-ups noticeably better (16 %
+  versus 1.3 %), but pile-ups are only 1.7 % of events at ~4000 cps.
+  Threshold 0.9 already loses 24 % of small pulses. For small pulses the
+  correlation drops more than white noise would give (median 0.90 against
+  an expected 0.95): the shape varies from pulse to pulse.
 
 ### Processing core budget: memmove and the chunk copy
 

@@ -885,6 +885,36 @@ for algo in (0, 2):
 print(f"  длинный фронт, 300 кодов: FWHM трапеция {fw_sl[0]:.2f} %, свёртка {fw_sl[2]:.2f} %")
 check("длинный фронт: свёртка не хуже трапеции", fw_sl[2] <= 1.1 * fw_sl[0],
       f"{fw_sl[2]:.2f} % против {fw_sl[0]:.2f} %")
+# ---- скруглённая вершина: шум сдвигает максимум позже, и база ширины «8
+# отсчётов перед окном» ложилась на фронт - фильтр отбрасывал настоящие малые
+# импульсы (сырые кадры Ra-226, 2026-11-04: 55 % при 16-25 кодах). База - от
+# пробоя порога.
+def rounded(A, seed, n=500):
+    rm = random.Random(seed)
+    pm = [300 + k * 400 + rm.randint(0, 40) for k in range(n)]
+    sm = make_pulse_train(pm[-1] + 1000, [A] * n, pm, fs_hz=FS12, rise_ns=800, tau_us=2.5, clip=False)
+    k9 = 9                                  # скругление вершины: среднее по 9
+    sm = [sum(sm[max(0, i - k9 + 1):i + 1]) / min(k9, i + 1) for i in range(len(sm))]
+    gm = random.Random(seed + 1)
+    return [max(0, min(MCA_ADC_MAX, int(round(v + gm.gauss(0, 1.6))))) for v in sm]
+
+
+cfgr = dict(cfgc, int_rise=10, int_fall=36)
+d_r = DSP(Params(**cfgr))
+d_r.start_learn()
+s_r = rounded(400, 51)
+for off in range(0, len(s_r) - CAP_CHUNK_SAMPLES + 1, CAP_CHUNK_SAMPLES):
+    d_r.process(s_r[off:off + CAP_CHUNK_SAMPLES])
+d_r.finish_learn()
+for A_r in (20, 30):
+    q_r = Params(**cfgr, shape_on=1, shape_tol=40, shape_ref=d_r.p.shape_ref,
+                 shape_win=d_r.p.shape_win)
+    d_q = runc(rounded(A_r, 61 + A_r), q_r)
+    fr_r = d_q.shape_rej / max(d_q.shape_chk, 1)
+    print(f"  скруглённая вершина, {A_r} кодов: эталон ширины {d_r.p.shape_ref / 10:.1f}, "
+          f"отброшено {d_q.shape_rej} из {d_q.shape_chk}")
+    check(f"скруглённая вершина, {A_r} кодов: фильтр отбрасывает не больше 3 % настоящих импульсов",
+          fr_r <= 0.03, f"{100 * fr_r:.1f} %")
 p_w = Params(**cfg12, shape_on=1, shape_tol=25, shape_ref=p_l.shape_ref,
              shape_win=p_l.shape_win)
 p_w.int_fall = 30
