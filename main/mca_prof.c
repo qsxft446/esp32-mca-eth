@@ -2,6 +2,7 @@
 
 #include "mca_config.h"
 #include "mca_dsp.h"
+#include "adc_cap.h"
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -194,6 +195,67 @@ static void cpu_report(void)
 }
 #endif  /* MCA_PROF_LOG */
 
+/* ЗАГРУЗКА ЯДЕР И ЗАДАЧ за секунду - по счётчикам времени FreeRTOS
+ * (CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS, мкс от esp_timer, 64 бита).
+ * Ядро: 1000 минус доля его задачи простоя. Задачи: прирост счётчика каждой
+ * за секунду; прежние значения - по номеру задачи. Список задач снимается
+ * из главной задачи раз в секунду - это десятки микросекунд. */
+#define PROF_TMAX 40
+static TaskStatus_t s_ts[PROF_TMAX];
+static struct { UBaseType_t num; configRUN_TIME_COUNTER_TYPE rt; } s_tprev[PROF_TMAX];
+static int s_tprev_n;
+static configRUN_TIME_COUNTER_TYPE s_idle_prev[2];
+static int64_t s_cores_t0;
+
+static void cores_tick(int64_t now, mca_prof_t *sn)
+{
+    const int64_t dt = s_cores_t0 ? now - s_cores_t0 : 0;
+    for (int c = 0; c < 2; c++) {
+        const configRUN_TIME_COUNTER_TYPE idle = ulTaskGetIdleRunTimeCounterForCore(c);
+        const uint64_t d = idle - s_idle_prev[c];
+        s_idle_prev[c] = idle;
+        sn->core_pm[c] = dt > 0 && (int64_t)d <= dt
+                       ? (uint32_t)(1000 - d * 1000 / (uint64_t)dt) : 0;
+    }
+    const UBaseType_t n = uxTaskGetSystemState(s_ts, PROF_TMAX, NULL);
+    mca_prof_task_t top[PROF_TASKS];
+    int nt = 0;
+    for (UBaseType_t i = 0; i < n; i++) {
+        const TaskStatus_t *t = &s_ts[i];
+        configRUN_TIME_COUNTER_TYPE prev = t->ulRunTimeCounter;
+        for (int k = 0; k < s_tprev_n; k++)
+            if (s_tprev[k].num == t->xTaskNumber) { prev = s_tprev[k].rt; break; }
+        if (dt <= 0 || strncmp(t->pcTaskName, "IDLE", 4) == 0) continue;
+        const uint32_t pm = (uint32_t)((t->ulRunTimeCounter - prev) * 1000 / (uint64_t)dt);
+        if (pm == 0) continue;
+        /* вставка по убыванию в короткий список */
+        int pos = nt;
+        while (pos > 0 && top[pos - 1].pm < pm) pos--;
+        if (pos >= PROF_TASKS) continue;
+        for (int k = (nt < PROF_TASKS ? nt : PROF_TASKS - 1); k > pos; k--) top[k] = top[k - 1];
+        strncpy(top[pos].name, t->pcTaskName, sizeof(top[pos].name) - 1);
+        top[pos].name[sizeof(top[pos].name) - 1] = 0;
+        top[pos].core = t->xCoreID == tskNO_AFFINITY ? 255 : (uint8_t)t->xCoreID;
+        top[pos].pm = (uint16_t)(pm > 65535 ? 65535 : pm);
+        if (nt < PROF_TASKS) nt++;
+    }
+    s_tprev_n = 0;
+    for (UBaseType_t i = 0; i < n && s_tprev_n < PROF_TMAX; i++) {
+        s_tprev[s_tprev_n].num = s_ts[i].xTaskNumber;
+        s_tprev[s_tprev_n].rt  = s_ts[i].ulRunTimeCounter;
+        s_tprev_n++;
+    }
+    /* прерывание захвата: такты за секунду к тактам ядра */
+    static uint32_t isr_prev;
+    const uint32_t isr = adc_cap_isr_cycles();
+    sn->isr_pm = dt > 0 ? (uint32_t)((uint64_t)(isr - isr_prev) * 1000 /
+                 ((uint64_t)dt * CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ)) : 0;
+    isr_prev = isr;
+    s_cores_t0 = now;
+    sn->ntasks = (uint32_t)nt;
+    memcpy(sn->tasks, top, sizeof(top[0]) * (size_t)nt);
+}
+
 void mca_prof_tick_1s(void)
 {
     /* Память читаем здесь: это не горячий путь. */
@@ -201,8 +263,15 @@ void mca_prof_tick_1s(void)
     const uint32_t hm =
         (uint32_t)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
     const int64_t now = esp_timer_get_time();
+    /* ядра и задачи - до блокировки: список задач снимается не мгновенно */
+    static mca_prof_t cs;
+    cores_tick(now, &cs);
 
     LOCK();
+    memcpy(s_snap.core_pm, cs.core_pm, sizeof(cs.core_pm));
+    s_snap.isr_pm = cs.isr_pm;
+    s_snap.ntasks = cs.ntasks;
+    memcpy(s_snap.tasks, cs.tasks, sizeof(cs.tasks));
     const int64_t span = s_busy_t0 ? now - s_busy_t0 : 0;
     s_snap.busy_pm = span > 0 ? (uint32_t)(s_work_sum_us * 1000 / span) : 0;
     s_work_sum_us = 0;

@@ -8,6 +8,7 @@
 #include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_cpu.h"
 #include "esp_rom_gpio.h"
 #include "esp_rom_sys.h"
 #include "esp_private/periph_ctrl.h"
@@ -42,7 +43,9 @@ _Static_assert(GPIO_MATRIX_CONST_ZERO >= SOC_GPIO_PIN_COUNT &&
                "константа GPIO-матрицы совпала с номером настоящей ножки");
 
 /* ---- состояние ---- */
-static uint16_t          *s_buf[CAP_N_CHUNKS];
+static uint16_t          *s_buf[CAP_N_CHUNKS];   /* данные чанка в s_mem[i] */
+static uint16_t          *s_mem[CAP_N_CHUNKS];   /* голова + данные + запас  */
+static volatile uint32_t  s_isr_cyc;             /* такты в прерывании       */
 static dma_descriptor_t  *s_desc;
 static gdma_channel_handle_t s_dma;
 static QueueHandle_t      s_queue;
@@ -80,6 +83,7 @@ typedef struct { int idx; } cap_msg_t;
 static IRAM_ATTR bool on_recv_eof(gdma_channel_handle_t ch,
                                   gdma_event_data_t *ev, void *user)
 {
+    const uint32_t c0 = esp_cpu_get_cycle_count();
     BaseType_t hp = pdFALSE;
     /* ev->rx_eof_desc_addr указывает на завершившийся дескриптор */
     dma_descriptor_t *d = (dma_descriptor_t *)ev->rx_eof_desc_addr;
@@ -89,7 +93,7 @@ static IRAM_ATTR bool on_recv_eof(gdma_channel_handle_t ch,
             idx = i; break;
         }
     }
-    if (idx < 0) return false;
+    if (idx < 0) { s_isr_cyc += esp_cpu_get_cycle_count() - c0; return false; }
 
     s_last_ready = idx;
     s_chunks++;
@@ -98,6 +102,7 @@ static IRAM_ATTR bool on_recv_eof(gdma_channel_handle_t ch,
         s_lost++;               /* DSP не успевает - чанк потерян */
         s_gap = true;           /* поток разорван, фильтру нужен сброс */
     }
+    s_isr_cyc += esp_cpu_get_cycle_count() - c0;
     return hp == pdTRUE;
 }
 
@@ -248,14 +253,21 @@ static esp_err_t cap_dma_setup(void)
 {
     /* Буферы во ВНУТРЕННЕЙ RAM: PSRAM не тянет 30 МБ/с потока
      * и добавляет непредсказуемые задержки. */
+    /* Перед данными - место под хвост прошлого чанка, после - запас:
+     * обработка идёт прямо здесь, без копии всего чанка (mca_dsp.c). */
+    _Static_assert((CAP_HEAD_SAMPLES * 2) % 16 == 0,
+                   "данные чанка должны быть выровнены на 16 байт");
+    const size_t mem_bytes =
+        (CAP_HEAD_SAMPLES + CAP_CHUNK_SAMPLES + CAP_PAD_SAMPLES) * 2;
     for (int i = 0; i < CAP_N_CHUNKS; i++) {
-        s_buf[i] = heap_caps_aligned_alloc(64, CAP_CHUNK_BYTES,
+        s_mem[i] = heap_caps_aligned_alloc(64, mem_bytes,
                        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
-        if (!s_buf[i]) {
+        if (!s_mem[i]) {
             ESP_LOGE(TAG, "нет памяти под чанк %d", i);
             return ESP_ERR_NO_MEM;
         }
-        memset(s_buf[i], 0, CAP_CHUNK_BYTES);
+        memset(s_mem[i], 0, mem_bytes);
+        s_buf[i] = s_mem[i] + CAP_HEAD_SAMPLES;
     }
 
     s_desc = heap_caps_aligned_alloc(64,
@@ -471,6 +483,8 @@ size_t adc_cap_snapshot(uint16_t *dst, size_t max_samples)
     memcpy(dst, s_buf[idx], n * 2);
     return n;
 }
+
+uint32_t adc_cap_isr_cycles(void) { return s_isr_cyc; }
 
 bool adc_cap_wait_chunk(const uint16_t **out, size_t *n, uint32_t ms)
 {

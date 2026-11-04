@@ -67,7 +67,7 @@ static int32_t  s_trap;          /* текущее значение трапец
  * стоило вычитания, наложения маски и расчёта адреса - около
  * тридцати инструкций на отсчёт, потолок около 3.5 МГц. В линейном
  * буфере отсчёты берутся простым смещением по фиксированному сдвигу. */
-#define DSP_TAIL (TRAP_L_MAX + TRAP_G_MAX + 8)
+#define DSP_TAIL CAP_HEAD_SAMPLES
 /* Выровнен на 16 байт: векторная разность (diff_vec) читает отсчёт
  * w[i] выровненными 128-битными словами, начиная с s_work + DSP_TAIL,
  * а переворот полярности пишет сюда 32-битными. Запас в 16 отсчётов
@@ -75,8 +75,18 @@ static int32_t  s_trap;          /* текущее значение трапец
 static uint16_t s_work[DSP_TAIL + CAP_CHUNK_SAMPLES + 16] __attribute__((aligned(16)));
 _Static_assert(DSP_TAIL % 8 == 0, "s_work + DSP_TAIL должен быть выровнен на 16 байт");
 
+/* ТЕКУЩИЙ РАБОЧИЙ БУФЕР: хвост прошлого чанка + этот чанк. Обычно это сам
+ * буфер DMA - перед данными у него место под хвост (adc_cap.c), и копируется
+ * только хвост, 200 отсчётов, а не весь чанк: копия всего чанка стоила 1.43
+ * такта на отсчёт из бюджета 12 на 20 МГц (замер 2026-11-04). s_work - для
+ * импульсов вниз (их переворачиваем при копии) и когда очередь почти полна:
+ * тогда DMA скоро запишет в этот же буфер, и данные надо унести. Хвост между
+ * чанками хранится в s_tail. */
+static uint16_t *s_w = s_work;
+static uint16_t  s_tail[DSP_TAIL];
+
 /* Разность трапеции d[i] = w[i] - w[i-L] - w[i-G] + w[i-G-L] для
- * отсчётов текущего чанка: s_d[k] относится к s_work[DSP_TAIL + k].
+ * отсчётов текущего чанка: s_d[k] относится к s_w[DSP_TAIL + k].
  * Считается сразу для всего чанка, дальше вся обработка берёт готовое
  * значение - одно чтение на отсчёт вместо четырёх. Значения в пределах
  * ±8190, в 16 бит помещаются. Запас в 16 - под последнюю восьмёрку. */
@@ -368,7 +378,7 @@ static int64_t amp_integrate(int32_t peak_pos, int32_t rise, int32_t fall,
 
     int32_t mx = -32768, pk = lo;
     for (int i = lo; i <= hi; i++)
-        if (s_work[i] > mx) { mx = s_work[i]; pk = i; }
+        if (s_w[i] > mx) { mx = s_w[i]; pk = i; }
 
     *out_pk = pk;
     int a = pk - rise, b = pk + fall;
@@ -376,7 +386,7 @@ static int64_t amp_integrate(int32_t peak_pos, int32_t rise, int32_t fall,
     if (b >= total) b = total - 1;
 
     int64_t sum = 0;
-    for (int i = a; i <= b; i++) sum += (int32_t)s_work[i] - base;
+    for (int i = a; i <= b; i++) sum += (int32_t)s_w[i] - base;
 
     int n = b - a + 1;
     *out_n = n > 0 ? n : 1;
@@ -431,16 +441,16 @@ static bool amp_conv(int32_t peak_pos, int end, const mca_params_t *p,
     int32_t mx = -1;
     int pk = lo;
     for (int i = lo; i <= hi; i++)
-        if (s_work[i] > mx) { mx = s_work[i]; pk = i; }
+        if (s_w[i] > mx) { mx = s_w[i]; pk = i; }
     const int a = pk - p->int_rise;
     if (a - 32 < 0) return false;
     int32_t base32 = 0;
-    for (int i = a - 32; i < a; i++) base32 += s_work[i];
+    for (int i = a - 32; i < a; i++) base32 += s_w[i];
     const int32_t base8 = base32 / 4;
     const int32_t h8 = mx * 8 - base8;
     if (h8 <= 0) return false;
     int c50 = pk;
-    while (c50 > a - 8 && s_work[c50 - 1] * 16 - 2 * base8 > h8) c50--;
+    while (c50 > a - 8 && s_w[c50 - 1] * 16 - 2 * base8 > h8) c50--;
     const int s0 = c50 - s_cr_mid;
     if (s0 < 0 || s0 + s_cr_len > end) return false;
     /* по 32 отсчёта в 32 битах: 131040 x 256 x 32 - в пределах int32 */
@@ -449,7 +459,7 @@ static bool amp_conv(int32_t peak_pos, int end, const mca_params_t *p,
         const int j1 = j0 + 32 < s_cr_len ? j0 + 32 : s_cr_len;
         int32_t part = 0;
         for (int j = j0; j < j1; j++)
-            part += ((int32_t)s_work[s0 + j] * 32 - base32) * s_cr[j];
+            part += ((int32_t)s_w[s0 + j] * 32 - base32) * s_cr[j];
         acc += part;
     }
     *num = acc * 256;                   /* x - коды x32, r - доли x256 */
@@ -513,22 +523,22 @@ static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
     int pk;
     if (ipk >= 0) {
         pk = ipk;
-        mx = s_work[pk];
+        mx = s_w[pk];
     } else {
         int lo = s_cross_pos - p->trap_L, hi = tpk + 4;
         if (lo < 1) lo = 1;
         if (hi > end - 1) hi = end - 1;
         pk = lo;
         for (int i = lo; i <= hi; i++)
-            if (s_work[i] > mx) { mx = s_work[i]; pk = i; }
+            if (s_w[i] > mx) { mx = s_w[i]; pk = i; }
     }
     const int a = pk - p->int_rise, b = pk + p->int_fall;
     if (a - 8 < 0 || b >= end) return true;
 
     int32_t base8 = 0, sum = 0;
-    for (int i = a - 8; i < a; i++) base8 += s_work[i];
+    for (int i = a - 8; i < a; i++) base8 += s_w[i];
     if (ipk >= 0 && isum >= 0) sum = isum;
-    else for (int i = a; i <= b; i++) sum += s_work[i];
+    else for (int i = a; i <= b; i++) sum += s_w[i];
     const int32_t n  = b - a + 1;
     const int32_t h8 = mx * 8 - base8;              /* высота x8  */
     const int32_t s8 = sum * 8 - n * base8;         /* площадь x8 */
@@ -558,14 +568,14 @@ static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
         const int32_t k = s_learn_n;
         bool clip = false;
         for (int i = a - 8; i <= b && !clip; i++)
-            clip = s_work[i] >= MCA_ADC_MAX - 1 || s_work[i] == 0;
+            clip = s_w[i] >= MCA_ADC_MAX - 1 || s_w[i] == 0;
         if (k < s_learn_need && !clip) {
             s_learn[k] = (int16_t)(w10 > 32767 ? 32767 : w10);
             int c50 = pk;
-            while (c50 > a - 8 && s_work[c50 - 1] * 16 - 2 * base8 > h8) c50--;
+            while (c50 > a - 8 && s_w[c50 - 1] * 16 - 2 * base8 > h8) c50--;
             for (int i = a - 8; i <= b; i++) {
                 const int j = i - c50 + WOFF;
-                s_wsum[j] += ((int32_t)s_work[i] * 8 - base8) * 1024 / h8;
+                s_wsum[j] += ((int32_t)s_w[i] * 8 - base8) * 1024 / h8;
                 s_wcnt[j]++;
             }
             s_learn_n = k + 1;
@@ -584,7 +594,7 @@ static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
         e->w10 = w10;
         e->ok  = ok;
         for (int i = a - 8, j = 0; i <= b; i++, j++)
-            e->v[j] = (int16_t)(((int32_t)s_work[i] * 8 - base8) / 8);
+            e->v[j] = (int16_t)(((int32_t)s_w[i] * 8 - base8) / 8);
         LOCK();
         s_ex_want[ek] = false;
         s_ex_new[ek]  = true;
@@ -598,12 +608,12 @@ static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
 }
 
 /* ---- РАЗНОСТЬ ТРАПЕЦИИ ДЛЯ ВСЕГО ЧАНКА ----
- * d[k] = w[k] - w[k-L] - w[k-G] + w[k-G-L], где w = s_work + DSP_TAIL. */
+ * d[k] = w[k] - w[k-L] - w[k-G] + w[k-G-L], где w = s_w + DSP_TAIL. */
 
 /* Обычным кодом - запасной путь, если векторный не прошёл самопроверку. */
 static void IRAM_ATTR diff_scalar(int L, int G, int n)
 {
-    const uint16_t *w = s_work + DSP_TAIL;
+    const uint16_t *w = s_w + DSP_TAIL;
     for (int k = 0; k < n; k++)
         s_d[k] = (int16_t)(w[k] - w[k - L] - w[k - G] + w[k - G - L]);
 }
@@ -627,7 +637,7 @@ static void IRAM_ATTR diff_scalar(int L, int G, int n)
  * циклов не бывает - функция не должна оказаться внутри чужого. */
 static void IRAM_ATTR __attribute__((noinline)) diff_vec(int L, int G, int n)
 {
-    const uint16_t *pa = s_work + DSP_TAIL;
+    const uint16_t *pa = s_w + DSP_TAIL;
     const uint16_t *pb = pa - L, *pc = pa - G, *pe = pa - G - L;
     int16_t *pd = s_d;
     int nv = (n + 7) >> 3;
@@ -662,15 +672,16 @@ static void IRAM_ATTR __attribute__((noinline)) diff_vec(int L, int G, int n)
  * Вызывать из задачи обработки до первого mca_dsp_process. */
 bool mca_dsp_vec_init(void)
 {
+    s_w = s_work;                       /* самопроверка - на своём буфере */
     static const uint8_t Ls[] = { 1, 2, 3, 5, 7, 8, 13, 20, 33, 64 };
-    const int total = (int)(sizeof(s_work) / sizeof(s_work[0]));
+    const int total = (int)(sizeof(s_work) / sizeof(s_w[0]));
     bool ok = true;
     uint32_t x = 0x12345678u;
 
     for (int set = 0; set < 2 && ok; set++) {
         for (int k = 0; k < total; k++) {
             x = x * 1664525u + 1013904223u;
-            s_work[k] = set == 0 ? (uint16_t)((x >> 20) & 0x0FFF)
+            s_w[k] = set == 0 ? (uint16_t)((x >> 20) & 0x0FFF)
                                  : (uint16_t)((x >> 31) ? MCA_ADC_MAX : 0);
         }
         for (size_t a = 0; a < sizeof(Ls) && ok; a++) {
@@ -709,7 +720,7 @@ bool mca_dsp_vec_ok(void) { return s_vec_ok; }
 /* Во ВНУТРЕННЕЙ памяти: иначе код горячего цикла тянется из флеш
  * через кэш, и каждый промах останавливает конвейер. Для цикла,
  * выполняемого миллионы раз в секунду, это заметно. */
-void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
+void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n, bool own_head)
 {
     /* замер загрузки: такты этого вызова копятся в s_busy_cyc */
     const uint32_t cyc0 = esp_cpu_get_cycle_count();
@@ -767,7 +778,12 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
     /* Склеиваем хвост и новый чанк. Импульсы вниз переворачиваем здесь,
      * один раз: дальше вся обработка видит их как импульсы вверх. Для
      * обычной полярности остаётся прежнее быстрое копирование. */
-    if (p.polarity && ((uintptr_t)data & 3) == 0) {
+    /* По месту - в буфере DMA, если он наш (см. s_w) и импульсы вверх. */
+    const bool inplace = own_head && !p.polarity && n == CAP_CHUNK_SAMPLES;
+    s_w = inplace ? (uint16_t *)data - DSP_TAIL : s_work;
+    if (inplace) {
+        /* данные уже на месте */
+    } else if (p.polarity && ((uintptr_t)data & 3) == 0) {
         /* По два отсчёта за операцию: в 32-битном слове две половины,
          * в каждой 0x0FFF - (v & 0x0FFF). После маски половина не больше
          * 0x0FFF, поэтому вычитание не занимает из соседней половины и
@@ -782,22 +798,23 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
         for (size_t k = 0; k < n2; k++)
             dst[k] = 0x0FFF0FFFu - (src[k] & 0x0FFF0FFFu);
         if (n & 1)
-            s_work[DSP_TAIL + n - 1] =
+            s_w[DSP_TAIL + n - 1] =
                 MCA_ADC_MAX - (data[n - 1] & MCA_DATA_MASK);
     } else if (p.polarity) {
         /* невыровненные данные (из DMA такого не бывает) - по одному */
         for (size_t k = 0; k < n; k++)
-            s_work[DSP_TAIL + k] = MCA_ADC_MAX - (data[k] & MCA_DATA_MASK);
+            s_w[DSP_TAIL + k] = MCA_ADC_MAX - (data[k] & MCA_DATA_MASK);
     } else {
         memcpy(s_work + DSP_TAIL, data, n * sizeof(uint16_t));
     }
+    memcpy(s_w, s_tail, DSP_TAIL * sizeof(uint16_t));
 
     if (s_need_prime) {
         /* Хвост заполняем ПЕРВЫМ отсчётом чанка, а не нулями:
          * так на стыке нет скачка, и трапеция стартует с нуля
          * естественным образом. Берём уже из буфера - с учётом знака. */
-        uint16_t v0 = s_work[DSP_TAIL];
-        for (int k = 0; k < DSP_TAIL; k++) s_work[k] = v0;
+        uint16_t v0 = s_w[DSP_TAIL];
+        for (int k = 0; k < DSP_TAIL; k++) s_w[k] = v0;
         s_trap = 0;
         s_state = ST_IDLE;
         s_prime_left = L + G + p.search + 4;
@@ -859,7 +876,7 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
     /* Базовая линия обновляется РЕДКО и отдельным проходом: раньше
      * условие проверялось на каждом отсчёте внутри горячего цикла. */
     for (int k = DSP_TAIL + 8; k < end; k += 64) {
-        int32_t v = s_work[k];
+        int32_t v = s_w[k];
         int32_t base = base_fp >> 8;
         int32_t dev  = v - base;
         if (!s_base_init) {
@@ -1044,7 +1061,12 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
     }
 
     /* хвост -> начало буфера для следующего вызова */
-    memmove(s_work, s_work + end - DSP_TAIL, DSP_TAIL * sizeof(uint16_t));
+    /* memcpy, НЕ memmove: обе - из ПЗУ микросхемы, но memmove там медленный.
+     * Прежний перенос хвоста memmove'ом внутри s_work (400 байт на чанк)
+     * стоил 2.2 такта на отсчёт - почти пятую часть бюджета на 20 МГц
+     * (замер 2026-11-04: «порог и события» 7.29 с memmove, 5.07 с memcpy,
+     * всё остальное то же). */
+    memcpy(s_tail, s_w + end - DSP_TAIL, DSP_TAIL * sizeof(uint16_t));
 
     /* Событие, не успевшее завершиться до конца чанка, продолжается
      * в следующем вызове. Но s_peak_pos - это ИНДЕКС В БУФЕРЕ, а

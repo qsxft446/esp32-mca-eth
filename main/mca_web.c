@@ -2116,6 +2116,14 @@ SUB_HEAD("Диагностика", "Diagnostics") SUB_NAV(N_SET, N_DIAG_ON, N_HE
 "(p.wmax[k]/1000).toFixed(1)+L(' мс',' ms'));"
 "h+=dR(L('Свободно внутр. памяти','Free internal memory'),(p.heap/1024).toFixed(0)+L(' КБ (минимум ',' KB (minimum ')+"
 "(p.hmin/1024).toFixed(0)+L(' КБ)',' KB)'));"
+/* загрузка ядер (1000 минус доля задачи простоя) и самые занятые задачи:
+   ядро 0 - сеть, веб, дисплей и прерывание захвата, ядро 1 - обработка */
+"if(j.cores){var cl=function(v){return df((v/10).toFixed(1)+' %',v>900?'bad':(v>700?'warn':'ok'))};"
+"h+=dR(L('Загрузка ядра 0 (сеть, веб, дисплей)','Core 0 load (network, web, display)'),cl(j.cores[0])+"
+"(j.isr!==undefined?' <span style=opacity:.6>'+L('+ прерывание захвата ','+ capture interrupt ')+(j.isr/10).toFixed(1)+' %</span>':''));"
+"h+=dR(L('Загрузка ядра 1 (обработка)','Core 1 load (processing)'),cl(j.cores[1]));"
+"if(j.tasks&&j.tasks.length)h+=dR(L('Самые занятые задачи','Busiest tasks'),j.tasks.map(function(t){"
+"return t[0]+' <span style=opacity:.6>('+L('ядро ','core ')+(t[1]==255?L('любое','any'):t[1])+')</span> '+(t[2]/10).toFixed(1)+' %'}).join(', '))}"
 /* такты процессора на отсчёт по этапам против бюджета 240 МГц / частота:
    видно, хватает ли ядра на эту частоту и что в обработке дороже всего */
 "if(j.cyc&&j.fhz){var bud=240e6/j.fhz,cs=(j.cyc[0]+j.cyc[1]+j.cyc[2])/100;"
@@ -2332,7 +2340,7 @@ static esp_err_t h_diag_data(httpd_req_t *r)
     int pclk_lvl = -1;
     adc_cap_dump_regs(&reg_ctrl, &reg_ctrl1, &pclk_lvl);
 
-    char buf[2600];
+    static char buf[3000];              /* запросы по одному - общий буфер */
     int n = snprintf(buf, sizeof(buf),
         "{\"enabled\":%s,\"flow\":%s,\"chunks\":%llu,\"samples\":%llu,"
         "\"rate\":%lu,\"exp\":%lu,\"err\":%ld,\"lost\":%llu,"
@@ -2378,6 +2386,14 @@ static esp_err_t h_diag_data(httpd_req_t *r)
         (unsigned long)pf.web_cnt[PROF_EP_SPEC],
         (unsigned long)pf.web_cnt[PROF_EP_SCOPE],
         (unsigned long)pf.web_cnt[PROF_EP_STAT]);
+    /* загрузка ядер и самые занятые задачи: [имя, ядро (255 - любое), промилле] */
+    n += snprintf(buf + n, sizeof(buf) - n, ",\"cores\":[%lu,%lu],\"isr\":%lu,\"tasks\":[",
+                  (unsigned long)pf.core_pm[0], (unsigned long)pf.core_pm[1],
+                  (unsigned long)pf.isr_pm);
+    for (uint32_t i = 0; i < pf.ntasks && n < (int)sizeof(buf) - 64; i++)
+        n += snprintf(buf + n, sizeof(buf) - n, "%s[\"%s\",%u,%u]", i ? "," : "",
+                      pf.tasks[i].name, (unsigned)pf.tasks[i].core, (unsigned)pf.tasks[i].pm);
+    n += snprintf(buf + n, sizeof(buf) - n, "]");
 
     /* Такты на отсчёт по этапам обработки спектра (x100) и частота АЦП:
      * страница сравнивает их с бюджетом 240 МГц / частота. */

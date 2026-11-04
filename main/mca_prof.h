@@ -41,6 +41,16 @@ void mca_prof_web_end(int ep);
 /* Раз в секунду из главной задачи: закрыть секунду и снять снимок. */
 void mca_prof_tick_1s(void);
 
+/* Самая занятая задача за секунду: имя, ядро (255 - любое) и доля времени
+ * ядра, промилле. Время прерываний счётчики FreeRTOS отдельно не видят - оно
+ * записывается той задаче, которую прерывание прервало. */
+#define PROF_TASKS 8
+typedef struct {
+    char     name[16];
+    uint8_t  core;
+    uint16_t pm;
+} mca_prof_task_t;
+
 typedef struct {
     uint32_t chunks;              /* чанков за секунду                  */
     uint32_t q_max;               /* пиковая глубина очереди            */
@@ -52,6 +62,12 @@ typedef struct {
     uint32_t lost_1s;             /* потеряно чанков за секунду         */
     uint32_t heap_now;            /* свободная внутренняя память        */
     uint32_t heap_min;            /* её минимум за всё время            */
+    uint32_t core_pm[2];          /* загрузка ядер 0 и 1, промилле:
+                                     1000 минус доля задачи простоя      */
+    uint32_t isr_pm;              /* прерывание захвата, доля ядра 0:
+                                     в core_pm[0] оно почти не видно     */
+    uint32_t ntasks;
+    mca_prof_task_t tasks[PROF_TASKS]; /* самые занятые, по убыванию   */
 } mca_prof_t;
 
 void mca_prof_get(mca_prof_t *out);

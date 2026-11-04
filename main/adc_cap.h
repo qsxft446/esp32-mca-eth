@@ -31,6 +31,14 @@ bool      adc_cap_is_running(void);
 size_t    adc_cap_snapshot(uint16_t *dst, size_t max_samples);
 
 /* Очередь готовых чанков для DSP-задачи. */
+/* Такты процессора, проведённые в прерывании захвата (с включения,
+ * 32 бита по кругу). Оно на ядре 0, и счётчики FreeRTOS записывают его
+ * время задаче, которую прервали, - чаще всего простою. */
+uint32_t adc_cap_isr_cycles(void);
+
+/* Буфер выданного чанка принадлежит обработке, пока DMA не дойдёт до него
+ * снова (через CAP_N_CHUNKS чанков): перед данными свободны
+ * CAP_HEAD_SAMPLES отсчётов, после - CAP_PAD_SAMPLES; туда можно писать. */
 bool      adc_cap_wait_chunk(const uint16_t **out, size_t *n, uint32_t ms);
 uint64_t  adc_cap_chunks_lost(void);
 uint64_t  adc_cap_chunks_total(void);

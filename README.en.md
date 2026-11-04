@@ -412,7 +412,10 @@ BecqMoni (answers to commands).
     statistics of the data lines, last-second profile (including processing
     busy time and CPU cycles per sample by stage — copy, difference,
     threshold and events — against the budget of 240 MHz / sample rate),
-    chunk loss log with the device mode, data-line check.
+    core 0 and core 1 load (from the FreeRTOS idle task) with the share of
+    the capture interrupt on core 0 (FreeRTOS counters do not see it — it is
+    counted separately) and the busiest tasks with their core, chunk loss log
+    with the device mode, data-line check.
 
 ![Single pulse](docs/scope-pulse.png)
 
@@ -558,6 +561,12 @@ the count rate. In the oscilloscope at 20 MHz the queue reaches 16/16 and
 losses happen (on the chunks where the window is captured). Hot-loop
 estimate (`tools/hotloop.py`): ~5.4 cycles per sample while waiting for an
 event (1.75 — vector difference, 3.6 — search).
+
+After 2026-11-04 (the chunk tail is moved with `memcpy`, not `memmove`; the
+chunk is processed right in the DMA buffer) at 20 MHz and ~4000 cps: 7.55
+cycles per sample of 12, processing 63 %, no losses; with convolution — 7.71
+and 64 %. It used to be 10.88 and 91 %. Details — “Findings from debugging”,
+“Processing core budget”.
 
 The page gets the frequency list from the firmware (`/cfg`, field `fl`),
 its own for each CLK generator. The frequency is stored in the device
@@ -923,6 +932,63 @@ pre-allocated memory.
 
   Gap — 5 % of accepted widths to 95 % of rejected. The tolerance (25–40 %)
   covers the narrower width of small pulses.
+
+### Processing core budget: memmove and the chunk copy
+
+Measurements 2026-11-04: 20 MHz, Ra-226, ~4000 cps, integration, window
+10 + 50, shape filter on; cycles per sample by stage from “Diagnostics”,
+90–120 s each, the spectrum reset before each run.
+
+| Build | Copy | Difference | Threshold and events | Total of 12 | Processing |
+|---|---|---|---|---|---|
+| before (`6e929fe`) | 1.43 | 2.15 | 7.29 | 10.88 | 90.7 % |
+| chunk in place | 0.29 | 2.20 | 5.06 | 7.55 | 63.0 % |
+| same, but always copying | 1.58 | 2.15 | 5.07 | 8.80 | 73.3 % |
+| same + old DMA buffers | 1.58 | 2.15 | 5.07 | 8.79 | 73.3 % |
+| chunk in place, tail via `memmove` | 0.29 | 2.20 | 7.29 | 9.78 | 81.6 % |
+
+- **Chunk copy.** Each chunk used to be copied whole from the DMA buffer into
+  the work buffer — 1.43 cycles per sample. Now the DMA buffers have room for
+  the previous chunk's tail (200 samples) before the data, and processing runs
+  right in them; only the tail is copied: 0.29. If the queue is already 12 of
+  16 (DMA will soon write into the same buffer) or pulses go down (they must
+  be inverted, and the DMA buffer is read by others) — the old path with a
+  copy.
+- **memmove.** An unexpected and the largest finding: the old move of the
+  tail to the start of the work buffer with `memmove` (400 bytes per chunk)
+  cost **2.2 cycles per sample** — almost a fifth of the budget at 20 MHz.
+  `memcpy` and `memmove` here come from the chip ROM, and the ROM `memmove` is
+  slow: with it “threshold and events” is 7.29, with `memcpy` 5.07, everything
+  else the same. Two misses on the way: it is not function inlining (in both
+  builds everything is in one function in internal instruction RAM) and not
+  the placement of the DMA buffers.
+- **The spectrum is the same**: scale ×1.0000, shape match 0.9999, count rates
+  by region within statistics, share rejected by the filter 18.9 → 19.0 %.
+
+### Core 0: headroom for moving work
+
+Core 0 runs the network (W5500), the web server, the display and the capture
+interrupt. With no pages open it is busy ~1 % with tasks and ~4 % with the
+capture interrupt (~9800 times per second at 20 MHz); with the shape filter
+card open (`/shape` 10 times per second) — ~14 %. Check: a temporary task on
+core 0 (priority above the web server) took a given share of the core, the
+page polled `/shape` 10 times per second, acquisition ran:
+
+| Added on core 0 | Core 0 total (+ interrupt) | `/shape` answer, median / 95 % | Chunk losses |
+|---|---|---|---|
+| 0 % | 14.0 % + 4.2 % | 57 / 60 ms | 0 |
+| 20 % | 32.7 % + 4.2 % | 58 / 62 ms | 0 |
+| 40 % | 52.8 % + 4.1 % | 60 / 64 ms | 0 |
+| 60 % | 71.0 % + 4.1 % | 61 / 64 ms | 0 |
+| 80 % | 87.7 % + 4.1 % | 60 / 66 ms | 0 |
+
+Neither the web server's answers, nor capture, nor processing on core 1
+suffered. Conclusion: core 0 has ~70 % of the core spare. Event processing
+(amplitude, shape filter, histogram) at 5000 cps is, by estimate (~1500–2700
+cycles per event), 3–6 % of a core, so it can be moved to core 0 with a large
+margin. But after the changes above core 1 already has ~4.4 cycles per sample
+spare at 20 MHz (63 %), so the move is needed only for a noticeably higher
+count rate or heavy event processing.
 
 ### Convolution with the reference: model versus device
 
