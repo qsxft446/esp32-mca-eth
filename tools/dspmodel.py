@@ -230,22 +230,35 @@ class DSP:
         for i in range(lo, hi + 1):
             if w[i] > mx:
                 mx, pk = w[i], i
-        a = pk - p.int_rise
-        if a - 32 < 0:                  # база - 32 отсчёта, как в прошивке
+        e = self.cross_pos - p.trap_L   # база - 32 отсчёта до «пробой - L»
+        if e - 32 < 0:
             return None
-        base32 = sum(w[a - 32:a])
+        base32 = sum(w[e - 32:e])
         base8 = base32 // 4
         h8 = mx * 8 - base8
         if h8 <= 0:
             return None
         c50 = pk
-        while c50 > a - 8 and w[c50 - 1] * 16 - 2 * base8 > h8:
+        while c50 > e and w[c50 - 1] * 16 - 2 * base8 > h8:
             c50 -= 1
         s0 = c50 - mid
-        if s0 < 0 or s0 + len(cr) > end:
+        if s0 < 0:
             return None
-        acc = sum((w[s0 + j] * 32 - base32) * cr[j] for j in range(len(cr)))
-        return acc * 256, 32 * r2, pk
+        n = len(cr)
+        if s0 + n > end:                # хвост за концом чанка - неполное окно
+            n = end - s0
+            if n <= self.ref_wave[1]:
+                return None
+            r2 = sum(r * r for r in cr[:n])
+            if r2 <= 0:
+                return None
+        acc = sum((w[s0 + j] * 32 - base32) * cr[j] for j in range(n))
+        # шкала интегрирования: среднее эталона по окну «до / после вершины»
+        pre = self.ref_wave[1]
+        win = [cr[j] for j in range(pre - p.int_rise, pre + p.int_fall + 1) if 0 <= j < len(cr)]
+        if sum(win) <= 0:
+            return None
+        return cdiv(acc * sum(win), len(win)), 32 * r2, pk
 
     def shape_check(self, tpk, end, num, den, cmp, filt, learn, ipk=-1, isum=0):
         """ipk >= 0 - вершину и сумму окна (isum, без вычета базы) уже
@@ -282,13 +295,18 @@ class DSP:
             if len(self.learn) < self.learn_need and not clip:
                 self.learn.append(min(w10, 32767))
                 self.learn_h.append(h8)
-                c50 = pk                # середина фронта, как в прошивке
-                while c50 > a - 8 and w[c50 - 1] * 16 - 2 * base8 > h8:
-                    c50 -= 1
-                for i in range(a - 8, b + 1):    # каждый своей высотой к 1, x1024
-                    j = i - c50 + WOFF
-                    self.wsum[j] += cdiv((w[i] * 8 - base8) * 1024, h8)
-                    self.wcnt[j] += 1
+                # средняя форма - с базой от «пробой - L», как у свёртки
+                e = self.cross_pos - p.trap_L
+                bx8 = sum(w[e - 32:e]) // 4 if e - 32 >= 0 else base8
+                hx8 = mx * 8 - bx8
+                if hx8 > 0:
+                    c50 = pk            # середина фронта, как в прошивке
+                    while c50 > e and c50 > a - 8 and w[c50 - 1] * 16 - 2 * bx8 > hx8:
+                        c50 -= 1
+                    for i in range(a - 8, b + 1):    # каждый своей высотой к 1, x1024
+                        j = i - c50 + WOFF
+                        self.wsum[j] += cdiv((w[i] * 8 - bx8) * 1024, hx8)
+                        self.wcnt[j] += 1
         ok = True
         if cmp:
             tol = p.shape_ref * p.shape_tol // 100

@@ -476,11 +476,17 @@ scaled to its height — large ones do not dominate.
 
 **Measurement method “convolution with the reference”** (after BecqMoni):
 the height is the one at which the reference pulse fits the pulse best; the
-baseline is 32 samples before the window. It needs a reference for this
-window and rate, without one the amplitude is computed by the trapezoid; a
-new reference clears the spectrum. **On this PMT it is worse than the
-trapezoid** — see “Findings from debugging”, “Convolution with the
-reference: model versus device”. Kept for checking on other detectors.
+baseline is 32 samples before the rise starts (ending L before the threshold
+crossing). The scale is that of integration: height × the mean of the
+reference over the “before / after peak” window, so switching between them
+does not stretch the spectrum. It needs a reference for this window and
+rate, without one the amplitude is computed by the trapezoid; a new
+reference clears the spectrum. If the tail of the reference does not fit in
+the chunk, the height is fitted on the part that does. On the noisy PMT of
+this device, after the baseline fix (2026-11-04), convolution is better than
+both integration and the trapezoid — see “Findings from debugging”,
+“Convolution with the reference: model versus device”. The reference is
+learned only from running acquisition: after a reboot press “Start” first.
 
 **Check on the device** (2026-11-04): noisy PMT, weak Cs-137 in a lead
 castle, 20 MHz, trapezoid L = 10, G = 51, threshold 16, tolerance 32 %; 333 s
@@ -1015,7 +1021,50 @@ count rate or heavy event processing.
   grows with the window: 10 codes over 26 µs, 18 over 1.6 ms) and the shape
   varies from pulse to pulse. Long-window methods (convolution, integration)
   pick this up, the trapezoid — a difference of two windows — does not. For
-  low-energy lines on this PMT the trapezoid is better.
+  low-energy lines on this PMT the trapezoid is better. *This assumption did
+  not hold — the cause is below.*
+- **Cause: the baseline lay on the rise** (analysis 2026-11-04 on 19 thousand
+  isolated pulses from raw scope frames, Ra-226, 20 MHz, window 10 + 50). The
+  convolution baseline was taken right before the “before peak” window, and
+  the rise of this PMT (~20 samples) is longer than that window (10): the
+  baseline lay on the rise and the height was underestimated by an amount
+  that depends on the rise shape — the reference started at −0.40 instead of
+  0. Main peak FWHM on these pulses: trapezoid 9.25 %, convolution as it was
+  11.75 % (8-sample baseline — 21 %, 64 — 9.5 %), with the baseline ending L
+  before the threshold crossing — 9.00 %. The threshold is crossed no later
+  than L samples after the rise starts, so such a baseline never touches the
+  rise whatever the window. The reference is now learned with the same
+  baseline.
+- **Spectrum stretch.** The convolution height is the pulse height, while
+  integration gives the mean over the window, about 0.6 of the height with a
+  10 + 50 window. So switching stretched the spectrum 1.5–2 times (device,
+  Ra-226: 1.62). Now convolution outputs height × the mean of the reference
+  over the integration window — what integration of a clean pulse of this
+  shape would give.
+- **Chunk end.** If the tail of the reference did not fit in the chunk, the
+  event was measured by the trapezoid — in its scale, and a second peak grew
+  above the real one (model, long rise: ~0.4 % of events, FWHM 6.30 % instead
+  of 0.45 %). Now the height is fitted on the part of the reference that fits
+  in the chunk.
+- Both cases are in `tools/test_dsp.py` (level 12, “long rise”); both checks
+  go red on the old code: baseline before the window — the reference differs
+  from the generator by 0.069, FWHM 2.93 % versus 0.62 % for the trapezoid;
+  fallback to the trapezoid — 6.30 %.
+- **Device after the fix** (2026-11-04, noisy PMT, Ra-226, ~4300 cps, 20 MHz,
+  L = 11, G = 37, threshold 16, window 10 + 36, shape filter on, tolerance
+  40 %, reference learned anew; 300 s each, spectrum reset before each run):
+
+  | Method | Main peak, channel | FWHM | Load | Chunk losses |
+  |---|---|---|---|---|
+  | trapezoid | 270.4 | 10.75 % | 63.5 % | 0 |
+  | integration | 215.7 | 10.00 % | 63.8 % | 0 |
+  | convolution with the reference | 225.1 | 9.50 % | 65.3 % | 0 |
+
+  Convolution to integration scale ×1.043 (both by the peak and by stretching
+  the whole spectrum; shape match 0.998). The remaining 4 % is an assumption:
+  the integration baseline (running average) slightly lowers the amplitude;
+  on the model the same integration gives 17.61 versus 18.85 with an exact
+  baseline.
 
 ### Other
 

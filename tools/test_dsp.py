@@ -824,10 +824,67 @@ for algo in (0, 2):
     res[algo] = (statistics.mean(a_), 235.5 * statistics.pstdev(a_) / statistics.mean(a_), len(a_))
 print(f"  высота 30 кодов: трапеция среднее {res[0][0]:.1f}, FWHM {res[0][1]:.2f} %; "
       f"свёртка среднее {res[2][0]:.1f}, FWHM {res[2][1]:.2f} % (событий {res[2][2]})")
-check("свёртка меряет высоту без смещения (30 кодов ±3 %)", abs(res[2][0] - 30) <= 0.9,
-      f"{res[2][0]:.2f}")
+pi_ = Params(**cfgc, algo=1)
+di_ = runc(s30, pi_)
+ai_ = [x for _, x in di_.events]
+mi_ = statistics.median(ai_)
+mi_ = statistics.mean([x for x in ai_ if abs(x - mi_) < 0.5 * mi_])
+# шкала интегрирования без ошибки базы: высота x среднее формы по окну 13 + 36
+# (у интегрирования в модели своя медленная база, при частых импульсах в неё
+# подмешиваются хвосты, и оно занижено - поэтому сравнение с расчётом)
+exp_ = 30 * w_true12 / 50
+print(f"  интегрирование тех же импульсов: среднее {mi_:.2f}; без ошибки базы - {exp_:.2f}")
+check("свёртка - в шкале интегрирования (высота x среднее формы по окну, ±3 %)",
+      abs(res[2][0] - exp_) <= 0.03 * exp_, f"{res[2][0]:.2f} против {exp_:.2f}")
 check("свёртка на малых высотах точнее трапеции (белый шум)", res[2][1] < 0.85 * res[0][1],
       f"{res[2][1]:.2f} % против {res[0][1]:.2f} %")
+# ---- длинный фронт (20 отсч.) при коротком окне «до вершины» (10): база
+# перед окном ложилась на фронт - у эталона в начале было -0.40 вместо 0,
+# свёртка проигрывала трапеции (прибор, 2026-11-04). База - от пробоя порога.
+cfgs = dict(cfgc, int_rise=10, int_fall=50)
+
+
+def slow(A, seed):
+    rm = random.Random(seed)
+    pm = [300 + k * 400 + rm.randint(0, 40) for k in range(500)]
+    sm = make_pulse_train(pm[-1] + 1000, [A] * 500, pm, fs_hz=FS12, rise_ns=1000, tau_us=2.5, clip=False)
+    gm = random.Random(seed + 1)
+    return [max(0, min(MCA_ADC_MAX, v + int(round(gm.gauss(0, 1.6))))) for v in sm]
+
+
+p_sl = Params(**cfgs)
+d_sl = DSP(p_sl)
+d_sl.start_learn()
+s_sl = slow(400, 31)
+for off in range(0, len(s_sl) - CAP_CHUNK_SAMPLES + 1, CAP_CHUNK_SAMPLES):
+    d_sl.process(s_sl[off:off + CAP_CHUNK_SAMPLES])
+d_sl.finish_learn()
+w_sl, pre_sl, mid_sl = d_sl.wave[0], d_sl.wave[1], d_sl.wave_mid
+# та же форма без шума: совмещение по середине фронта, как при наборе
+g_sl = make_pulse_train(400, [400], [100], fs_hz=FS12, rise_ns=1000, tau_us=2.5, clip=False)
+pk_sl = max(range(len(g_sl)), key=lambda i: (g_sl[i], -i))
+h_sl = g_sl[pk_sl] - 2048
+c_sl = pk_sl
+while (g_sl[c_sl - 1] - 2048) * 2 > h_sl:
+    c_sl -= 1
+dev_sl = max(abs(w_sl[j] / 1000 - (g_sl[c_sl - mid_sl + j] - 2048) / h_sl)
+             for j in range(min(len(w_sl), pre_sl + cfgs["int_fall"] + 1)))
+print(f"  длинный фронт: начало эталона {', '.join(f'{v / 1000:.3f}' for v in w_sl[:6])}, "
+      f"генератор {', '.join(f'{(g_sl[c_sl - mid_sl + j] - 2048) / h_sl:.3f}' for j in range(6))}")
+check("длинный фронт: эталон совпадает с формой генератора (до конца окна, < 0.03)",
+      dev_sl < 0.03, f"{dev_sl:.3f}")
+ref_sl = (d_sl.wave[0], d_sl.wave[1], d_sl.wave[2], d_sl.wave_mid)
+s_sl2 = slow(300, 41)
+fw_sl = {}
+for algo in (0, 2):
+    q_ = Params(**cfgs, algo=algo, shape_ref=p_sl.shape_ref, shape_win=p_sl.shape_win)
+    a_ = [x for _, x in runc(s_sl2, q_, ref_wave=ref_sl).events]
+    m_ = statistics.median(a_)
+    a_ = [x for x in a_ if abs(x - m_) < 0.5 * m_]
+    fw_sl[algo] = 235.5 * statistics.pstdev(a_) / statistics.mean(a_)
+print(f"  длинный фронт, 300 кодов: FWHM трапеция {fw_sl[0]:.2f} %, свёртка {fw_sl[2]:.2f} %")
+check("длинный фронт: свёртка не хуже трапеции", fw_sl[2] <= 1.1 * fw_sl[0],
+      f"{fw_sl[2]:.2f} % против {fw_sl[0]:.2f} %")
 p_w = Params(**cfg12, shape_on=1, shape_tol=25, shape_ref=p_l.shape_ref,
              shape_win=p_l.shape_win)
 p_w.int_fall = 30
