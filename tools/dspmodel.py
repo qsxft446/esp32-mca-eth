@@ -36,6 +36,10 @@ MCA_ADC_MAX = _D['MCA_ADC_MAX']
 _DS = _defines(os.path.join(os.path.dirname(_HDR), 'mca_dsp.h'))
 SHAPE_HB = _DS['SHAPE_HB']
 SHAPE_LEARN_N = _DS['SHAPE_LEARN_N']
+# средний импульс копится с совмещением по середине фронта (mca_dsp.c)
+SHAPE_WAVE_MAX = 8 + 200 + 400 + 1
+WOFF = 8 + 200
+WBUF = 2 * SHAPE_WAVE_MAX
 
 
 def cdiv(a, b):
@@ -124,10 +128,10 @@ class DSP:
         self.whist = [0] * SHAPE_HB   # гистограмма ширины
         self.whist_win = 0
         self.learn = []           # набранные ширины x10
-        self.wsum = []            # сумма импульсов набора над базой, x8
+        self.wsum = []            # сумма импульсов набора над базой, x8 (по ячейкам)
+        self.wcnt = []            # сколько импульсов легло в ячейку
         self.learn_need = 0
         self.learn_win = 0
-        self.learn_pre = 0
         self.wave = None          # эталонный импульс: (отсчёты x1000, вершина, импульсов)
         self.examples = [None, None]  # последние в допуске / вне: (отсчёты, вершина, высота, ширина x10)
         self.shape_chk = 0
@@ -169,8 +173,8 @@ class DSP:
         p = self.p
         self.learn = []
         self.learn_win = p.int_rise + p.int_fall + 1
-        self.learn_pre = 8 + p.int_rise
-        self.wsum = [0] * (self.learn_win + 8)
+        self.wsum = [0] * WBUF
+        self.wcnt = [0] * WBUF
         self.learn_need = SHAPE_LEARN_N
 
     def finish_learn(self):
@@ -179,9 +183,19 @@ class DSP:
         v = sorted(self.learn)
         n = len(v)
         p = self.p
-        top = self.wsum[self.learn_pre] if self.wsum[self.learn_pre] > 0 else 1
-        wv = [max(-32768, min(32767, cdiv(x * 1000, top))) for x in self.wsum]
-        self.wave = (wv, self.learn_pre, n)
+        cells = [j for j in range(WBUF) if self.wcnt[j] * 10 >= n * 9]
+        j0, j1 = (cells[0], cells[-1]) if cells else (0, -1)
+        j1 = min(j1, j0 + SHAPE_WAVE_MAX - 1)
+        pre, top = j0, 1
+        for j in range(j0, j1 + 1):
+            m = cdiv(self.wsum[j] * 1000, self.wcnt[j])
+            if m > top:
+                top, pre = m, j
+        wv = []
+        for j in range(j0, j1 + 1):
+            m = cdiv(self.wsum[j] * 1000, self.wcnt[j])
+            wv.append(max(-32768, min(32767, cdiv(m * 1000, top))))
+        self.wave = (wv, pre - j0, n)
         p.shape_ref = v[n // 2]
         p.shape_win = self.learn_win
         p.shape_hz = self.fclk or 0
@@ -218,8 +232,13 @@ class DSP:
         if learn and n == self.learn_win and num >= 3 * p.threshold * den:
             if len(self.learn) < self.learn_need:
                 self.learn.append(min(w10, 32767))
-                for j, i in enumerate(range(a - 8, b + 1)):
+                c50 = pk                # середина фронта, как в прошивке
+                while c50 > a - 8 and w[c50 - 1] * 16 - 2 * base8 > h8:
+                    c50 -= 1
+                for i in range(a - 8, b + 1):
+                    j = i - c50 + WOFF
                     self.wsum[j] += w[i] * 8 - base8
+                    self.wcnt[j] += 1
         ok = True
         if cmp:
             tol = p.shape_ref * p.shape_tol // 100

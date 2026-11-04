@@ -146,11 +146,20 @@ static uint32_t  s_shp_chk_pend, s_shp_rej_pend;
  * них. Итог досчитывает mca_dsp_shape_poll; s_learn_gen отличает набор,
  * начатый заново, от досчитываемого. */
 static int16_t  *s_learn;
-static int32_t   s_wsum[SHAPE_WAVE_MAX];   /* сумма импульсов над базой, x8 */
+/* Средний импульс копится с совмещением по середине фронта: отсчёт i
+ * импульса ложится в ячейку i - c50 + WOFF, где c50 - первый отсчёт фронта
+ * выше половины высоты. Раньше импульсы совмещались по своему максимуму: на
+ * широкой вершине его место шум бросает на ~13 отсчётов (замер 2026-11-04,
+ * 59 импульсов), и средний импульс получал излом слева от вершины, которого
+ * у самих импульсов нет. В ячейке - сумма и сколько импульсов в неё легло. */
+#define WOFF (8 + 200)
+#define WBUF (2 * SHAPE_WAVE_MAX)
+static int32_t   s_wsum[WBUF];             /* сумма импульсов над базой, x8 */
+static int16_t   s_wcnt[WBUF];
 static volatile int32_t s_learn_n, s_learn_need;
 static int32_t   s_req_learn;              /* под LOCK                      */
 static uint32_t  s_learn_gen;
-static int32_t   s_learn_win, s_learn_hz, s_learn_pre;  /* условия набора  */
+static int32_t   s_learn_win, s_learn_hz;  /* условия набора               */
 static int32_t   s_lp10, s_lp50, s_lp90;   /* итог последнего набора        */
 static mca_shape_wave_t s_wave;            /* эталонный импульс, под LOCK   */
 /* Примеры для страницы: [0] - в допуске, [1] - вне. Задача обработки
@@ -280,11 +289,11 @@ void mca_dsp_service(bool idle)
     if (rl == 1 && s_learn) {
         /* 2.4 КБ во внутренней памяти - микросекунды */
         memset(s_wsum, 0, sizeof(s_wsum));
+        memset(s_wcnt, 0, sizeof(s_wcnt));
         LOCK();
         s_learn_gen++;
         s_learn_n    = 0;
         s_learn_win  = s_par.int_rise + s_par.int_fall + 1;
-        s_learn_pre  = 8 + s_par.int_rise;
         s_learn_hz   = (int32_t)adc_clk_get_freq();
         s_learn_need = SHAPE_LEARN_N;
         UNLOCK();
@@ -456,14 +465,20 @@ static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
     s_whist[hb]++;
 
     /* эталон: только заметно выше порога, там шумовых всплесков мало;
-     * импульс копится в среднюю форму целиком - база и окно */
+     * импульс копится в среднюю форму целиком - база и окно, совмещённый
+     * по середине фронта */
     if (learn && s_learn && n == s_learn_win &&
         num >= (int64_t)3 * p->threshold * den) {
         const int32_t k = s_learn_n;
         if (k < s_learn_need) {
             s_learn[k] = (int16_t)(w10 > 32767 ? 32767 : w10);
-            for (int i = a - 8, j = 0; i <= b; i++, j++)
+            int c50 = pk;
+            while (c50 > a - 8 && s_work[c50 - 1] * 16 - 2 * base8 > h8) c50--;
+            for (int i = a - 8; i <= b; i++) {
+                const int j = i - c50 + WOFF;
                 s_wsum[j] += (int32_t)s_work[i] * 8 - base8;
+                s_wcnt[j]++;
+            }
             s_learn_n = k + 1;
         }
     }
@@ -1117,15 +1132,24 @@ bool mca_dsp_shape_poll(void)
     if (need <= 0 || n < need) return false;
     memcpy(v, s_learn, (size_t)n * sizeof(int16_t));
     qsort(v, (size_t)n, sizeof(int16_t), cmp_i16);
-    /* средний импульс - в тысячных от его вершины */
-    const int len = s_learn_win + 8, pre = s_learn_pre;
-    const int32_t top = s_wsum[pre] > 0 ? s_wsum[pre] : 1;
-    wv.len = (int16_t)len;
-    wv.pre = (int16_t)pre;
+    /* средний импульс - по ячейкам, куда легли не меньше 90 % импульсов
+     * (края окна у разных импульсов разные), в тысячных от его вершины */
+    int j0 = 0, j1 = -1;
+    for (int j = 0; j < WBUF; j++)
+        if (s_wcnt[j] * 10 >= n * 9) { if (j1 < 0) j0 = j; j1 = j; }
+    if (j1 - j0 + 1 > SHAPE_WAVE_MAX) j1 = j0 + SHAPE_WAVE_MAX - 1;
+    int pre = j0;
+    int64_t top = 1;
+    for (int j = j0; j <= j1; j++) {
+        const int64_t m = (int64_t)s_wsum[j] * 1000 / s_wcnt[j];
+        if (m > top) { top = m; pre = j; }
+    }
+    wv.len = (int16_t)(j1 >= j0 ? j1 - j0 + 1 : 0);
+    wv.pre = (int16_t)(pre - j0);
     wv.n   = (int16_t)n;
-    for (int i = 0; i < len; i++) {
-        int64_t x = (int64_t)s_wsum[i] * 1000 / top;
-        wv.v[i] = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
+    for (int j = j0; j <= j1; j++) {
+        const int64_t x = (int64_t)s_wsum[j] * 1000 / s_wcnt[j] * 1000 / top;
+        wv.v[j - j0] = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
     }
     bool ok = false;
     LOCK();

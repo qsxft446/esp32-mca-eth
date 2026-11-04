@@ -481,8 +481,10 @@ chunk losses, core load 84 % in both runs.
 
 ![Pulse shape: reference, accepted and rejected](docs/shape-filter-pulses.en.png)
 
-The reference is the mean of 2000 pulses: rise ~0.6 µs, decay to half in
-~1.3 µs. The rejected ones are the mean of 71 pulses, one per page request:
+The reference is the mean of 2000 pulses aligned at the middle of the rise
+(learned at 16 MHz; the examples at 20 MHz, the axis is in microseconds): a
+round top ~0.5 µs after the middle of the rise, decay to half another ~1.4 µs
+later. The rejected ones are the mean of 71 pulses, one per page request:
 rise ~0.4 µs, decay to half in ~0.45 µs; among them there are small ones at
 the threshold (20–30 codes) and tall ones, up to the top of the ADC. Where the
 tall fast pulses come from was not checked (an assumption — muons in the PMT
@@ -874,6 +876,32 @@ pre-allocated memory.
   acquisitions (filter with the map and without) gave no losses. The cause
   was not found. (This is on background; the losses with a source at 20 MHz
   are a different matter, see “What it costs”.)
+- **A kink at the reference top.** At first the reference was accumulated
+  with pulses aligned at their highest sample. Real pulses have a wide,
+  almost flat top (~10 samples within 0.97–1.00), and noise throws the
+  position of the maximum around: for 59 pulses from 0.7 to 13.8 samples after
+  the middle of the rise. The rise on the left is steep, the decay on the
+  right is gentle — the mean got a step left of the top (0.84 → 0.93 → 1.00)
+  that the pulses do not have. Now pulses are aligned at the first rise
+  sample above half the height: the top is smooth (0.961 → 0.983 → 0.995 →
+  1.000 → 0.997). The model does not reproduce the kink (all its pulses have
+  the same top), so it was checked on the device. This is display only: it
+  does not affect the filter decision.
+- **The height is the maximum, not a smoothed top.** The maximum of several
+  nearly equal samples is biased up by noise (~2 codes): for a 300-code
+  pulse this is under 1 %, for a 20–30-code pulse (barium X-ray) 7–10 %, and
+  small real pulses come out narrower. Smoothing the top would fix this, but
+  a check on 71 accepted and 71 rejected pulses showed worse separation: noise
+  bursts have a sharp top, and smoothing widens them more.
+
+  | Height from | Small accepted (<60 codes) | Rejected: 95 % / max | Gap |
+  |---|---|---|---|
+  | 1 sample (kept) | 23.0–35.2 | 19.7 / 22.4 | 1.35 |
+  | 3 samples | 25.2–35.6 | 22.2 / 26.9 | 1.24 |
+  | 5 samples | 26.4–36.3 | 23.1 / 31.6 | 1.21 |
+
+  Gap — 5 % of accepted widths to 95 % of rejected. The tolerance (25–40 %)
+  covers the narrower width of small pulses.
 
 ### Other
 
