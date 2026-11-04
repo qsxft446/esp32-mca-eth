@@ -755,10 +755,10 @@ static const char PAGE[] =
 "L('мёртвое','dead')+'</span> '+dt.toFixed(1)+'%</span>'+"
 "'<span class=sep>|</span><span><span class=mut>'+L('истинно','true')+'</span> '+"
 "(j.cps/Math.max(0.01,1-dt/100)).toFixed(0)+L(' имп/с',' cps')+'</span>'+"
-/* загрузка ядра 1 (обработка потока) - та же, что в «Диагностике»:
-   около 100% - не успевает, пойдут потерянные чанки */
-"'<span class=sep>|</span><span title=\"'+L('Загрузка ядра 1, на котором идёт обработка потока (как в «Диагностике»). '+"
-"'Около 100% - не успевает, пойдут потерянные чанки: снизьте частоту.','Load of core 1, which runs stream processing (as in “Diagnostics”). '+"
+/* загрузка обработки - та же, что в «Диагностике»: около 100% - не
+   успевает, пойдут потерянные чанки */
+"'<span class=sep>|</span><span title=\"'+L('Доля времени, когда обработка потока занята чанками (как в «Диагностике»). '+"
+"'Около 100% - не успевает, пойдут потерянные чанки: снизьте частоту.','Share of time stream processing is busy with chunks (as in “Diagnostics”). '+"
 "'Near 100% - it cannot keep up, chunks will be lost: lower the rate.')+'\"><span class=mut>'+L('загрузка','load')+'</span> '+"
 "((j.load||0)/10).toFixed(0)+'%</span>'+"
 /* векторная обработка не прошла самопроверку при старте - предупредить */
@@ -1195,12 +1195,15 @@ static esp_err_t h_stat(httpd_req_t *r)
     mca_ota_confirm();
     mca_stats_t s;
     mca_dsp_get_stats(&s);
-    /* load - загрузка ядра 1, где идёт обработка потока (1 минус доля
-     * задачи простоя FreeRTOS, за прошлую секунду): та же цифра, что в
-     * «Диагностике». Такты внутри обработки чанка (s.load_pm) её
-     * занижают: на 20 МГц 57 % против 76 % у ядра - задача обработки ещё
-     * принимает чанк из очереди, просыпается ~9800 раз в секунду и т.д.
-     * Потери начинаются, когда к 100 % подходит именно ядро. */
+    /* load - загрузка обработки: доля времени за прошлую секунду, когда
+     * задача обработки работает с чанками (от получения чанка до конца
+     * работы с ним), та же цифра, что в «Диагностике». Растёт вместе с
+     * работой и подходит к 100 %, когда начинаются потери.
+     * Не загрузка ядра 1 по FreeRTOS: та ещё включает ~3100 тактов на
+     * засыпание и пробуждение задачи на каждом чанке (замер 2026-11-05,
+     * 20 МГц: 76 % против 64 %), а под нагрузкой, когда чанк уже ждёт в
+     * очереди, этих тактов нет - получение стоит 375. И не такты внутри
+     * mca_dsp_process (s.load_pm, 57 %): без служебной работы вокруг. */
     mca_prof_t pf;
     mca_prof_get(&pf);
     char buf[600];
@@ -1220,7 +1223,7 @@ static esp_err_t h_stat(httpd_req_t *r)
         (unsigned long)adc_clk_get_freq(),
         /* run - набор спектра, srun - осциллограф, cap - сам захват АЦП */
         mca_spec_run ? 1 : 0, (unsigned long)s.run_ms,
-        (int)mca_mode, (unsigned long)pf.core_pm[1], mca_dsp_vec_ok() ? 1 : 0,
+        (int)mca_mode, (unsigned long)pf.busy_pm, mca_dsp_vec_ok() ? 1 : 0,
         mca_scope_run ? 1 : 0, adc_cap_is_running() ? 1 : 0,
         /* часы прибора: мс Unix-времени (0 - не заданы) и откуда время */
         (long long)mca_time_now_ms(), (int)mca_time_source(),
@@ -2126,15 +2129,17 @@ SUB_HEAD("Диагностика", "Diagnostics") SUB_NAV(N_SET, N_DIAG_ON, N_HE
 "(p.wmax[k]/1000).toFixed(1)+L(' мс',' ms'));"
 "h+=dR(L('Свободно внутр. памяти','Free internal memory'),(p.heap/1024).toFixed(0)+L(' КБ (минимум ',' KB (minimum ')+"
 "(p.hmin/1024).toFixed(0)+L(' КБ)',' KB)'));"
-/* загрузка ядер (1000 минус доля задачи простоя) и самые занятые задачи:
-   ядро 0 - сеть, веб, дисплей и прерывание захвата, ядро 1 - обработка.
-   Жёлтое - с 85 %: на 20 МГц без потерь ядро 1 занято на ~75-82 %
-   (замеры 2026-11-04/05), потери - когда оно подходит к 100 % */
+/* загрузка обработки на ядре 1 - доля времени в работе с чанками (та же,
+   что в строке состояния спектра; около 100 % - потери), ядро 0 - сеть,
+   веб, дисплей и прерывание захвата (1000 минус доля задачи простоя), и
+   самые занятые задачи, кроме обработки: у неё FreeRTOS считает и
+   засыпание-пробуждение на каждом чанке, которого под нагрузкой нет */
 "if(j.cores){var cl=function(v){return df((v/10).toFixed(1)+' %',v>950?'bad':(v>850?'warn':'ok'))};"
 "h+=dR(L('Загрузка ядра 0 (сеть, веб, дисплей)','Core 0 load (network, web, display)'),cl(j.cores[0])+"
 "(j.isr!==undefined?' <span style=opacity:.6>'+L('+ прерывание захвата ','+ capture interrupt ')+(j.isr/10).toFixed(1)+' %</span>':''));"
-"h+=dR(L('Загрузка ядра 1 (обработка)','Core 1 load (processing)'),cl(j.cores[1]));"
-"if(j.tasks&&j.tasks.length)h+=dR(L('Самые занятые задачи','Busiest tasks'),j.tasks.map(function(t){"
+"h+=dR(L('Загрузка обработки (ядро 1)','Processing load (core 1)'),cl(p.busy));"
+"var tk=(j.tasks||[]).filter(function(t){return t[0]!='dsp'});"
+"if(tk.length)h+=dR(L('Самые занятые задачи','Busiest tasks'),tk.map(function(t){"
 "return t[0]+' <span style=opacity:.6>('+L('ядро ','core ')+(t[1]==255?L('любое','any'):t[1])+')</span> '+(t[2]/10).toFixed(1)+' %'}).join(', '))}"
 /* такты процессора на отсчёт по этапам против бюджета 240 МГц / частота:
    видно, хватает ли ядра на эту частоту и что в обработке дороже всего */
@@ -2666,8 +2671,8 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "ошибки, жёлтые &mdash; предупреждения, тег окрашен по подсистеме (АЦП, сеть, прошивка...); "
 "галочки уровней и подсистем скрывают лишнее, «Сохранить» пишет лог в файл. Лог виден и тогда, когда консоль молчит из-за эмуляции MCA на "
 "COM. <b>Диагностика АЦП</b> &mdash; поток отсчётов и его реальная скорость, регистры "
-"камерного интерфейса, профиль за последнюю секунду (загрузка ядер &mdash; та же, что в "
-"строке состояния спектра, такты на отсчёт, запросы, память), журнал потерь чанков, побитовая статистика линий данных "
+"камерного интерфейса, профиль за последнюю секунду (загрузка обработки &mdash; та же, что в "
+"строке состояния спектра, загрузка ядра 0, такты на отсчёт, запросы, память), журнал потерь чанков, побитовая статистика линий данных "
 "и их проверка.</td></tr>"
 "</table></div>"
 
@@ -2849,8 +2854,8 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "yellow &mdash; warnings, the tag is coloured by subsystem (ADC, network, firmware...); "
 "the level and subsystem checkboxes hide what is not needed, “Save” writes the log to a file. The log is visible even when the console is silent because of MCA emulation "
 "on COM. <b>ADC diagnostics</b> &mdash; the sample stream and its real rate, camera "
-"interface registers, the last-second profile (core load &mdash; the same as in the spectrum "
-"status line, cycles per "
+"interface registers, the last-second profile (processing load &mdash; the same as in the spectrum "
+"status line, core 0 load, cycles per "
 "sample, requests, memory), the chunk loss log, per-bit statistics of the data lines "
 "and their check.</td></tr>"
 "</table></div>"
