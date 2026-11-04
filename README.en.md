@@ -456,7 +456,23 @@ width and shape), tick “filter on”. The default tolerance is 25 %. The
 reference is valid for the “before / after peak” window and the ADC rate it
 was learned at; if they change, the filter passes everything and asks to
 learn the reference again. The card shows the reference pulse with the last
-accepted and rejected ones and a width histogram with the tolerance band.
+accepted and rejected ones and a width histogram with the tolerance band;
+while the reference is being learned, the mean pulse is redrawn as it goes
+(on the device the shape settled by ~130 pulses).
+
+**Which pulses go into the reference** — like reference recording in
+BecqMoni: the line “reference: height from … to … codes, pulses …” (0 — above
+three thresholds / no upper limit; defaults 0, 0, 2000). Clipped pulses (top
+cut by the ADC limit) never go into the reference. Each pulse enters the mean
+scaled to its height — large ones do not dominate.
+
+**Measurement method “convolution with the reference”** (after BecqMoni):
+the height is the one at which the reference pulse fits the pulse best; the
+baseline is 32 samples before the window. It needs a reference for this
+window and rate, without one the amplitude is computed by the trapezoid; a
+new reference clears the spectrum. **On this PMT it is worse than the
+trapezoid** — see “Findings from debugging”, “Convolution with the
+reference: model versus device”. Kept for checking on other detectors.
 
 **Check on the device** (2026-11-04): noisy PMT, weak Cs-137 in a lead
 castle, 20 MHz, trapezoid L = 10, G = 51, threshold 16, tolerance 32 %; 333 s
@@ -902,6 +918,33 @@ pre-allocated memory.
 
   Gap — 5 % of accepted widths to 95 % of rejected. The tolerance (25–40 %)
   covers the narrower width of small pulses.
+
+### Convolution with the reference: model versus device
+
+- **Model** (white noise 1.6 codes, identical pulses, L = 10, G = 51, window
+  13 + 36): FWHM at 30 codes — trapezoid 5.64 %, convolution with an 8-sample
+  baseline 7.04 %, 16 — 5.28 %, 32 — 4.18 %, 64 — 3.52 %; at 400 codes
+  0.72 % versus ~0.85 %. The BecqMoni variant — a zero-mean reference, no
+  baseline needed — 2.81 % at 400 codes and 6.82 % at 30. A 32-sample baseline
+  was chosen.
+- **Device** (2026-11-04, noisy PMT, Cs-137 in a lead castle, 20 MHz, L = 10,
+  G = 51, window 13 + 36, shape filter on, 331 s each, reference 34.4 samples
+  from 2000 pulses):
+
+  | Method | 662 keV peak, FWHM | Ba X-ray 32 keV, peak / valley |
+  |---|---|---|
+  | integration | 8.74 % | 0.94 (no peak) |
+  | convolution with the reference | 11.05 % | 0.90 (no peak) |
+  | trapezoid | 9.61 % | 2.20 |
+
+  No chunk losses, load 84.3–84.5 % in all three. On the device convolution is
+  worse both at 662 keV and at the threshold — the model did not show this.
+  An assumption (not checked): the model has white noise and identical
+  pulses, while the real baseline wanders slowly by a few codes (the swing
+  grows with the window: 10 codes over 26 µs, 18 over 1.6 ms) and the shape
+  varies from pulse to pulse. Long-window methods (convolution, integration)
+  pick this up, the trapezoid — a difference of two windows — does not. For
+  low-energy lines on this PMT the trapezoid is better.
 
 ### Other
 

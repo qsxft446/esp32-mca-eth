@@ -756,6 +756,78 @@ check("интегрирование: эталон тот же (±5 % от фор
 check("интегрирование: убрано не меньше 95 % всплесков, оставлено не меньше 99 % сцинтилляций",
       ai > 0 and bi <= 0.05 * ai and ci > 0 and ei >= 0.99 * ci,
       f"всплесков осталось {bi} из {ai}, сцинтилляций {ei} из {ci}")
+# ---- отбор импульсов в эталон (как запись эталона в BecqMoni)
+p_n = Params(**cfg12, shape_ln=500)
+d_n = run12(p_n, learn=True)
+check("в эталон берётся заданное число импульсов (500)", len(d_n.learn) == 500, f"{len(d_n.learn)}")
+p_r = Params(**cfg12, shape_lmin=300, shape_lmax=700)
+d_r = run12(p_r, learn=True)
+hr = [h / 8 for h in d_r.learn_h]
+check("в эталон - только высоты от 300 до 700 кодов",
+      len(hr) > 100 and min(hr) >= 300 and max(hr) <= 700,
+      f"взято {len(hr)}, высоты {min(hr):.0f}-{max(hr):.0f}" if hr else "не взято ни одного")
+# зашкалившие (вершина срезана верхом АЦП) в эталон не идут
+rc = random.Random(21)
+pc = [300 + k * 320 + rc.randint(0, 40) for k in range(300)]
+ac = [2500 if k % 3 == 0 else 400 for k in range(300)]
+sc = make_pulse_train(pc[-1] + 1000, ac, pc, fs_hz=FS12, rise_ns=500, tau_us=2.5)
+gc = random.Random(22)
+sc = [max(0, min(MCA_ADC_MAX, v + int(round(gc.gauss(0, 1.6))))) for v in sc]
+d_c = DSP(Params(**cfg12))
+d_c.start_learn()
+for off in range(0, len(sc) - CAP_CHUNK_SAMPLES + 1, CAP_CHUNK_SAMPLES):
+    d_c.process(sc[off:off + CAP_CHUNK_SAMPLES])
+hc = [h / 8 for h in d_c.learn_h]
+check("зашкалившие импульсы в эталон не берутся",
+      len(hc) > 150 and max(hc) < 1000, f"взято {len(hc)}, наибольшая высота {max(hc):.0f}" if hc else "не взято ни одного")
+
+# ---- амплитуда свёрткой с эталоном: моноэнергетические импульсы, шум 1.6
+# кода, настройки как на приборе (L = 10, G = 51); эталон - с импульсов 400
+# кодов. Свёртка должна мерить высоту без смещения и при белом шуме быть
+# точнее трапеции на малых высотах. На приборе (шум не белый, форма от
+# импульса к импульсу разная) вышло наоборот - см. README.
+cfgc = dict(threshold=8, trap_L=10, trap_G=51, rearm=23, search=56, int_rise=13, int_fall=36,
+            cpc=1000, nch=2048)
+
+
+def mono(A, seed):
+    rm = random.Random(seed)
+    pm = [300 + k * 320 + rm.randint(0, 40) for k in range(600)]
+    sm = make_pulse_train(pm[-1] + 1000, [A] * 600, pm, fs_hz=FS12, rise_ns=500, tau_us=2.5, clip=False)
+    gm = random.Random(seed + 1)
+    return [max(0, min(MCA_ADC_MAX, v + int(round(gm.gauss(0, 1.6))))) for v in sm]
+
+
+def runc(sig, p, **kw):
+    d = DSP(p, **kw)
+    for off in range(0, len(sig) - CAP_CHUNK_SAMPLES + 1, CAP_CHUNK_SAMPLES):
+        d.process(sig[off:off + CAP_CHUNK_SAMPLES])
+    return d
+
+
+p_cl = Params(**cfgc)
+d_cl = DSP(p_cl)
+d_cl.start_learn()
+s400 = mono(400, 9)
+for off in range(0, len(s400) - CAP_CHUNK_SAMPLES + 1, CAP_CHUNK_SAMPLES):
+    d_cl.process(s400[off:off + CAP_CHUNK_SAMPLES])
+d_cl.finish_learn()
+refc = (d_cl.wave[0], d_cl.wave[1], d_cl.wave[2], d_cl.wave_mid)
+s30 = mono(30, 3)
+res = {}
+for algo in (0, 2):
+    pc_ = Params(**cfgc, algo=algo, shape_ref=p_cl.shape_ref, shape_win=p_cl.shape_win)
+    d_ = runc(s30, pc_, ref_wave=refc)
+    a_ = [x for _, x in d_.events]
+    m_ = statistics.median(a_)
+    a_ = [x for x in a_ if abs(x - m_) < 0.5 * m_]
+    res[algo] = (statistics.mean(a_), 235.5 * statistics.pstdev(a_) / statistics.mean(a_), len(a_))
+print(f"  высота 30 кодов: трапеция среднее {res[0][0]:.1f}, FWHM {res[0][1]:.2f} %; "
+      f"свёртка среднее {res[2][0]:.1f}, FWHM {res[2][1]:.2f} % (событий {res[2][2]})")
+check("свёртка меряет высоту без смещения (30 кодов ±3 %)", abs(res[2][0] - 30) <= 0.9,
+      f"{res[2][0]:.2f}")
+check("свёртка на малых высотах точнее трапеции (белый шум)", res[2][1] < 0.85 * res[0][1],
+      f"{res[2][1]:.2f} % против {res[0][1]:.2f} %")
 p_w = Params(**cfg12, shape_on=1, shape_tol=25, shape_ref=p_l.shape_ref,
              shape_win=p_l.shape_win)
 p_w.int_fall = 30

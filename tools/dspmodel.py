@@ -79,6 +79,10 @@ class Params:
         self.shape_ref = 0
         self.shape_win = 0
         self.shape_hz = 0
+        # какие импульсы брать в эталон (как запись эталона в BecqMoni)
+        self.shape_lmin = 0
+        self.shape_lmax = 0
+        self.shape_ln = SHAPE_LEARN_N
         self.__dict__.update(kw)
 
 
@@ -88,7 +92,8 @@ class DSP:
        guard_end=True - запрет чтения за концом свежих данных."""
 
     def __init__(self, p, rebase=True, guard_end=False, vec=False,
-                 word_invert=False, fclk=None, shape_watch=False):
+                 word_invert=False, fclk=None, shape_watch=False,
+                 ref_wave=None):
         """vec         - как в прошивке: разность трапеции d для всего
                          чанка заранее, в 16-битной арифметике с насыщением
                          (векторные команды), цикл ожидания восьмёрками с
@@ -124,6 +129,10 @@ class DSP:
         # фильтр формы
         self.fclk = fclk
         self.shape_watch = shape_watch
+        # эталон для свёртки (algo = 2): (отсчёты x1000, вершина, импульсов,
+        # середина фронта) - как s_wave в прошивке
+        self.ref_wave = ref_wave
+        self.learn_h = []         # высоты импульсов, взятых в эталон, x8
         self.cross_pos = 0
         self.whist = [0] * SHAPE_HB   # гистограмма ширины
         self.whist_win = 0
@@ -175,15 +184,12 @@ class DSP:
         self.learn_win = p.int_rise + p.int_fall + 1
         self.wsum = [0] * WBUF
         self.wcnt = [0] * WBUF
-        self.learn_need = SHAPE_LEARN_N
+        self.learn_need = p.shape_ln
+        self.learn_h = []
 
-    def finish_learn(self):
-        """Как mca_dsp_shape_poll: медиана - в эталон, средний импульс -
-        в тысячных от его вершины. Модель берёт столько, сколько набрано."""
-        v = sorted(self.learn)
-        n = len(v)
-        p = self.p
-        cells = [j for j in range(WBUF) if self.wcnt[j] * 10 >= n * 9]
+    def build_wave(self, n):
+        """Как build_wave в прошивке: (отсчёты x1000, вершина, n, середина)."""
+        cells = [j for j in range(WBUF) if self.wcnt[j] > 0 and self.wcnt[j] * 10 >= n * 9]
         j0, j1 = (cells[0], cells[-1]) if cells else (0, -1)
         j1 = min(j1, j0 + SHAPE_WAVE_MAX - 1)
         pre, top = j0, 1
@@ -195,18 +201,57 @@ class DSP:
         for j in range(j0, j1 + 1):
             m = cdiv(self.wsum[j] * 1000, self.wcnt[j])
             wv.append(max(-32768, min(32767, cdiv(m * 1000, top))))
-        self.wave = (wv, pre - j0, n)
+        return (wv, pre - j0, n, WOFF - j0)
+
+    def finish_learn(self):
+        """Как mca_dsp_shape_poll: медиана - в эталон, средний импульс -
+        в тысячных от его вершины. Модель берёт столько, сколько набрано."""
+        v = sorted(self.learn)
+        n = len(v)
+        p = self.p
+        wv, pre, _, mid = self.build_wave(n)
+        self.wave = (wv, pre, n)
+        self.wave_mid = mid
         p.shape_ref = v[n // 2]
         p.shape_win = self.learn_win
         p.shape_hz = self.fclk or 0
         self.learn_need = 0
         return v[n // 10], v[n // 2], v[n * 9 // 10]
 
+    def amp_conv(self, peak_pos, end):
+        """Порт amp_conv: (num, den, вершина) или None - окно не легло."""
+        p, w = self.p, self.w
+        wv, _, _, mid = self.ref_wave
+        cr = [cdiv(v * 256, 1000) for v in wv]
+        r2 = sum(r * r for r in cr)
+        lo = max(peak_pos - p.trap_L - p.trap_G, self.cross_pos - p.trap_L, 1)
+        hi = min(peak_pos + 4, end - 1)
+        mx, pk = -1, lo
+        for i in range(lo, hi + 1):
+            if w[i] > mx:
+                mx, pk = w[i], i
+        a = pk - p.int_rise
+        if a - 32 < 0:                  # база - 32 отсчёта, как в прошивке
+            return None
+        base32 = sum(w[a - 32:a])
+        base8 = base32 // 4
+        h8 = mx * 8 - base8
+        if h8 <= 0:
+            return None
+        c50 = pk
+        while c50 > a - 8 and w[c50 - 1] * 16 - 2 * base8 > h8:
+            c50 -= 1
+        s0 = c50 - mid
+        if s0 < 0 or s0 + len(cr) > end:
+            return None
+        acc = sum((w[s0 + j] * 32 - base32) * cr[j] for j in range(len(cr)))
+        return acc * 256, 32 * r2, pk
+
     def shape_check(self, tpk, end, num, den, cmp, filt, learn, ipk=-1, isum=0):
         """ipk >= 0 - вершину и сумму окна (isum, без вычета базы) уже
         нашло интегрирование, как в прошивке."""
         p, w = self.p, self.w
-        if ipk >= 0:
+        if ipk >= 0:                    # isum < 0 - сумму считаем здесь (свёртка)
             pk, mx = ipk, w[ipk]
         else:
             lo = max(self.cross_pos - p.trap_L, 1)
@@ -219,7 +264,7 @@ class DSP:
         if a - 8 < 0 or b >= end:
             return True
         base8 = sum(w[a - 8:a])
-        ssum = isum if ipk >= 0 else sum(w[a:b + 1])
+        ssum = isum if (ipk >= 0 and isum >= 0) else sum(w[a:b + 1])
         n = b - a + 1
         h8 = mx * 8 - base8
         s8 = ssum * 8 - n * base8
@@ -229,15 +274,20 @@ class DSP:
             self.whist = [0] * SHAPE_HB
             self.whist_win = n
         self.whist[min(w10 * SHAPE_HB // (10 * n), SHAPE_HB - 1)] += 1
-        if learn and n == self.learn_win and num >= 3 * p.threshold * den:
-            if len(self.learn) < self.learn_need:
+        if (learn and n == self.learn_win and h8 > 0 and
+                (h8 >= p.shape_lmin * 8 if p.shape_lmin > 0
+                 else num >= 3 * p.threshold * den) and
+                (p.shape_lmax <= 0 or h8 <= p.shape_lmax * 8)):
+            clip = any(w[i] >= MCA_ADC_MAX - 1 or w[i] == 0 for i in range(a - 8, b + 1))
+            if len(self.learn) < self.learn_need and not clip:
                 self.learn.append(min(w10, 32767))
+                self.learn_h.append(h8)
                 c50 = pk                # середина фронта, как в прошивке
                 while c50 > a - 8 and w[c50 - 1] * 16 - 2 * base8 > h8:
                     c50 -= 1
-                for i in range(a - 8, b + 1):
+                for i in range(a - 8, b + 1):    # каждый своей высотой к 1, x1024
                     j = i - c50 + WOFF
-                    self.wsum[j] += w[i] * 8 - base8
+                    self.wsum[j] += cdiv((w[i] * 8 - base8) * 1024, h8)
                     self.wcnt[j] += 1
         ok = True
         if cmp:
@@ -290,6 +340,8 @@ class DSP:
         swin = p.int_rise + p.int_fall + 1
         hz_ok = self.fclk is None or p.shape_hz == self.fclk
         shape_cmp = p.shape_ref > 0 and p.shape_win == swin and hz_ok
+        conv_ok = (p.algo == 2 and self.ref_wave is not None and
+                   len(self.ref_wave[0]) > 0 and shape_cmp)
         shape_filt = shape_cmp and p.shape_on
         shape_learn = self.learn_need > 0
         shape_need = shape_filt or shape_learn or self.shape_watch
@@ -396,6 +448,9 @@ class DSP:
                                 self.peak_pos, p.int_rise, p.int_fall,
                                 L, G, ib)
                             ipk, isum = self.int_pk, num + den * ib
+                        elif conv_ok and self.amp_conv(self.peak_pos, end) is not None:
+                            num, den, ipk = self.amp_conv(self.peak_pos, end)
+                            isum = -1
                         else:
                             num, den = self.peak, L
                         if (not shape_need or

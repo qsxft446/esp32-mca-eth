@@ -1267,6 +1267,9 @@ static esp_err_t h_cfg(httpd_req_t *r)
         q_int(q, "pileup_post_pct", &p.pileup_post_pct);
         q_int(q, "shape_on",        &p.shape_on);
         q_int(q, "shape_tol",       &p.shape_tol);
+        q_int(q, "shape_lmin",      &p.shape_lmin);
+        q_int(q, "shape_lmax",      &p.shape_lmax);
+        q_int(q, "shape_ln",        &p.shape_ln);
         mca_dsp_set_params(&p);
         mca_dsp_get_params(&p);
 
@@ -1285,6 +1288,7 @@ static esp_err_t h_cfg(httpd_req_t *r)
         "\"flat_avg\":%ld,"
         "\"pileup_pre_pct\":%ld,"
         "\"pileup_post_pct\":%ld,\"shape_on\":%ld,\"shape_tol\":%ld,"
+        "\"shape_lmin\":%ld,\"shape_lmax\":%ld,\"shape_ln\":%ld,"
         "\"shape_ref\":%ld,\"shape_win\":%ld,\"shape_hz\":%ld,"
         "\"emu\":%lu,\"fl\":[",
         (long)p.threshold, (long)p.cpc_milli, (long)p.nch,
@@ -1295,6 +1299,7 @@ static esp_err_t h_cfg(httpd_req_t *r)
         (long)p.flat_avg,
         (long)p.pileup_pre_pct,
         (long)p.pileup_post_pct, (long)p.shape_on, (long)p.shape_tol,
+        (long)p.shape_lmin, (long)p.shape_lmax, (long)p.shape_ln,
         (long)p.shape_ref, (long)p.shape_win, (long)p.shape_hz,
         (unsigned long)mca_emu_baud());
     /* snprintf возвращает длину, которая ПОТРЕБОВАЛАСЬ БЫ. При нехватке
@@ -1651,6 +1656,11 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "<div class=grp style='margin:8px 0'>"
 "<label><input type=checkbox id=sh_on onchange=shSet()> <span data-en='filter on'>фильтр включён</span></label>"
 "<label><span data-en='tolerance, %'>допуск, %</span> <input id=sh_tol type=number min=1 max=200 style=width:70px onchange=shSet()></label>"
+"<label title='какие импульсы брать в эталон, как запись эталона в BecqMoni: высота от / до в кодах (0 - выше трёх порогов / без верхней границы; зашкалившие не берутся никогда) и сколько импульсов' "
+"data-en-title='which pulses go into the reference, like reference recording in BecqMoni: height from / to in codes (0 - above three thresholds / no upper limit; clipped pulses are never taken) and how many pulses'>"
+"<span data-en='reference: height from'>в эталон: высота от</span> <input id=sh_lmin type=number min=0 max=4095 style=width:70px onchange=shSet()> "
+"<span data-en='to'>до</span> <input id=sh_lmax type=number min=0 max=4095 style=width:70px onchange=shSet()> "
+"<span data-en='codes, pulses'>кодов, импульсов</span> <input id=sh_ln type=number min=100 max=2000 step=100 style=width:80px onchange=shSet()></label>"
 "<button class='btn green sm' onclick=shLearn() id=sh_lb></button>"
 "<button class='btn sm' onclick=shClr() data-en='Clear histogram'>Очистить гистограмму</button></div>"
 "<div id=sh_st class=n style=line-height:1.6></div>"
@@ -1723,7 +1733,7 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 /* пометка только у параметров одного способа; без пометки - действует всегда */
 "var BDG={t:[L('трапеция','trapezoid'),'t'],i:[L('интегрирование','integration'),'i']};"
 /* поля выпадающими меню: значение и подпись */
-"var SEL={algo:[['0',L('трапеция','trapezoid')],['1',L('интегрирование','integration')]],"
+"var SEL={algo:[['0',L('трапеция','trapezoid')],['1',L('интегрирование','integration')],['2',L('свёртка с эталоном','convolution with the reference')]],"
 "nch:[['2048','2048'],['4096','4096'],['8192','8192']],"
 "emu:[['0',L('выключена','off')],['38400','38400'],['115200','115200'],['460800','460800'],"
 "['600000','600000'],['921600','921600']]};"
@@ -1734,8 +1744,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "'ADC sample rate. Higher - more detailed pulse shape, but processing may not keep up: watch lost chunks on the “Diagnostics” page. Measured on this board (about 3500 cps), spectrum processing takes about 70 % of the core at 16 MHz and about 90 % at 20 MHz; with a higher count rate the load is higher. Filter parameters are set in samples, so at another rate the same L or G is a different time.'),"
 "polarity:L('0 - импульсы вверх от базовой линии, 1 - вниз (например, анод ФЭУ напрямую). При 1 сигнал переворачивается ещё до обработки, и порог и спектр работают как с импульсами вверх; осциллограф синхронизируется по фронту вниз. Постоянная составляющая сигнала на обработку не влияет - её вычитает трапеция.',"
 "'0 - pulses go up from the baseline, 1 - down (for example, PMT anode directly). With 1 the signal is inverted before processing, so the threshold and spectrum work as with upward pulses; the oscilloscope triggers on a falling edge. A DC offset of the signal does not affect processing - the trapezoid subtracts it.'),"
-"algo:L('Трапеция: амплитуда по вершине трапеции (окно L, зазор G, по желанию среднее по плато). Интегрирование: среднее отсчётов импульса вокруг вершины за вычетом базовой линии (до и после вершины, база 2^N, окно базы). Поля, которые при выбранном способе ни на что не влияют, в таблице приглушены. Обнаружение события в обоих способах одинаковое - по выходу трапеции, поэтому L, G, порог, гистерезис, перезапуск и поиск пика нужны всегда. Масштабы способов различаются - после переключения подберите «Кодов на канал». Смена способа очищает спектр.',"
-"'Trapezoid: amplitude from the trapezoid top (window L, gap G, optionally flat-top average). Integration: mean of the pulse samples around the peak minus the baseline (before and after peak, baseline 2^N, baseline window). Fields that have no effect with the selected method are dimmed in the table. Event detection is the same for both methods - on the trapezoid output, so L, G, threshold, hysteresis, re-arm and peak search are always needed. The methods have different scales - after switching, adjust “Codes per channel”. Changing the method clears the spectrum.'),"
+"algo:L('Трапеция: амплитуда по вершине трапеции (окно L, зазор G, по желанию среднее по плато). Интегрирование: среднее отсчётов импульса вокруг вершины за вычетом базовой линии (до и после вершины, база 2^N, окно базы). Свёртка с эталоном: высота, при которой эталонный импульс фильтра формы лучше всего ложится на импульс - в неё идёт весь импульс, каждый отсчёт с весом своей доли сигнала (так берёт высоту BecqMoni для звуковой карты); нужен набранный эталон на этом окне «до / после вершины» и этой частоте, без него амплитуда считается трапецией; новый эталон очищает спектр. Поля, которые при выбранном способе ни на что не влияют, в таблице приглушены. Обнаружение события в обоих способах одинаковое - по выходу трапеции, поэтому L, G, порог, гистерезис, перезапуск и поиск пика нужны всегда. Масштабы способов различаются - после переключения подберите «Кодов на канал». Смена способа очищает спектр.',"
+"'Trapezoid: amplitude from the trapezoid top (window L, gap G, optionally flat-top average). Integration: mean of the pulse samples around the peak minus the baseline (before and after peak, baseline 2^N, baseline window). Convolution with the reference: the height at which the shape-filter reference pulse fits the pulse best - the whole pulse goes into it, each sample weighted by its share of the signal (this is how BecqMoni takes the height for a sound card); it needs a learned reference for this “before / after peak” window and this rate, without one the amplitude is computed by the trapezoid; a new reference clears the spectrum. Fields that have no effect with the selected method are dimmed in the table. Event detection is the same for both methods - on the trapezoid output, so L, G, threshold, hysteresis, re-arm and peak search are always needed. The methods have different scales - after switching, adjust “Codes per channel”. Changing the method clears the spectrum.'),"
 "int_rise:L('Интегрирование: сколько отсчётов ДО вершины включать в сумму. Смотрите на картинку импульса и считайте по сетке.',"
 "'Integration: how many samples BEFORE the peak to include in the sum. Look at the pulse picture and count by the grid.'),"
 "int_fall:L('Интегрирование: сколько отсчётов ПОСЛЕ вершины включать в сумму. Обычно заметно больше, чем до вершины, потому что спад длиннее фронта.',"
@@ -1799,7 +1809,7 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "document.getElementById('fqslot').appendChild(fs);"
 /* способ измерения: строки другого способа приглушаются */
 /* окно «до / после вершины» нужно и фильтру формы - при нём не приглушаем */
-"function showFields(){var al=+document.getElementById('p_algo').value,so=document.getElementById('sh_on').checked;"
+"function showFields(){var al=+document.getElementById('p_algo').value,so=document.getElementById('sh_on').checked||al==2;"
 "GR.forEach(function(g){g[1].forEach(function(r){var w=document.getElementById('w_'+r[0]);"
 "if(so&&(r[0]=='int_rise'||r[0]=='int_fall'))r=[r[0],r[1],'b'];"
 "if(w)w.className=(r[2]=='t'&&al!=0)||(r[2]=='i'&&al!=1)?'off':''})})}"
@@ -1823,7 +1833,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "function fillCfg(p){if(p.fl){FHZ=p.fl;fillFq()}"
 "if(p.emu!==undefined){window.EMU=String(p.emu);document.getElementById('p_emu').value=window.EMU}"
 "P.forEach(function(k){document.getElementById('p_'+k).value=k=='cpc'?p[k]/1000:p[k]});"
-"if(p.shape_on!==undefined){document.getElementById('sh_on').checked=p.shape_on==1;document.getElementById('sh_tol').value=p.shape_tol}"
+"if(p.shape_on!==undefined){document.getElementById('sh_on').checked=p.shape_on==1;document.getElementById('sh_tol').value=p.shape_tol;"
+"document.getElementById('sh_lmin').value=p.shape_lmin;document.getElementById('sh_lmax').value=p.shape_lmax;document.getElementById('sh_ln').value=p.shape_ln;window.ALGO=p.algo}"
 "showFields();cpcTop()}"
 "function ldcfg(){fetch('/stat').then(function(r){return r.json()}).then(function(j){window.REALHZ=j.freq})"
 ".catch(function(){}).then(function(){return fetch('/cfg')}).then(function(r){return r.json()})"
@@ -1882,10 +1893,13 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
    при выключенном фильтре. */
 "var SH={busy:0,d:null};"
 "function shSet(){var on=document.getElementById('sh_on').checked?1:0,t=+document.getElementById('sh_tol').value||25;"
-"fetch('/cfg?shape_on='+on+'&shape_tol='+t).then(function(r){return r.json()}).then(fillCfg).then(function(){shLoad()}).catch(function(){})}"
+"function gv(k){return Math.max(0,Math.round(+document.getElementById(k).value||0))}"
+"fetch('/cfg?shape_on='+on+'&shape_tol='+t+'&shape_lmin='+gv('sh_lmin')+'&shape_lmax='+gv('sh_lmax')+'&shape_ln='+(gv('sh_ln')||2000))"
+".then(function(r){return r.json()}).then(fillCfg).then(function(){shLoad()}).catch(function(){})}"
 "function shLearn(){var lr=SH.d&&SH.d.need>0;"
-"if(!lr&&!confirm(L('Набрать эталон формы? Нужен запущенный набор спектра (подойдёт и фон, с источником быстрее): прибор возьмёт 2000 импульсов выше трёх порогов, медиана их ширины станет эталоном и сохранится в памяти прибора.',"
-"'Learn the shape reference? A running spectrum acquisition is needed (background will do, a source is faster): the device takes 2000 pulses above three thresholds, the median of their width becomes the reference and is saved in the device memory.')))return;"
+"var nl=document.getElementById('sh_ln').value||2000;"
+"if(!lr&&!confirm(L('Набрать эталон формы? Нужен запущенный набор спектра (подойдёт и фон, с источником быстрее): прибор возьмёт '+nl+' импульсов по настройке «в эталон», медиана их ширины станет эталоном и сохранится в памяти прибора. Средний импульс виден по ходу набора.',"
+"'Learn the shape reference? A running spectrum acquisition is needed (background will do, a source is faster): the device takes '+nl+' pulses by the “reference” setting, the median of their width becomes the reference and is saved in the device memory. The mean pulse is shown while learning.')))return;"
 "shLoad(lr?'stop':'learn')}"
 "function shClr(){shLoad('clear')}"
 "function shLoad(dd){if(SH.busy&&!dd)return;SH.busy=1;"
@@ -1910,7 +1924,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "L('частота АЦП сменилась после набора эталона - наберите его заново, пока фильтр пропускает всё','the ADC rate changed after the reference was learned - learn it again, until then the filter passes everything'))+'</b>');"
 "if(d.act)t.push('<b style=color:#9fe0a0>'+L('фильтр действует','filter active')+'</b>: '+L('с «Сброса» проверено ','since “Reset” checked ')+d.chk+L(', отброшено ',', rejected ')+d.rej+"
 "(d.chk?' ('+(d.rej*100/d.chk).toFixed(1)+' %)':''));"
-"else if(!d.on&&d.ref>0)t.push(L('фильтр выключен: импульсы вне допуска показаны, но в спектр идут','filter off: pulses outside the tolerance are shown but still go into the spectrum'));"
+"if(window.ALGO==2&&(!shCmp(d)||!d.wave))t.push('<b style=color:#ff8a82>'+L('способ «свёртка с эталоном», но эталонного импульса для этого окна и частоты нет - амплитуда считается трапецией; наберите эталон','method “convolution with the reference”, but there is no reference pulse for this window and rate - the amplitude is computed by the trapezoid; learn the reference')+'</b>');"
+"if(!d.on&&d.ref>0)t.push(L('фильтр выключен: импульсы вне допуска показаны, но в спектр идут','filter off: pulses outside the tolerance are shown but still go into the spectrum'));"
 "document.getElementById('sh_st').innerHTML=t.join('<br>')}"
 /* холст под размер на экране; возвращает контекст и размеры */
 "function shCv(id){var c=document.getElementById(id),dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;"
@@ -2501,6 +2516,11 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "отсчётов брать, считаются прямо по осциллографу), «База 2^N» и «Окно "
 "базы». Масштаб у способов разный &mdash; после переключения подберите "
 "«Кодов на канал». Смена способа очищает спектр.</td></tr>"
+"<tr><td>Свёртка с эталоном</td><td>Амплитуда &mdash; высота, при которой эталонный "
+"импульс фильтра формы лучше всего ложится на импульс (как в BecqMoni); база &mdash; 32 "
+"отсчёта перед окном. Нужен эталон на этом окне «до / после вершины» и этой частоте, без "
+"него амплитуда считается трапецией; новый эталон очищает спектр. На шумном ФЭУ этого "
+"прибора оказался хуже трапеции (README).</td></tr>"
 "</table>"
 
 "<h4>Амплитуда и базовая линия</h4><table>"
@@ -2686,6 +2706,12 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "many samples to take, counted straight from the oscilloscope), “Baseline 2^N” and "
 "“Baseline window”. The methods have different scales &mdash; after switching, "
 "adjust “Codes per channel”. Changing the method clears the spectrum.</td></tr>"
+"<tr><td>Convolution with the reference</td><td>Amplitude &mdash; the height at which the "
+"shape-filter reference pulse fits the pulse best (as in BecqMoni); the baseline is 32 samples "
+"before the window. It needs a reference for this “before / after peak” window and this "
+"rate, without one the amplitude is computed by the trapezoid; a new reference clears the "
+"spectrum. On the noisy PMT of this device it turned out worse than the trapezoid "
+"(README).</td></tr>"
 "</table>"
 
 "<h4>Amplitude and baseline</h4><table>"

@@ -162,6 +162,13 @@ static uint32_t  s_learn_gen;
 static int32_t   s_learn_win, s_learn_hz;  /* условия набора               */
 static int32_t   s_lp10, s_lp50, s_lp90;   /* итог последнего набора        */
 static mca_shape_wave_t s_wave;            /* эталонный импульс, под LOCK   */
+static uint32_t  s_wave_gen;               /* растёт при каждом новом эталоне */
+/* Копия эталона для свёртки - у задачи обработки, обновляется, когда
+ * s_wave_gen сменился: отсчёты x256 от вершины, их число, середина фронта и
+ * сумма квадратов. */
+static int16_t   s_cr[SHAPE_WAVE_MAX];
+static int32_t   s_cr_len, s_cr_mid, s_cr_r2;
+static uint32_t  s_cr_gen;
 /* Примеры для страницы: [0] - в допуске, [1] - вне. Задача обработки
  * пишет в слот, только пока s_ex_want, потом ставит s_ex_new (под LOCK). */
 static mca_shape_ex_t s_ex[2];
@@ -227,6 +234,11 @@ void mca_dsp_init(void)
          * втрое уже. */
         .shape_on        = 0,
         .shape_tol       = 25,
+        /* в эталон: выше трёх порогов, без верхней границы (зашкалившие не
+         * берутся никогда), 2000 импульсов */
+        .shape_lmin      = 0,
+        .shape_lmax      = 0,
+        .shape_ln        = SHAPE_LEARN_N,
     };
     s_learn = heap_caps_calloc(SHAPE_LEARN_N, sizeof(int16_t),
                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -295,7 +307,7 @@ void mca_dsp_service(bool idle)
         s_learn_n    = 0;
         s_learn_win  = s_par.int_rise + s_par.int_fall + 1;
         s_learn_hz   = (int32_t)adc_clk_get_freq();
-        s_learn_need = SHAPE_LEARN_N;
+        s_learn_need = s_par.shape_ln;
         UNLOCK();
     }
 
@@ -397,6 +409,74 @@ static void record_event(int64_t num, int32_t den, const mca_params_t *p)
     s_ev_pend++;
 }
 
+/* АМПЛИТУДА СВЁРТКОЙ С ЭТАЛОНОМ (algo = 2). Эталон фильтра формы - средняя
+ * форма импульса; амплитуда - высота, при которой он лучше всего (по сумме
+ * квадратов) ложится на импульс: A = sum(x*r) / sum(r*r). Для известной
+ * формы и белого шума это лучшая оценка высоты - в неё идёт весь импульс с
+ * весом своей доли сигнала (так берёт высоту и BecqMoni для звуковой карты).
+ * Вершину ищем, как интегрирование; импульс совмещается с эталоном по
+ * середине фронта, как при наборе эталона. База - 32 отсчёта перед окном «до
+ * вершины»: её шум входит в высоту с весом sum(r)/sum(r*r) ~ 1.5, и с 8
+ * отсчётами свёртка проигрывала трапеции (модель, 30 кодов, L = 10: FWHM
+ * 7.0 % против 5.6 %), с 32 - выигрывает (4.2 %); длиннее - ещё лучше, но
+ * чаще ловит хвост предыдущего импульса. false - окно не легло в буфер,
+ * событие считается трапецией. Высота = *num / *den, в кодах. */
+static bool amp_conv(int32_t peak_pos, int end, const mca_params_t *p,
+                     int64_t *num, int32_t *den, int32_t *out_pk)
+{
+    int lo = peak_pos - p->trap_L - p->trap_G, hi = peak_pos + 4;
+    if (lo < s_cross_pos - p->trap_L) lo = s_cross_pos - p->trap_L;
+    if (lo < 1) lo = 1;
+    if (hi > end - 1) hi = end - 1;
+    int32_t mx = -1;
+    int pk = lo;
+    for (int i = lo; i <= hi; i++)
+        if (s_work[i] > mx) { mx = s_work[i]; pk = i; }
+    const int a = pk - p->int_rise;
+    if (a - 32 < 0) return false;
+    int32_t base32 = 0;
+    for (int i = a - 32; i < a; i++) base32 += s_work[i];
+    const int32_t base8 = base32 / 4;
+    const int32_t h8 = mx * 8 - base8;
+    if (h8 <= 0) return false;
+    int c50 = pk;
+    while (c50 > a - 8 && s_work[c50 - 1] * 16 - 2 * base8 > h8) c50--;
+    const int s0 = c50 - s_cr_mid;
+    if (s0 < 0 || s0 + s_cr_len > end) return false;
+    /* по 32 отсчёта в 32 битах: 131040 x 256 x 32 - в пределах int32 */
+    int64_t acc = 0;
+    for (int j0 = 0; j0 < s_cr_len; j0 += 32) {
+        const int j1 = j0 + 32 < s_cr_len ? j0 + 32 : s_cr_len;
+        int32_t part = 0;
+        for (int j = j0; j < j1; j++)
+            part += ((int32_t)s_work[s0 + j] * 32 - base32) * s_cr[j];
+        acc += part;
+    }
+    *num = acc * 256;                   /* x - коды x32, r - доли x256 */
+    *den = 32 * s_cr_r2;
+    *out_pk = pk;
+    return true;
+}
+
+/* Копия эталона для свёртки: доли x256 от вершины. Зовёт задача обработки,
+ * когда эталон сменился. */
+static void conv_take_wave(void)
+{
+    static mca_shape_wave_t w;
+    LOCK();
+    w = s_wave;
+    s_cr_gen = s_wave_gen;
+    UNLOCK();
+    int32_t r2 = 0;
+    for (int j = 0; j < w.len; j++) {
+        s_cr[j] = (int16_t)(w.v[j] * 256 / 1000);
+        r2 += s_cr[j] * s_cr[j];
+    }
+    s_cr_len = r2 > 0 ? w.len : 0;
+    s_cr_mid = w.mid;
+    s_cr_r2  = r2;
+}
+
 /* Границы допуска фильтра формы (ширина x10): считаются раз на чанк. */
 static int32_t s_shape_lo, s_shape_hi;
 
@@ -415,7 +495,8 @@ static int32_t s_shape_lo, s_shape_hi;
  *
  * При интегрировании (ipk >= 0) вершину и сумму окна уже нашёл
  * amp_integrate - в том же окне «до / после вершины»: они и берутся (isum -
- * сумма отсчётов окна без вычета базы). Иначе поиск и сумма - здесь; это
+ * сумма отсчётов окна без вычета базы; при свёртке вершина есть, а суммы
+ * нет - isum < 0, её считаем здесь). Иначе поиск и сумма - здесь; это
  * ~580 из ~650 тактов меры (замер 2026-11-04), и при ~5000 имп/с на 20 МГц
  * повтор этой работы переполнял бюджет ядра.
  *
@@ -446,7 +527,7 @@ static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
 
     int32_t base8 = 0, sum = 0;
     for (int i = a - 8; i < a; i++) base8 += s_work[i];
-    if (ipk >= 0) sum = isum;
+    if (ipk >= 0 && isum >= 0) sum = isum;
     else for (int i = a; i <= b; i++) sum += s_work[i];
     const int32_t n  = b - a + 1;
     const int32_t h8 = mx * 8 - base8;              /* высота x8  */
@@ -464,19 +545,27 @@ static bool shape_check(int32_t tpk, int end, int64_t num, int32_t den,
     if (hb >= SHAPE_HB) hb = SHAPE_HB - 1;
     s_whist[hb]++;
 
-    /* эталон: только заметно выше порога, там шумовых всплесков мало;
-     * импульс копится в среднюю форму целиком - база и окно, совмещённый
-     * по середине фронта */
-    if (learn && s_learn && n == s_learn_win &&
-        num >= (int64_t)3 * p->threshold * den) {
+    /* Эталон. Какие импульсы брать - как запись эталона в BecqMoni: высота
+     * от / до (по умолчанию - выше трёх порогов, там шумовых всплесков
+     * мало, без верхней границы), зашкалившие - никогда: у них срезана
+     * вершина, и форма и ширина не те. Импульс копится в среднюю форму
+     * целиком - база и окно, совмещённый по середине фронта и приведённый к
+     * своей высоте (x1024): каждый весит одинаково, крупные не перевешивают. */
+    if (learn && s_learn && n == s_learn_win && h8 > 0 &&
+        (p->shape_lmin > 0 ? h8 >= p->shape_lmin * 8
+                           : num >= (int64_t)3 * p->threshold * den) &&
+        (p->shape_lmax <= 0 || h8 <= p->shape_lmax * 8)) {
         const int32_t k = s_learn_n;
-        if (k < s_learn_need) {
+        bool clip = false;
+        for (int i = a - 8; i <= b && !clip; i++)
+            clip = s_work[i] >= MCA_ADC_MAX - 1 || s_work[i] == 0;
+        if (k < s_learn_need && !clip) {
             s_learn[k] = (int16_t)(w10 > 32767 ? 32767 : w10);
             int c50 = pk;
             while (c50 > a - 8 && s_work[c50 - 1] * 16 - 2 * base8 > h8) c50--;
             for (int i = a - 8; i <= b; i++) {
                 const int j = i - c50 + WOFF;
-                s_wsum[j] += (int32_t)s_work[i] * 8 - base8;
+                s_wsum[j] += ((int32_t)s_work[i] * 8 - base8) * 1024 / h8;
                 s_wcnt[j]++;
             }
             s_learn_n = k + 1;
@@ -736,6 +825,10 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
     const bool shape_filt = shape_cmp && p.shape_on;
     const bool shape_learn = s_learn_need > 0 && s_learn_hz == (int32_t)fclk0;
     const bool shape_need = shape_filt || shape_learn || s_watch_s > 0;
+    /* свёртка: эталон есть и набран на этом окне и этой частоте */
+    if (p.algo == 2 && s_cr_gen != s_wave_gen) conv_take_wave();
+    const bool conv_ok = p.algo == 2 && s_cr_len > 0 && p.shape_ref > 0 &&
+                         p.shape_win == swin && p.shape_hz == (int32_t)fclk0;
     s_shape_lo = p.shape_ref - p.shape_ref * p.shape_tol / 100;
     s_shape_hi = p.shape_ref + p.shape_ref * p.shape_tol / 100;
 
@@ -902,6 +995,9 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n)
                                                 &den, &ipk);
                             /* сумма окна без вычета базы - для меры формы */
                             isum = (int32_t)(num + (int64_t)den * ib);
+                        } else if (conv_ok &&
+                                   amp_conv(s_peak_pos, end, &p, &num, &den, &ipk)) {
+                            isum = -1;          /* вершина есть, суммы нет */
                         } else {
                             num = (s_flat_cnt > 0)
                                 ? (int32_t)(s_flat_sum / s_flat_cnt)
@@ -1066,7 +1162,7 @@ void mca_dsp_shape_info(mca_shape_info_t *o)
     LOCK();
     const mca_params_t p = s_par;
     o->learn_n    = s_learn_n;
-    o->learn_need = s_req_learn == 1 ? SHAPE_LEARN_N : s_learn_need;
+    o->learn_need = s_req_learn == 1 ? s_par.shape_ln : s_learn_need;
     o->p10 = s_lp10; o->p50 = s_lp50; o->p90 = s_lp90;
     UNLOCK();
     o->win    = p.int_rise + p.int_fall + 1;
@@ -1081,8 +1177,42 @@ void mca_dsp_shape_hist(uint32_t *dst)
     memcpy(dst, s_whist, sizeof(s_whist));
 }
 
+/* Средний импульс из сумм набора: ячейки, куда легли не меньше 90 %
+ * импульсов (края окна у разных импульсов разные), в тысячных от вершины. */
+static void build_wave(int32_t n, mca_shape_wave_t *wv)
+{
+    int j0 = 0, j1 = -1;
+    for (int j = 0; j < WBUF; j++)
+        if (s_wcnt[j] > 0 && s_wcnt[j] * 10 >= n * 9) { if (j1 < 0) j0 = j; j1 = j; }
+    if (j1 - j0 + 1 > SHAPE_WAVE_MAX) j1 = j0 + SHAPE_WAVE_MAX - 1;
+    int pre = j0;
+    int64_t top = 1;
+    for (int j = j0; j <= j1; j++) {
+        const int64_t m = (int64_t)s_wsum[j] * 1000 / s_wcnt[j];
+        if (m > top) { top = m; pre = j; }
+    }
+    wv->len = (int16_t)(j1 >= j0 ? j1 - j0 + 1 : 0);
+    wv->pre = (int16_t)(pre - j0);
+    wv->mid = (int16_t)(WOFF - j0);
+    wv->n   = (int16_t)n;
+    for (int j = j0; j <= j1; j++) {
+        const int64_t x = (int64_t)s_wsum[j] * 1000 / s_wcnt[j] * 1000 / top;
+        wv->v[j - j0] = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
+    }
+}
+
 void mca_dsp_shape_wave(mca_shape_wave_t *o)
 {
+    /* Пока идёт набор - текущее среднее. Суммы в это время дописывает
+     * задача обработки: ячейка может прочитаться на импульс раньше или
+     * позже - для картинки это не важно. */
+    LOCK();
+    const int32_t n = s_learn_n, need = s_learn_need;
+    UNLOCK();
+    if (need > 0 && n > 0) {
+        build_wave(n, o);
+        return;
+    }
     LOCK();
     *o = s_wave;
     UNLOCK();
@@ -1094,6 +1224,7 @@ void mca_dsp_shape_set_wave(const mca_shape_wave_t *w)
         return;
     LOCK();
     s_wave = *w;
+    s_wave_gen++;
     UNLOCK();
 }
 
@@ -1132,25 +1263,7 @@ bool mca_dsp_shape_poll(void)
     if (need <= 0 || n < need) return false;
     memcpy(v, s_learn, (size_t)n * sizeof(int16_t));
     qsort(v, (size_t)n, sizeof(int16_t), cmp_i16);
-    /* средний импульс - по ячейкам, куда легли не меньше 90 % импульсов
-     * (края окна у разных импульсов разные), в тысячных от его вершины */
-    int j0 = 0, j1 = -1;
-    for (int j = 0; j < WBUF; j++)
-        if (s_wcnt[j] * 10 >= n * 9) { if (j1 < 0) j0 = j; j1 = j; }
-    if (j1 - j0 + 1 > SHAPE_WAVE_MAX) j1 = j0 + SHAPE_WAVE_MAX - 1;
-    int pre = j0;
-    int64_t top = 1;
-    for (int j = j0; j <= j1; j++) {
-        const int64_t m = (int64_t)s_wsum[j] * 1000 / s_wcnt[j];
-        if (m > top) { top = m; pre = j; }
-    }
-    wv.len = (int16_t)(j1 >= j0 ? j1 - j0 + 1 : 0);
-    wv.pre = (int16_t)(pre - j0);
-    wv.n   = (int16_t)n;
-    for (int j = j0; j <= j1; j++) {
-        const int64_t x = (int64_t)s_wsum[j] * 1000 / s_wcnt[j] * 1000 / top;
-        wv.v[j - j0] = (int16_t)(x > 32767 ? 32767 : x < -32768 ? -32768 : x);
-    }
+    build_wave(n, &wv);
     bool ok = false;
     LOCK();
     if (gen == s_learn_gen) {           /* набор не начат заново */
@@ -1162,6 +1275,9 @@ bool mca_dsp_shape_poll(void)
         s_par.shape_win = s_learn_win;
         s_par.shape_hz  = s_learn_hz;
         s_wave = wv;
+        s_wave_gen++;
+        /* свёртка меряет новым эталоном: шкала чуть другая - спектр заново */
+        if (s_par.algo == 2) s_req_clear = true;
         ok = true;
     }
     UNLOCK();
@@ -1222,7 +1338,13 @@ void mca_dsp_set_params(const mca_params_t *in)
     }
     if (s_par.cpc_milli < 10)     s_par.cpc_milli = 10;      /* 0.01 кода  */
     if (s_par.cpc_milli > 100000) s_par.cpc_milli = 100000;  /* 100 кодов  */
-    if (s_par.algo != 1) s_par.algo = 0;
+    if (s_par.algo < 0 || s_par.algo > 2) s_par.algo = 0;
+    if (s_par.shape_lmin < 0)    s_par.shape_lmin = 0;
+    if (s_par.shape_lmin > 4095) s_par.shape_lmin = 4095;
+    if (s_par.shape_lmax < 0)    s_par.shape_lmax = 0;
+    if (s_par.shape_lmax > 4095) s_par.shape_lmax = 4095;
+    if (s_par.shape_ln < 100)    s_par.shape_ln = 100;
+    if (s_par.shape_ln > SHAPE_LEARN_N) s_par.shape_ln = SHAPE_LEARN_N;
     s_par.polarity = s_par.polarity ? 1 : 0;
     if (s_par.int_rise < 0)  s_par.int_rise = 0;
     if (s_par.int_rise > 200) s_par.int_rise = 200;
