@@ -118,7 +118,7 @@
 #define MCA_CLK_GEN_CAM 1
 
 #if MCA_CLK_GEN_CAM
-#define MCA_FREQ_COUNT 15
+#define MCA_FREQ_COUNT 16
 #else
 #define MCA_FREQ_COUNT 12
 #endif

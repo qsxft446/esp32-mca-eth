@@ -578,7 +578,7 @@ oscilloscope mode.
 
 In this copy CLK comes from the camera block (CAM_CLK, `MCA_CLK_GEN_CAM 1`)
 with integer dividers from 160 and 240 MHz: 1, 2, 4, 5, 6.67, 8, 8.89, 10,
-11.43, 12, 13.33, 15, 16, 17.14 and 20 MHz. LEDC (`MCA_CLK_GEN_CAM 0`, only
+11.43, 12, 13.33, 15, 16, 17.14, 20 and 24 MHz. LEDC (`MCA_CLK_GEN_CAM 0`, only
 80/K) corrupts the data on this board at 16 MHz — see “A CLK generator
 from the camera block”.
 
@@ -595,6 +595,27 @@ chunk is processed right in the DMA buffer) at 20 MHz and ~4000 cps: 7.55
 cycles per sample of 12, processing 63 %, no losses; with convolution — 7.71
 and 64 %. It used to be 10.88 and 91 %. Details — “Findings from debugging”,
 “Processing core budget”.
+
+**24 MHz** (240/10, 50 % square wave; added 2026-11-05). Measurement:
+Ra-226, ~4800 cps, integration, shape filter off, the same windows in time
+(1.2 times more samples at 24 MHz: L 13, G 44, window 14 + 48), 306 s each:
+
+| | 20 MHz | 24 MHz |
+|---|---|---|
+| stream, million samples/s (set) | 19.985 (20) | 23.982 (24) |
+| processing load | 68.4 % | 81.6 % |
+| cycles per sample / budget | 7.52 / 12 | 7.47 / 10 |
+| chunk queue peak | 7 of 16 | 9 of 16 |
+| chunks lost | 0 | 0 |
+| main peak: channel, FWHM | 202.0, 9.75 % | 203.1, 9.75 % |
+
+Data lines are alive at both rates, none stuck. The spectrum is the same
+(4820 cps, regions within 3 %, the peak shifted by 0.5 % — the windows in
+samples are rounded). Resolution did not grow with the rate: the detector
+sets it. Core headroom at 24 MHz is ~18 %; convolution and the shape filter
+add another 1–2 % (per-event work), at a noticeably higher count rate watch
+the losses in “Diagnostics”. Queue headroom is 1.36 ms of stream (1.64 ms at
+20 MHz).
 
 The page gets the frequency list from the firmware (`/cfg`, field `fl`),
 its own for each CLK generator. The frequency is stored in the device
@@ -616,7 +637,7 @@ wires. To work without regard to the clock — Ethernet.
 ### A CLK generator from the camera block — the main one in this copy
 
 `adc_clk.c` contains a second generator: the CAM_CLK output of the LCD_CAM
-block, integer dividers from 160 and 240 MHz (up to 20 MHz, including 12,
+block, integer dividers from 160 and 240 MHz (up to 24 MHz, including 12,
 15, 17.14). It is enabled with `MCA_CLK_GEN_CAM 1` in `mca_config.h`. The
 calculation promised that at 17.14 MHz (240/14) channel 6 would be clean —
 assuming a 50 % square wave. In practice, with capture **stopped**, ping
