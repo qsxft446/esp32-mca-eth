@@ -258,7 +258,7 @@ analyzer.
   `-pileup`…) are not executed and are answered with `-err not supported`:
   processing parameters are set on the device page.
 - **During acquisition**, every second — a status packet (acquisition time,
-  load, CPS, rejected pulses — pile-ups and off-scale events), then the
+  core 1 load, CPS, rejected pulses — pile-ups and off-scale events), then the
   whole spectrum: 8192 channels in packets of 64. `-sta` starts spectrum
   acquisition on the device itself, `-sto` stops it.
 - **Dead time.** Programs compute it as
@@ -409,10 +409,11 @@ BecqMoni (answers to commands).
     collection. Lines from before `app_main` (bootloader, core start) are not
     in the log — only in the console.
   - **ADC diagnostics** — sample stream and its real rate, per-bit
-    statistics of the data lines, last-second profile (including processing
-    busy time and CPU cycles per sample by stage — copy, difference,
-    threshold and events — against the budget of 240 MHz / sample rate),
-    core 0 and core 1 load (from the FreeRTOS idle task) with the share of
+    statistics of the data lines, last-second profile (including
+    CPU cycles per sample by stage — copy, difference, threshold and
+    events — against the budget of 240 MHz / sample rate), core 0 and core
+    1 load (from the FreeRTOS idle task; core 1 is the same “load” as in the
+    spectrum status line) with the share of
     the capture interrupt on core 0 (FreeRTOS counters do not see it — it is
     counted separately) and the busiest tasks with their core, chunk loss log
     with the device mode, data-line check.
@@ -905,6 +906,17 @@ Measurements 2026-11-04: 20 MHz, Ra-226, ~4000 cps, integration, window
   the placement of the DMA buffers.
 - **The spectrum is the same**: scale ×1.0000, shape match 0.9999, count rates
   by region within statistics, share rejected by the filter 18.9 → 19.0 %.
+- **Which load to show.** There were three numbers and they disagreed
+  (2026-11-05, 20 MHz, Cs-137, spectrum mode): cycles inside chunk
+  processing — 57 % (“load” on the spectrum page and the “Processing” column
+  of the table above), time working on a chunk including service calls —
+  63 % (“Processing busy” in “Diagnostics”), core 1 load from the FreeRTOS
+  idle task — 76 %. The rest the processing task spends outside the chunk:
+  it waits for it from the queue and wakes up ~9800 times per second
+  (assumption: these wake-ups are the main share; not measured). Now there
+  is one number everywhere — core 1 load: only it reaches 100 % exactly
+  when processing stops keeping up (the task stops going idle); processing
+  cycles during losses were ~91–92 %. It is highlighted yellow from 85 %.
 
 ### Core 0: headroom for moving work
 

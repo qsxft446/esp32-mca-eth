@@ -99,7 +99,12 @@ static const char CSS[] =
 ".ml{margin-left:auto}"
 "canvas{width:100%;display:block;background:#0c0f0b;border-radius:6px}"
 ".mono{font-size:12px;line-height:1.7;color:#aeb6a8}"
-"table{border-collapse:collapse;width:100%;font-size:12px}"
+"table{border-collapse:collapse;width:100%;font-size:12px;font-variant-numeric:tabular-nums}"
+/* «параметр - значение»: ширина колонок не зависит от содержимого - иначе
+   значения при обновлении ездят влево-вправо, а у соседних таблиц не
+   совпадают */
+"table.kv{table-layout:fixed}table.kv tr>:first-child{width:38%}"
+"table.kv td{overflow-wrap:anywhere}"
 "th,td{border-bottom:1px solid #1b211a;padding:7px 10px;text-align:left;color:var(--txt);vertical-align:top}"
 "th{color:var(--accent);font-weight:600;font-size:11.5px}"
 "h3{margin:0 0 8px;font-size:15px;color:#e8efe2}"
@@ -750,12 +755,12 @@ static const char PAGE[] =
 "L('мёртвое','dead')+'</span> '+dt.toFixed(1)+'%</span>'+"
 "'<span class=sep>|</span><span><span class=mut>'+L('истинно','true')+'</span> '+"
 "(j.cps/Math.max(0.01,1-dt/100)).toFixed(0)+L(' имп/с',' cps')+'</span>'+"
-/* загрузка обработки: около 100% - не успевает, пойдут потерянные чанки.
-   На вкладке «Осциллограф» спектр не набирается, и нагрузки нет. */
-"'<span class=sep>|</span><span title=\"'+L('Какую долю ядра занимает обработка потока. '+"
-"'Около 100% - не успевает, пойдут потерянные чанки: снизьте частоту.','Share of the core taken by stream processing. '+"
+/* загрузка ядра 1 (обработка потока) - та же, что в «Диагностике»:
+   около 100% - не успевает, пойдут потерянные чанки */
+"'<span class=sep>|</span><span title=\"'+L('Загрузка ядра 1, на котором идёт обработка потока (как в «Диагностике»). '+"
+"'Около 100% - не успевает, пойдут потерянные чанки: снизьте частоту.','Load of core 1, which runs stream processing (as in “Diagnostics”). '+"
 "'Near 100% - it cannot keep up, chunks will be lost: lower the rate.')+'\"><span class=mut>'+L('загрузка','load')+'</span> '+"
-"(md=='1'||md=='3'?'—':((j.load||0)/10).toFixed(0)+'%')+'</span>'+"
+"((j.load||0)/10).toFixed(0)+'%</span>'+"
 /* векторная обработка не прошла самопроверку при старте - предупредить */
 "(j.vec===0?'<span class=sep>|</span><span style=color:#f0c45a title=\"'+L('Векторные команды не прошли '+"
 "'самопроверку при старте, обработка идёт обычным кодом - медленнее.','Vector instructions failed the self-test at start, '+"
@@ -1190,6 +1195,14 @@ static esp_err_t h_stat(httpd_req_t *r)
     mca_ota_confirm();
     mca_stats_t s;
     mca_dsp_get_stats(&s);
+    /* load - загрузка ядра 1, где идёт обработка потока (1 минус доля
+     * задачи простоя FreeRTOS, за прошлую секунду): та же цифра, что в
+     * «Диагностике». Такты внутри обработки чанка (s.load_pm) её
+     * занижают: на 20 МГц 57 % против 76 % у ядра - задача обработки ещё
+     * принимает чанк из очереди, просыпается ~9800 раз в секунду и т.д.
+     * Потери начинаются, когда к 100 % подходит именно ядро. */
+    mca_prof_t pf;
+    mca_prof_get(&pf);
     char buf[600];
     int n = snprintf(buf, sizeof(buf),
         "{\"ev\":%llu,\"cps\":%lu,\"pile\":%llu,\"dead\":%llu,"
@@ -1207,7 +1220,7 @@ static esp_err_t h_stat(httpd_req_t *r)
         (unsigned long)adc_clk_get_freq(),
         /* run - набор спектра, srun - осциллограф, cap - сам захват АЦП */
         mca_spec_run ? 1 : 0, (unsigned long)s.run_ms,
-        (int)mca_mode, (unsigned long)s.load_pm, mca_dsp_vec_ok() ? 1 : 0,
+        (int)mca_mode, (unsigned long)pf.core_pm[1], mca_dsp_vec_ok() ? 1 : 0,
         mca_scope_run ? 1 : 0, adc_cap_is_running() ? 1 : 0,
         /* часы прибора: мс Unix-времени (0 - не заданы) и откуда время */
         (long long)mca_time_now_ms(), (int)mca_time_source(),
@@ -2072,7 +2085,7 @@ SUB_HEAD("Диагностика", "Diagnostics") SUB_NAV(N_SET, N_DIAG_ON, N_HE
 "function dR(a,b){return '<tr><td>'+a+'</td><td>'+b+'</td></tr>'}"
 "function dupd(){fetch('/diag/data').then(r=>r.json()).then(function(j){"
 "document.getElementById('den').checked=j.enabled;"
-"var h='<table><tr><th>'+L('Параметр','Parameter')+'</th><th>'+L('Значение','Value')+'</th></tr>';"
+"var h='<table class=kv><tr><th>'+L('Параметр','Parameter')+'</th><th>'+L('Значение','Value')+'</th></tr>';"
 "h+=dR(L('Поток данных','Data flow'),j.flow?df(L('идёт','flowing'),'ok'):df(L('НЕТ ДАННЫХ','NO DATA'),'bad'));"
 "h+=dR(L('Чанков всего','Chunks total'),j.chunks);"
 "h+=dR(L('Отсчётов всего','Samples total'),j.samples);"
@@ -2100,12 +2113,9 @@ SUB_HEAD("Диагностика", "Diagnostics") SUB_NAV(N_SET, N_DIAG_ON, N_HE
    чанк потерян; долгие запросы - кандидаты в виновники. */
 "var p=j.pf;if(p){"
 "var qc=p.q>=14?'bad':(p.q>=8?'warn':'ok');"
-"h+='<h4>'+L('Профиль за последнюю секунду','Profile for the last second')+'</h4><table><tr><th>'+"
+"h+='<h4>'+L('Профиль за последнюю секунду','Profile for the last second')+'</h4><table class=kv><tr><th>'+"
 "L('Что','What')+'</th><th>'+L('Значение','Value')+'</th></tr>';"
 "h+=dR(L('Чанков обработано','Chunks processed'),p.ch);"
-/* занятость задачи обработки: около 100% - очередь растёт, пойдут потери */
-"h+=dR(L('Занятость обработки','Processing busy'),"
-"df((p.busy/10).toFixed(1)+' %',p.busy>900?'bad':(p.busy>700?'warn':'ok')));"
 "h+=dR(L('Пик очереди чанков','Chunk queue peak'),df(p.q+L(' из 16',' of 16'),qc)+"
 "' <span style=opacity:.6>'+L('(16 - следующий теряется)','(16 - the next one is lost)')+'</span>');"
 "h+=dR(L('Самая долгая обработка чанка','Longest chunk processing'),(p.work/1000).toFixed(2)+L(' мс',' ms'));"
@@ -2117,8 +2127,10 @@ SUB_HEAD("Диагностика", "Diagnostics") SUB_NAV(N_SET, N_DIAG_ON, N_HE
 "h+=dR(L('Свободно внутр. памяти','Free internal memory'),(p.heap/1024).toFixed(0)+L(' КБ (минимум ',' KB (minimum ')+"
 "(p.hmin/1024).toFixed(0)+L(' КБ)',' KB)'));"
 /* загрузка ядер (1000 минус доля задачи простоя) и самые занятые задачи:
-   ядро 0 - сеть, веб, дисплей и прерывание захвата, ядро 1 - обработка */
-"if(j.cores){var cl=function(v){return df((v/10).toFixed(1)+' %',v>900?'bad':(v>700?'warn':'ok'))};"
+   ядро 0 - сеть, веб, дисплей и прерывание захвата, ядро 1 - обработка.
+   Жёлтое - с 85 %: на 20 МГц без потерь ядро 1 занято на ~75-82 %
+   (замеры 2026-11-04/05), потери - когда оно подходит к 100 % */
+"if(j.cores){var cl=function(v){return df((v/10).toFixed(1)+' %',v>950?'bad':(v>850?'warn':'ok'))};"
 "h+=dR(L('Загрузка ядра 0 (сеть, веб, дисплей)','Core 0 load (network, web, display)'),cl(j.cores[0])+"
 "(j.isr!==undefined?' <span style=opacity:.6>'+L('+ прерывание захвата ','+ capture interrupt ')+(j.isr/10).toFixed(1)+' %</span>':''));"
 "h+=dR(L('Загрузка ядра 1 (обработка)','Core 1 load (processing)'),cl(j.cores[1]));"
@@ -2157,7 +2169,7 @@ SUB_HEAD("Диагностика", "Diagnostics") SUB_NAV(N_SET, N_DIAG_ON, N_HE
 "else st=L('меняется','toggling');"
 "h+='<tr><td>'+nm[b]+'</td><td>'+j.tg[b]+'</td><td>'+df(st,c)+'</td></tr>'}"
 "h+='</table>';"
-"h+='<table><tr><th>'+L('Значения в чанке','Values in the chunk')+'</th><th></th></tr>';"
+"h+='<table class=kv><tr><th>'+L('Значения в чанке','Values in the chunk')+'</th><th></th></tr>';"
 "h+=dR('min / max',j.vmin+' / '+j.vmax);"
 "h+=dR(L('среднее','mean'),j.vmean);"
 "h+=dR(L('размах','range'),j.vmax-j.vmin);"
@@ -2173,7 +2185,7 @@ SUB_HEAD("Диагностика", "Diagnostics") SUB_NAV(N_SET, N_DIAG_ON, N_HE
 "function dprobe(){document.getElementById('dpr').textContent=L('измеряю 4 с...','measuring 4 s...');"
 "fetch('/diag/probe').then(r=>r.json()).then(function(j){"
 "var nm=['D0','D1','D2','D3','D4','D5','D6','D7','D8','D9','D10','D11','OTR'];"
-"var h='<table><tr><th>'+L('Линия','Line')+'</th><th>'+L('Состояние','State')+'</th></tr>';var live=0;"
+"var h='<table class=kv><tr><th>'+L('Линия','Line')+'</th><th>'+L('Состояние','State')+'</th></tr>';var live=0;"
 "for(var b=0;b<13;b++){var st,c;"
 "if(j.ch&(1<<b)){st=L('меняется','toggling');c='ok';live++}"
 "else if(j.hi&(1<<b)){st=L('залипла в 1','stuck at 1');c='bad'}"
@@ -2654,8 +2666,8 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "ошибки, жёлтые &mdash; предупреждения, тег окрашен по подсистеме (АЦП, сеть, прошивка...); "
 "галочки уровней и подсистем скрывают лишнее, «Сохранить» пишет лог в файл. Лог виден и тогда, когда консоль молчит из-за эмуляции MCA на "
 "COM. <b>Диагностика АЦП</b> &mdash; поток отсчётов и его реальная скорость, регистры "
-"камерного интерфейса, профиль за последнюю секунду (занятость обработки, такты на "
-"отсчёт, запросы, память), журнал потерь чанков, побитовая статистика линий данных "
+"камерного интерфейса, профиль за последнюю секунду (загрузка ядер &mdash; та же, что в "
+"строке состояния спектра, такты на отсчёт, запросы, память), журнал потерь чанков, побитовая статистика линий данных "
 "и их проверка.</td></tr>"
 "</table></div>"
 
@@ -2837,7 +2849,8 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "yellow &mdash; warnings, the tag is coloured by subsystem (ADC, network, firmware...); "
 "the level and subsystem checkboxes hide what is not needed, “Save” writes the log to a file. The log is visible even when the console is silent because of MCA emulation "
 "on COM. <b>ADC diagnostics</b> &mdash; the sample stream and its real rate, camera "
-"interface registers, the last-second profile (processing busy time, cycles per "
+"interface registers, the last-second profile (core load &mdash; the same as in the spectrum "
+"status line, cycles per "
 "sample, requests, memory), the chunk loss log, per-bit statistics of the data lines "
 "and their check.</td></tr>"
 "</table></div>"

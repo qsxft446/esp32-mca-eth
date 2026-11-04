@@ -3,6 +3,7 @@
 #include "mca_config.h"
 #include "mca_dsp.h"
 #include "mca_web.h"
+#include "mca_prof.h"
 #include "adc_clk.h"
 
 #include <string.h>
@@ -316,7 +317,11 @@ static void send_sweep(void)
      * время у программы выходили бессмысленными. */
     pkt_begin(CMD_STAT);
     pkt_add32(st.run_ms / 1000);
-    pkt_add16((uint16_t)(st.load_pm / 10));
+    {   /* загрузка ядра 1 (обработка) - та же, что на странице */
+        mca_prof_t pf;
+        mca_prof_get(&pf);
+        pkt_add16((uint16_t)(pf.core_pm[1] / 10));
+    }
     pkt_add32(st.cps);
     pkt_add32((uint32_t)(st.skipped_pileup + st.overflow + above));
     pkt_add32(0);
