@@ -1645,14 +1645,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 /* фильтр формы (mca_dsp.c, shape_check): включается здесь же, сразу */
 "<section class='panel pad'>"
 "<h3 data-en='Pulse shape filter'>Фильтр формы импульса</h3>"
-"<p class=n style=margin-top:0 data-en='Rejects pulses whose width (area / height in the “before / after peak” window) "
-"differs from the reference by more than the tolerance: PMT noise bursts are narrower than scintillations, pile-ups are wider. "
-"Not needed with a good PMT and its own power supply. The reference is learned from detector pulses while the spectrum is being acquired: background will do, a source is faster. At 20 MHz the core headroom is small: with a count rate well above 5000 cps watch chunk losses on the “Diagnostics” page, if there are losses use 16 MHz.'>"
-"Отбрасывает импульсы, ширина которых (площадь / высота в окне «до / после вершины») отличается от эталона "
-"больше допуска: шумовые всплески ФЭУ уже сцинтилляций, наложения шире. С хорошим ФЭУ и его родным питанием "
-"не нужен. Эталон набирается из импульсов детектора, пока идёт набор спектра: подойдёт и фон, с источником быстрее. "
-"На 20 МГц запас ядра небольшой: при счёте заметно выше 5000 имп/с смотрите потери чанков в "
-"«Диагностике», при потерях - 16 МГц.</p>"
+"<p class=n style=margin-top:0 data-en='Rejects pulses that differ from the learned reference. Helps with a noisy power supply or a poor-quality PMT.'>"
+"Отбрасывает импульсы, отличающиеся от набранного эталона. Помогает при шумном питании или некачественном ФЭУ.</p>"
 "<div class=grp style='margin:8px 0'>"
 "<label><input type=checkbox id=sh_on onchange=shSet()> <span data-en='filter on'>фильтр включён</span></label>"
 "<label><span data-en='tolerance, %'>допуск, %</span> <input id=sh_tol type=number min=1 max=200 style=width:70px onchange=shSet()></label>"
@@ -1889,7 +1883,7 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
    эталона, частота сейчас, проверено, отброшено, столбцов гистограммы;
    эталон: длина, вершина, импульсов; два примера: длина, вершина, высота,
    ширина x10, возраст с; «до вершины»), затем гистограмма uint32, эталон
-   и примеры int16. Опрос раз в 2 с: пока он идёт, прибор меряет форму и
+   и примеры int16. Опрос 10 раз в секунду: пока он идёт, прибор меряет форму и
    при выключенном фильтре. */
 "var SH={busy:0,d:null};"
 "function shSet(){var on=document.getElementById('sh_on').checked?1:0,t=+document.getElementById('sh_tol').value||25;"
@@ -1974,7 +1968,9 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "(cmp?L('Полоса - эталон ± допуск, красное - вне допуска. ','The band is reference ± tolerance, red is outside the tolerance. '):'')+"
 "L('С «Сброса»: ','Since “Reset”: ')+tot+L(' импульсов',' pulses')+(cmp&&tot?L(', вне допуска ',', outside the tolerance ')+out+' ('+(out*100/tot).toFixed(1)+' %)':'')}"
 "function shDraw(){if(SH.d){shDrawWave();shDrawHist()}}"
-"shLoad();setInterval(function(){shLoad()},2000);window.addEventListener('resize',shDraw);"
+/* 10 раз в секунду; пока ответ не пришёл, новый запрос не уходит (SH.busy) -
+   при медленной сети карточка сама обновляется реже */
+"shLoad();setInterval(function(){shLoad()},100);window.addEventListener('resize',shDraw);"
 "</script></body></html>";
 
 static esp_err_t h_set_page(httpd_req_t *r)

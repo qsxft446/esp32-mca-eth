@@ -458,7 +458,12 @@ was learned at; if they change, the filter passes everything and asks to
 learn the reference again. The card shows the reference pulse with the last
 accepted and rejected ones and a width histogram with the tolerance band;
 while the reference is being learned, the mean pulse is redrawn as it goes
-(on the device the shape settled by ~130 pulses).
+(on the device the shape settled by ~130 pulses). The card refreshes 10 times
+per second (the next request goes only after the answer to the previous one;
+the device answers in 47 ms on average); this does not affect chunk losses:
+with the card open and closed the losses are the same (measured 2026-11-04,
+20 MHz, ~5000 cps, with settings that already overload the core —
+convolution with a 114-sample window).
 
 **Which pulses go into the reference** — like reference recording in
 BecqMoni: the line “reference: height from … to … codes, pulses …” (0 — above
