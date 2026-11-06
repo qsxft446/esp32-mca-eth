@@ -1079,23 +1079,16 @@ static const char PAGE[] =
    быстрого CPS); средняя с «Сброса» и поправка k - в блоке калибровки из
    /dose раз в секунду. */
 "function d3(v){return v>=100?v.toFixed(0):v>=10?v.toFixed(1):v>=1?v.toFixed(2):v.toFixed(3)}"
-/* в строке статуса - мкЗв/ч за скользящие 10 с набора, раз в секунду (из
-   /dose): точность задаёт длина окна, а не частота показа - при ~30 имп/с
-   окно 1 с дало бы ±18 %, 10 с - ±6 %. После «Сброса» окно копится. */
-"var DRING=[];"
-"function doseRing(j){if(!j.ok||j.hs==null){DRING=[];window.DOSEF='';doseStd();return}"
-"var z=DRING.length?DRING[DRING.length-1]:null;if(z&&(j.s<z.s||j.n<z.n))DRING=[],z=null;"
-"if(!z||j.s>z.s)DRING.push({s:j.s,h:j.hs,r:j.ks,n:j.n});"
-"while(DRING.length>2&&DRING[DRING.length-1].s-DRING[1].s>=10)DRING.shift();"
-"var a=DRING[0],b=DRING[DRING.length-1],dt=b.s-a.s,dn=b.n-a.n;"
-"if(DRING.length<2||dt<0.5){if(!z)window.DOSEF='';doseStd();return}"
-"window.DOSEF=d3((b.h-a.h)*3600e-6/dt*j.k)+L(' мкЗв/ч',' µSv/h');"
-"window.DOSET=L('за последние ','over the last ')+dt.toFixed(0)+L(' с набора, δ ',' s of acquisition, δ ')+(dn>0?(100/Math.sqrt(dn)).toFixed(0)+' %':'-')+"
-"' · '+d3((b.r-a.r)*3600e-6/dt/8.764e-3*j.k)+L(' мкР/ч',' µR/h');doseStd()}"
+/* в строке статуса - мкЗв/ч тем же окном, что быстрый CPS (cps_win.c:
+   накопление до 30 с, при изменении счёта окно сокращается), из /cps 10 раз
+   в секунду; в подсказке - длина окна, погрешность счёта и мкР/ч */
+"function wtip(j){return L('окно ','window ')+(j.cpsw/1000).toFixed(1)+L(' с, δ ',' s, δ ')+(j.cpsn>0?(100/Math.sqrt(j.cpsn)).toFixed(1)+' %':'-')}"
+"function doseFast(j){if(!j.dok){window.DOSEF='';doseStd();return}"
+"window.DOSEF=d3(j.dh)+L(' мкЗв/ч',' µSv/h');window.DOSET=wtip(j)+' · '+d3(j.dr)+L(' мкР/ч',' µR/h');doseStd()}"
 "function doseStd(){var e=document.getElementById('std'),w=document.getElementById('stds');"
 "if(e){e.textContent=window.DOSEF||'';e.title=window.DOSET||'';e.hidden=!window.DOSEF}if(w)w.hidden=!window.DOSEF}"
 "var DOSE=null;"
-"function doseLoad(){fetch('/dose').then(function(r){return r.json()}).then(function(j){DOSE=j;doseRing(j);doseShow()}).catch(function(){})}"
+"function doseLoad(){fetch('/dose').then(function(r){return r.json()}).then(function(j){DOSE=j;doseShow()}).catch(function(){})}"
 "function doseShow(){var e=document.getElementById('dsv'),j=DOSE;if(!e||!j)return;"
 "var sd=document.getElementById('ddet');if(sd&&document.activeElement!==sd&&j.det!=null)sd.value=j.det;if(window.calSum)calSum();"
 "if(!j.ok){e.innerHTML='<span class=mut>'+(j.why==2?L('калибровка по энергии набрана при других настройках - доза не считается',"
@@ -1120,7 +1113,7 @@ static const char PAGE[] =
 "setInterval(function(){if(!isScope()&&!document.hidden)doseLoad()},1000);doseLoad();"
 "var CPSB=0;setInterval(function(){if(CPSB||document.hidden||isScope())return;CPSB=1;"
 "fetch('/cps').then(function(r){return r.json()}).then(function(j){CPSB=0;window.CPSF=j.cpsf;window.CPSFT=Date.now();"
-"var e=document.getElementById('stc');if(e){e.textContent=j.cpsf;e.title=L('окно ','window ')+j.cpsw+L(' мс',' ms')}"
+"var e=document.getElementById('stc');if(e){e.textContent=j.cpsf;e.title=wtip(j)}doseFast(j);"
 "if(mfast()&&++MF.tk%2==0)mload1(MF,1)}"
 ").catch(function(){CPSB=0})},100);"
 /* КАЛИБРОВКА ПО ЭНЕРГИИ. Ядро (calcore.js в разработке: поиск линий,
@@ -1697,9 +1690,11 @@ static esp_err_t h_shape(httpd_req_t *r)
 }
 
 /* /cps - только CPS, для опроса 10 раз в секунду со страницы спектра:
- * cpsf - быстрый CPS (окно от 100 мс до 1 с, при скачке счёта - 100 мс,
- * см. mca_dsp_tick_fast), cpsw - длина его окна, мс; cps - за прошлую
- * целую секунду, ev - всего событий, run - идёт набор. */
+ * cpsf - быстрый CPS (окно до 30 с с детектором изменений, cps_win.c),
+ * cpsw - длина окна, мс; cpsn - событий в окне, cpwn - интервалов по 0.1 с
+ * в окне, hi - номер последнего отсчёта быстрой истории (tools/cpswin.py
+ * сверяет по ним прибор с моделью); cps - за прошлую целую секунду, ev -
+ * всего событий, run - идёт набор. */
 static esp_err_t h_cps(httpd_req_t *r)
 {
     mca_stats_t s;
@@ -1709,11 +1704,14 @@ static esp_err_t h_cps(httpd_req_t *r)
      * настроек, mca_dose.h) */
     const float k = mca_dose_k();
     const bool dok = mca_dose_state() == MCA_DOSE_OK;
-    char buf[160];
+    char buf[240];
     const int n = snprintf(buf, sizeof(buf),
-        "{\"cpsf\":%lu,\"cpsw\":%lu,\"cps\":%lu,\"ev\":%llu,\"run\":%d,"
+        "{\"cpsf\":%lu,\"cpsw\":%lu,\"cpsn\":%lu,\"cpwn\":%lu,\"hi\":%lu,"
+        "\"cps\":%lu,\"ev\":%llu,\"run\":%d,"
         "\"dok\":%d,\"dh\":%.4g,\"dr\":%.4g}",
         (unsigned long)s.cps_fast, (unsigned long)s.cps_fast_ms,
+        (unsigned long)s.cps_fast_n, (unsigned long)s.cps_fast_k,
+        (unsigned long)s.cps_fast_hi,
         (unsigned long)s.cps,
         (unsigned long long)s.total_events, mca_spec_run ? 1 : 0, dok ? 1 : 0,
         dok ? k * MCA_DOSE_USVH(s.dose_h_fast, 1.0) : 0.0,
@@ -3257,8 +3255,9 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "для текущих настроек: каждое событие добавляет вес G(E) своей энергии, функция G подогнана по "
 "модели кристалла выбранного блока &mdash; NaI(Tl) Ø25×25, 30×40, 30×70, 40×40, 63×63 или 80×80 "
 "(Монте-Карло, H*(10) по ICRP 74 и керма в воздухе); у каждого блока своя поправка k. "
-"В строке статуса &mdash; мощность дозы в мкЗв/ч за последние 10 с набора, обновляется раз в "
-"секунду (в подсказке &mdash; окно, погрешность и мкР/ч), в блоке «Мощность "
+"В строке статуса &mdash; мощность дозы в мкЗв/ч тем же окном, что CPS: пока счёт ровный, "
+"окно копится до 30 с, при изменении счёта (источник поднесли или убрали) сокращается, и цифра "
+"сразу следует за ним (в подсказке &mdash; окно, погрешность и мкР/ч), в блоке «Мощность "
 "дозы» &mdash; средняя с «Сброса». Ошибка модели от 50 кэВ до 3 МэВ &mdash; в среднем 3 %, "
 "до 14&ndash;17 %, если источник сбоку; в торец детектора мягкое излучение занижается до "
 "35 %. Поправку k можно подогнать по дозиметру: положите его рядом, «Сброс», подождите "
@@ -3484,8 +3483,10 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "calibration for the current settings: each event adds the weight G(E) of its energy, the G "
 "function is fitted on a model of the crystal of the chosen block &mdash; NaI(Tl) Ø25×25, 30×40, "
 "30×70, 40×40, 63×63 or 80×80 (Monte Carlo, H*(10) by ICRP 74 and air kerma); each block has its "
-"own correction k. The status line shows the dose rate in µSv/h over the last 10 s of "
-"acquisition, updated every second (the tooltip has the window, error and µR/h), the “Dose "
+"own correction k. The status line shows the dose rate in µSv/h with the same window as CPS: "
+"while the count is steady the window grows up to 30 s, on a change (the source brought or "
+"removed) it is cut and the number follows at once (the tooltip has the window, error and µR/h), "
+"the “Dose "
 "rate” block the mean since “Reset”. The model error from 50 keV to 3 MeV is 3 % on average, "
 "up to 14&ndash;17 % with the source at the side; at the detector end face soft radiation is "
 "underestimated by up to 35 %. The correction k can be fitted by a dosimeter: put it next to "

@@ -509,13 +509,12 @@ When the device holds an energy calibration for the current settings, it
 computes the dose rate: each event adds the weight G(E) of its channel
 (`main/mca_dose.c`, the per-channel weight table is rebuilt when the
 calibration or the settings change). The status line shows the dose rate
-in µSv/h over the last 10 s of acquisition, updated every second (the
-tooltip has the window length, counting error and µR/h): the window length,
-not the display rate, sets the precision — at ~30 cps a 1 s window would
-give ±18 %, 10 s ±6 %. The device returns the weight sums and the
-acquisition time in `/dose` as one snapshot: the acquisition time in the
-statistics updates once a second, which in a 10 s window would give jumps
-of up to 10 %. The
+in µSv/h with the same window as CPS (accumulation up to 30 s with a change
+detector, see “CPS and dose rate” below), the tooltip has the window
+length, counting error and µR/h. The device takes the weight sums and the
+acquisition time as one snapshot under one lock: the acquisition time in
+the statistics updates once a second, which in a short window would give
+jumps of up to 10 %. The
 “Dose rate” block under the calibration the mean since “Reset” with its
 counting error. A calibration made with other settings — no dose, the
 block says so.
@@ -1315,22 +1314,48 @@ A repeat of the same run differed by 0.2 keV, the fit error is about
   actually elapsed time: the one-second tick comes from the lowest-priority
   main loop, and under core 0 load (for example, spectrum upload over COM)
   it stretched to 1.1–1.2 s, overstating the rate by 10–20 %.
-- CPS on the spectrum page is fast, for finding a source by hand: every
-  ~100 ms the device takes the events of that step, the page fetches the
-  number from `/cps` 10 times a second (only on the spectrum tab, no more
-  than one request at a time). The window adapts itself: while the count
-  is steady it grows up to 1 s; if the next 100 ms differ from the window
-  mean by more than 3σ of Poisson, the window is cut to those 100 ms. The
-  window length is in the tooltip of the big number. Model (200 runs of a
-  step): 130 → 260 cps — reaction 100 ms (90 %: 300 ms) against
-  500–600 ms for a 1 s window; at rest at 130 cps the scatter is ±11 %
-  against ±8.5 % for a 1 s window and ±28 % for bare 100 ms. On the device
-  (2026-11-06, ~114 cps, 15 s): scatter ±15 %, the window is shorter than
-  300 ms in 2 % of polls (false cuts on bursts); “Stop” — the number is 0
-  259 ms after the command, “Start” — 72 after 258 ms and 104 after
-  463 ms: the incomplete first interval and the polling add to the 100 ms
-  step. At a low count a step is caught later: 30 → 60 cps — median 0.4 s,
-  90 % — 0.8 s.
+- CPS and dose rate on the spectrum page — for finding a source by hand
+  and for a precise number at rest at the same time: the `main/cps_win.c`
+  window — accumulation + a CUSUM change detector. Every 100 ms (a timer
+  in `main/main.c`) comes an interval of the fast history: events,
+  milliseconds of acquisition, dose weight sums. While the count is steady
+  the window grows up to 30 s. Two accumulated sums of the Poisson
+  log-likelihood ratio — “the rate rose 1.5 times” and “fell 1.5 times”
+  against the window mean; a sum above 8 is a change: the window is cut to
+  the intervals since the sum started to grow, and the number is computed
+  from the new data at once. A single noisy interval does not convince the
+  detector, a real step does within fractions of a second or seconds. The
+  page fetches CPS and dose from `/cps` 10 times a second; the tooltip
+  shows the window length and the counting error.
+
+  Model (`tools/cpswin.py`, a line-by-line port of `cps_win.c`; response —
+  median (90 %) seconds until the number passes half of the step):
+
+  | Background | ×1.3 | ×1.5 | ×2 | ×10 | removed /2 | at rest |
+  |---|---|---|---|---|---|---|
+  | 30 cps | 7.1 (19) | 2.8 (4.8) | 0.9 (1.4) | 0.2 (0.3) | 2.2 (3.2) | ±3.5 % |
+  | 300 cps | 0.8 (1.5) | 0.3 (0.5) | 0.1 (0.2) | 0.1 (0.2) | 0.2 (0.3) | ±1.2 % |
+
+  For comparison a 10 s window at 30 cps: 5 s response to any step, ±5.5 %
+  at rest; a window like the former fast CPS (100 ms … 1 s, cut on a 3σ
+  single interval) — ±27 % at rest: with ~3 events per 100 ms a
+  single-interval test often fires on noise. A false CUSUM cut happens once
+  in ~20 min. A weak step (×1.3 at 30 cps) is caught slowly: such a rise is
+  hard to tell from noise.
+
+  Check against the device (2026-11-07, Ra-226, ~4700 cps, 60 s): the
+  device returns in `/cps` the fast history sample number, the window
+  length and its count; the model run over the same `/hist?f=1` history
+  gave the same integers in 162 polls of 162 (`python tools/cpswin.py <ip>
+  60`); with a window of 299 instead of 300 — 49 mismatches of 49. A
+  second time the Ra-226 source was brought to the detector and removed
+  again and again (background ~300, at the detector ~4500 cps), 90 s: the
+  detector fired 43 times, 292 polls of 292 matched. The number catches the
+  source within the same second: brought — in the second with 2611 counts
+  the fast CPS is already 4591 (window 0.4 s); removed — in the second with
+  1269 counts it is already 300 (window 0.6 s); at rest the window grows
+  back to 30 s. While acquisition is stopped the window is not touched, and
+  CPS and dose show 0.
 
 ## Console diagnostics
 
@@ -1420,6 +1445,9 @@ on other ESP32-S3 boards:
   only).
 - `check_i18n.py` — checks that every label of the device pages has an
   English pair (`python tools/check_i18n.py`).
+- `cpswin.py` — the fast CPS and dose window (a port of `main/cps_win.c`):
+  the step response model and a check against the device on the fast
+  history (`python tools/cpswin.py` / `python tools/cpswin.py <ip> 60`).
 - `check_kcl.py` — the KCl sample of the spectrum page: the 1461 keV peak
   model and the net peak fit against `tools/dosemodel` and scipy
   (`python tools/check_kcl.py`).

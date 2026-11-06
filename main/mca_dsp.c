@@ -1,4 +1,5 @@
 #include "mca_dsp.h"
+#include "cps_win.h"
 #include "adc_cap.h"
 #include "adc_clk.h"
 
@@ -1239,82 +1240,38 @@ void mca_dsp_tick_1s(void)
     if (s_watch_s > 0) s_watch_s--;
 }
 
-/* БЫСТРЫЙ CPS для перемещения источника: звать из таймера 100 мс. Окно подстраивается само: каждый шаг - интервал «события
- * за шаг, время шага по часам». Пока счёт ровный, окно растёт до 10
- * интервалов (~1 с, разброс как у посекундного CPS); если новый интервал
- * отличается от среднего по окну больше чем на 3 сигмы Пуассона, старое
- * окно забывается и цифра - по одному этому интервалу. Модель (2026-11-06,
- * 200 прогонов скачка): 130 -> 260 имп/с - реакция 100 мс (90 %: 300 мс)
- * против 500-600 мс у окна 1 с; на месте при 130 имп/с разброс ±11 %
- * против ±8.5 % у окна 1 с и ±28 % у голых 100 мс. */
-void mca_dsp_tick_fast(void)
+/* БЫСТРЫЙ CPS И МОЩНОСТЬ ДОЗЫ: окно cps_win.c (накопление до 30 с +
+ * детектор изменений CUSUM), шаг - интервал быстрой истории (таймер 100 мс
+ * в main.c): события и миллисекунды набора за шаг, суммы весов дозы. Окно
+ * ведётся по тем же интервалам, что пишутся в историю по 0.1 с, - так
+ * tools/cpswin.py сверяет прибор с моделью до события. hi - номер этого
+ * отсчёта в быстрой истории. */
+static cpsw_t s_win;
+
+void mca_dsp_win_step(uint32_t dc, uint32_t dms, float dh, float dk, uint32_t hi)
 {
-    enum { K = 10 };
-    static uint32_t c[K], d[K];          /* события и мкс интервала */
-    static double hh[K], kk[K];          /* суммы весов дозы за интервал */
-    static int n, head;
-    static int64_t t_prev;
-    static uint64_t e_prev;
-    static double h_prev, k_prev;
-    const int64_t now = esp_timer_get_time();
+    cpsw_step(&s_win, dc, dms * 1000u, dh, dk);
+    uint64_t sc, sd;
+    double sh, sk;
+    int n;
+    cpsw_sum(&s_win, &sc, &sd, &sh, &sk, &n);
     LOCK();
-    const uint64_t ev = s_st.total_events;
-    const double dh = s_st.dose_h, dk = s_st.dose_k;
-    UNLOCK();
-    if (!t_prev || ev < e_prev) {        /* первый шаг или «Сброс» */
-        t_prev = now;
-        e_prev = ev;
-        h_prev = dh;
-        k_prev = dk;
-        n = 0;
-        LOCK();
-        s_st.cps_fast = 0;
-        s_st.cps_fast_ms = 0;
-        s_st.dose_h_fast = s_st.dose_k_fast = 0;
-        UNLOCK();
-        return;
-    }
-    const uint32_t dc = (uint32_t)(ev - e_prev);
-    const uint32_t dd = (uint32_t)(now - t_prev);
-    if (dd < 1000) return;               /* шаг меньше 1 мс - копим дальше */
-    t_prev = now;
-    e_prev = ev;
-    const double ih = dh - h_prev, ik = dk - k_prev;
-    h_prev = dh;
-    k_prev = dk;
-    if (n) {
-        uint64_t sc = 0, sd = 0;
-        for (int k = 0; k < n; k++) {
-            const int i = (head - 1 - k + K) % K;
-            sc += c[i];
-            sd += d[i];
-        }
-        /* ожидание на этот интервал по скорости окна */
-        const float lam = sd ? (float)sc * (float)dd / (float)sd : 0.0f;
-        const float dev = (float)dc - lam;
-        if (dev * dev > 9.0f * (lam > 1.0f ? lam : 1.0f)) n = 0;
-    }
-    c[head] = dc;
-    d[head] = dd;
-    hh[head] = ih;
-    kk[head] = ik;
-    head = (head + 1) % K;
-    if (n < K) n++;
-    uint64_t sc = 0, sd = 0;
-    double sh = 0, sk = 0;
-    for (int k = 0; k < n; k++) {
-        const int i = (head - 1 - k + K) % K;
-        sc += c[i];
-        sd += d[i];
-        sh += hh[i];
-        sk += kk[i];
-    }
-    const uint32_t r = sd ? (uint32_t)((sc * 1000000ULL + sd / 2) / sd) : 0;
-    LOCK();
-    s_st.cps_fast = r;
+    s_st.cps_fast    = sd ? (uint32_t)((sc * 1000000ULL + sd / 2) / sd) : 0;
     s_st.cps_fast_ms = (uint32_t)(sd / 1000);
+    s_st.cps_fast_n  = (uint32_t)sc;
+    s_st.cps_fast_k  = (uint32_t)n;
+    s_st.cps_fast_hi = hi;
     s_st.dose_h_fast = sd ? (float)(sh * 1e6 / (double)sd) : 0.0f;
     s_st.dose_k_fast = sd ? (float)(sk * 1e6 / (double)sd) : 0.0f;
+    UNLOCK();
+}
+
+/* набор стоит - окно не трогаем, цифры 0 */
+void mca_dsp_win_idle(void)
+{
+    LOCK();
+    s_st.cps_fast = 0;
+    s_st.dose_h_fast = s_st.dose_k_fast = 0;
     UNLOCK();
 }
 

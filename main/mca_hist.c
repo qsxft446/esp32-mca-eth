@@ -45,9 +45,9 @@ bool mca_hist_init(void)
     return ok;
 }
 
-static void push(hring_t *h, uint32_t end_ds, uint32_t counts, uint32_t dur_ms)
+static uint32_t push(hring_t *h, uint32_t end_ds, uint32_t counts, uint32_t dur_ms)
 {
-    if (!h->ring || !s_mx) return;
+    if (!h->ring || !s_mx) return 0;
     const mca_hist_sample_t smp = {
         .end_ds = end_ds,
         .counts = counts,
@@ -55,9 +55,10 @@ static void push(hring_t *h, uint32_t end_ds, uint32_t counts, uint32_t dur_ms)
     };
     xSemaphoreTake(s_mx, portMAX_DELAY);
     h->ring[h->next % h->len] = smp;
-    h->next++;
+    const uint32_t num = h->next++;
     if (h->count < h->len) h->count++;
     xSemaphoreGive(s_mx);
+    return num;
 }
 
 void mca_hist_push(uint32_t counts, uint32_t dur_ms, int64_t t_us)
@@ -70,9 +71,9 @@ void mca_hist_push(uint32_t counts, uint32_t dur_ms, int64_t t_us)
     push(&s_h[0], (uint32_t)(t_us / 100000), counts, dur_ms);
 }
 
-void mca_hist_push_fast(uint32_t counts, uint32_t dur_ms, uint32_t end_ds)
+uint32_t mca_hist_push_fast(uint32_t counts, uint32_t dur_ms, uint32_t end_ds)
 {
-    push(&s_h[1], end_ds, counts, dur_ms);
+    return push(&s_h[1], end_ds, counts, dur_ms);
 }
 
 void mca_hist_clear(void)

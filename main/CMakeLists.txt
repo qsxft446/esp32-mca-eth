@@ -4,6 +4,7 @@ idf_component_register(
          "adc_cap.c"
          "mca_dsp.c"
          "mca_dose.c"
+         "cps_win.c"
          "mca_diag.c"
          "mca_prof.c"
          "mca_settings.c"

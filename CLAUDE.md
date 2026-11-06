@@ -24,6 +24,8 @@ WiFi/Ethernet, эмуляция MCA (shproto) на UART0. ESP-IDF 5.4.4. Уст�
   странице (`mca_web.c`). Меняется формат → все три и уровень 9 `test_dsp.py`.
 - G(E) дозы: коэффициенты `G_H10`, `G_KA` в `main/mca_dose.c` ↔ вывод `tools/dosemodel/fit_blocks.py`;
   порядок блоков — `MCA_DOSE_DET_NAME` ↔ `KDET` и список `ddet` на странице.
+- Окно быстрого CPS и дозы: `main/cps_win.c` ↔ `tools/cpswin.py` (построчный порт);
+  сверка с прибором `python tools/cpswin.py <ip> 60`.
 - Проба KCl: `kclcore.js` в `mca_web.c` — порт `tools/dosemodel/mc_kcl.py`; правка одного → `check_kcl.py`.
 - README.md и README.en.md — одно содержание; меняется один — меняется второй.
 - Поведение для пользователя изменилось → раздел README в том же коммите.

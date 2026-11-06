@@ -127,23 +127,34 @@ static void fast_tick(void *arg)
 {
     static bool     init;
     static uint64_t ev0, ms0;
+    static double   h0, k0;
     static uint32_t ds;
     uint64_t ev, rn;
-    mca_dsp_tick_fast();
-    mca_dsp_run_snap(&ev, &rn);
+    double dh, dk;
+    /* один снимок: события, время набора и суммы дозы - под одной блокировкой */
+    mca_dsp_dose_snap(&dh, &dk, &ev, &rn);
     const uint64_t ms = rn / 1000000ULL;
     if (!init) {
         ds = (uint32_t)(esp_timer_get_time() / 100000);
         init = true;
     } else {
         ds++;
-        /* «Сброс» обнулил оба счётчика - считаем с нуля */
+        /* «Сброс» обнулил счётчики - считаем с нуля */
         const uint64_t dc = ev >= ev0 ? ev - ev0 : ev;
         const uint64_t dm = ms >= ms0 ? ms - ms0 : ms;
-        if (dm) mca_hist_push_fast((uint32_t)dc, (uint32_t)dm, ds);
+        const double ih = dh >= h0 ? dh - h0 : dh;
+        const double ik = dk >= k0 ? dk - k0 : dk;
+        if (dm) {
+            const uint32_t hi = mca_hist_push_fast((uint32_t)dc, (uint32_t)dm, ds);
+            mca_dsp_win_step((uint32_t)dc, (uint32_t)dm, (float)ih, (float)ik, hi);
+        } else {
+            mca_dsp_win_idle();
+        }
     }
     ev0 = ev;
     ms0 = ms;
+    h0 = dh;
+    k0 = dk;
 }
 
 void app_main(void)

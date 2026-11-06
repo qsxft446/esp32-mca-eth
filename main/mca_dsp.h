@@ -41,9 +41,11 @@ size_t mca_dsp_get_spectrum(uint32_t *dst, size_t from, size_t count);
 
 void mca_dsp_get_stats(mca_stats_t *out);
 void mca_dsp_tick_1s(void);
-/* Быстрый CPS (окно 100 мс ... 1 с, сбрасывается при скачке счёта): звать
- * из таймера 100 мс (main.c). */
-void mca_dsp_tick_fast(void);
+/* Быстрый CPS и мощность дозы (окно cps_win.c): шаг - интервал быстрой
+ * истории из таймера 100 мс (main.c): события, мс набора, суммы весов дозы,
+ * номер отсчёта истории. Набор стоит - mca_dsp_win_idle. */
+void mca_dsp_win_step(uint32_t dc, uint32_t dms, float dh, float dk, uint32_t hi);
+void mca_dsp_win_idle(void);
 /* Счётчики для быстрой истории: всего событий и время набора, нс (оба
  * обнуляет «Сброс»). */
 void mca_dsp_run_snap(uint64_t *events, uint64_t *run_ns);

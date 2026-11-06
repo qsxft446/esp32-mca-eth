@@ -193,9 +193,12 @@ typedef struct {
     uint64_t skipped_shape;     /* отброшено фильтром формы     */
     int32_t  baseline;          /* текущий уровень нуля         */
     uint32_t cps;
-    uint32_t cps_fast;          /* быстрый CPS: окно 100 мс ... 1 с,
-                                   подстраивается само (mca_dsp_tick_fast) */
+    uint32_t cps_fast;          /* быстрый CPS: окно до 30 с с детектором
+                                   изменений (cps_win.c)                 */
     uint32_t cps_fast_ms;       /* длина его окна сейчас, мс             */
+    uint32_t cps_fast_n;        /* событий в окне                         */
+    uint32_t cps_fast_k;        /* интервалов (по 0.1 с) в окне           */
+    uint32_t cps_fast_hi;       /* номер последнего отсчёта быстрой истории */
     double   dose_h;            /* сумма весов H*(10) с «Сброса», пЗв    */
     double   dose_k;            /* сумма весов кермы с «Сброса», пГр     */
     float    dose_h_fast;       /* то же в секунду, окно быстрого CPS    */
