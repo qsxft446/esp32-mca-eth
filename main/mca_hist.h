@@ -13,6 +13,9 @@
  * того, открыта ли страница. */
 
 #define MCA_HIST_LEN 21600      /* 6 ч по 1 с */
+/* Быстрая история - то же по 0.1 с (таймер 100 мс в main.c) за последние
+ * 10 мин, 60 КБ: для шага графика 0.1 / 0.25 / 0.5 с. */
+#define MCA_HIST_FAST_LEN 6000
 
 typedef struct __attribute__((packed)) {
     uint32_t end_ds;   /* конец секунды: время с включения прибора, 0.1 с */
@@ -23,7 +26,9 @@ typedef struct __attribute__((packed)) {
 bool   mca_hist_init(void);
 /* Из главной задачи, раз в секунду, только если dur_ms > 0. */
 void   mca_hist_push(uint32_t counts, uint32_t dur_ms, int64_t t_us);  /* t_us - время тика, esp_timer */
-/* Очистить и сменить эпоху (страница по ней понимает, что история новая). */
+/* Из таймера 100 мс: отсчёт быстрой истории, end_ds - конец шага, 0.1 с. */
+void   mca_hist_push_fast(uint32_t counts, uint32_t dur_ms, uint32_t end_ds);
+/* Очистить обе истории и сменить эпоху (страница по ней понимает, что история новая). */
 void   mca_hist_clear(void);
 /* Отсчёты начиная с номера from (меньше старейшего или больше
  * следующего - со старейшего), не больше max. *first - номер out[0],
@@ -31,3 +36,7 @@ void   mca_hist_clear(void);
  * включении и новая после очистки). Возвращает число скопированных. */
 size_t mca_hist_copy(uint32_t from, mca_hist_sample_t *out, size_t max,
                      uint32_t *first, uint32_t *next, uint32_t *epoch);
+/* То же из секундной (fast = false) или быстрой (true) истории. */
+size_t mca_hist_copy_ex(bool fast, uint32_t from, mca_hist_sample_t *out,
+                        size_t max, uint32_t *first, uint32_t *next,
+                        uint32_t *epoch);

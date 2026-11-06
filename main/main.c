@@ -15,6 +15,7 @@
 #include "mca_web.h"
 #include "mca_emu.h"
 #include "mca_hist.h"
+#include "mca_dose.h"
 #include "mca_ota.h"
 #include "mca_oled.h"
 #include "mca_log.h"
@@ -117,6 +118,34 @@ static void capture_stop(void)
     adc_cap_stop();
 }
 
+/* Шаг 100 мс: быстрый CPS и отсчёт быстрой истории - события и время
+ * набора за шаг (по счётчику набора, как у секундной истории: без потерь
+ * и остановок). Номер отсчёта по 0.1 с - счётчиком от первого шага, а не
+ * по часам в момент вызова: задержка вызова не сдвигает отсчёт в соседнюю
+ * десятую. Пока набор стоит, отсчёты не пишутся. */
+static void fast_tick(void *arg)
+{
+    static bool     init;
+    static uint64_t ev0, ms0;
+    static uint32_t ds;
+    uint64_t ev, rn;
+    mca_dsp_tick_fast();
+    mca_dsp_run_snap(&ev, &rn);
+    const uint64_t ms = rn / 1000000ULL;
+    if (!init) {
+        ds = (uint32_t)(esp_timer_get_time() / 100000);
+        init = true;
+    } else {
+        ds++;
+        /* «Сброс» обнулил оба счётчика - считаем с нуля */
+        const uint64_t dc = ev >= ev0 ? ev - ev0 : ev;
+        const uint64_t dm = ms >= ms0 ? ms - ms0 : ms;
+        if (dm) mca_hist_push_fast((uint32_t)dc, (uint32_t)dm, ds);
+    }
+    ev0 = ev;
+    ms0 = ms;
+}
+
 void app_main(void)
 {
     mca_log_init();             /* лог для страницы «Диагностика» - первым */
@@ -126,6 +155,20 @@ void app_main(void)
     mca_dsp_init();
     mca_diag_init();
     mca_hist_init();
+    mca_dose_init();
+    /* Таймер 100 мс: быстрый CPS и быстрая история CPS по 0.1 с. Не главный
+     * цикл: у того шаг 100 мс плюс работа (секундный тик - дольше), и
+     * отсчёты по 0.1 с ложились бы неровно. */
+    {
+        static esp_timer_handle_t ft;
+        const esp_timer_create_args_t fa = {
+            .callback = fast_tick, .name = "cps_fast",
+        };
+        esp_err_t fe = esp_timer_create(&fa, &ft);
+        if (fe == ESP_OK) fe = esp_timer_start_periodic(ft, 100000);
+        if (fe != ESP_OK)
+            ESP_LOGE(TAG, "таймер быстрого CPS не запущен: %s", esp_err_to_name(fe));
+    }
 
     ESP_ERROR_CHECK(adc_clk_start(mca_freq_table[MCA_FREQ_DEFAULT_IDX]));
     ESP_ERROR_CHECK(adc_cap_init());
@@ -197,6 +240,7 @@ void app_main(void)
             if (now_us - next_tick_us > 1000000)   /* сильно отстали - не догоняем */
                 next_tick_us = now_us + 1000000;
             mca_dsp_tick_1s();
+            mca_dose_tick_1s();         /* калибровка и настройки -> таблицы дозы */
             /* набор эталона формы закончен - эталон в память прибора */
             if (mca_dsp_shape_poll()) {
                 static mca_shape_wave_t sw;

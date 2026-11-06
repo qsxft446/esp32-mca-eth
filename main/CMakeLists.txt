@@ -3,6 +3,7 @@ idf_component_register(
          "adc_clk.c"
          "adc_cap.c"
          "mca_dsp.c"
+         "mca_dose.c"
          "mca_diag.c"
          "mca_prof.c"
          "mca_settings.c"
@@ -16,7 +17,7 @@ idf_component_register(
          "mca_oled.c"
          "mca_log.c"
     INCLUDE_DIRS "."
-    EMBED_FILES "logo.png"
+    EMBED_FILES "logo.png" "favicon.ico"
     REQUIRES driver esp_driver_gpio esp_driver_ledc esp_driver_spi
              esp_driver_uart
              esp_hw_support esp_http_server esp_eth nvs_flash

@@ -41,6 +41,19 @@ size_t mca_dsp_get_spectrum(uint32_t *dst, size_t from, size_t count);
 
 void mca_dsp_get_stats(mca_stats_t *out);
 void mca_dsp_tick_1s(void);
+/* Быстрый CPS (окно 100 мс ... 1 с, сбрасывается при скачке счёта): звать
+ * из таймера 100 мс (main.c). */
+void mca_dsp_tick_fast(void);
+/* Счётчики для быстрой истории: всего событий и время набора, нс (оба
+ * обнуляет «Сброс»). */
+void mca_dsp_run_snap(uint64_t *events, uint64_t *run_ns);
+/* Таблица весов дозы по каналам (пары H*(10), керма; mca_dose.c) или NULL -
+ * доза не считается. */
+void mca_dsp_dose_table(const float *g);
+/* Суммы дозы, события и время набора (нс) - одним снимком под одной
+ * блокировкой: для мощности дозы за короткое окно на странице. */
+void mca_dsp_dose_snap(double *h_psv, double *k_pgy, uint64_t *events,
+                       uint64_t *run_ns);
 
 /* ---- ФИЛЬТР ФОРМЫ ----
  * Мера формы - эффективная ширина импульса: площадь / высота, в отсчётах,

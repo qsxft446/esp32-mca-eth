@@ -293,10 +293,69 @@ BecqMoni (answers to commands).
 - **Language** — English or Russian, RU / EN buttons in the header next to
   the ADC frequency. The choice is remembered in the browser; without a
   choice the browser language is used (Russian for `ru`, otherwise English).
-- **Spectrum** — acquisition, lin/log scale, analysis of the
-  selected peak (centroid, FWHM, resolution), file export: XML
+- **Tab icon** — `/favicon.ico` (`main/favicon.ico`, embedded in the
+  firmware): the same atom as in the header, 16/32/48 px, at 16 and 32 px
+  the lines are thickened, or the orbits vanish.
+- **Spectrum** — acquisition, lin/log scale, “channels / keV” X axis,
+  analysis of the selected peak (centroid, FWHM, resolution). A peak is
+  selected with the mouse right on the plot: a click on a peak — the range
+  around it (the maximum within ±4 % of the click point, a fit, centroid
+  ±1.5 FWHM; checked on 7 Ra-226 spectra — 140 clicks from −4 to +4 % off
+  the line, all hit it), a drag — your own range, a double click — reset;
+  the result is labelled above the peak, the channel, energy and count are
+  shown under the cursor. File export: XML
   (ResultDataFile, opens in BecqMoni), CSV (channel, count), N42
   (ANSI N42.42), SPE (SpectraLine).
+- **Energy calibration** — a block under the spectrum plot. Choose the
+  isotope (Ra-226, Cs-137, Cs-137 + K-40, Th-232, Co-60) and “Calibrate”: the
+  page searches for the isotope lines (trying pairs “two lines — two
+  peaks”: for the right straight line the other lines land on peaks within
+  ~1 keV, for a false one the deviations are several times larger; the
+  scale zero no further than ±80 keV), fits each peak (centroid — a
+  parabola over the log of the top, FWHM — at half maximum above a
+  straight background at ±3σ) and builds the scale E = c0 + c1·k
+  (+ c2·k² with four or more lines). “Save to settings” writes the
+  calibration to the device; until then it is only on the page and marked
+  “not saved”. “Show calibration lines” marks the isotope lines on the
+  plot: the ones used for the calibration — bright and labelled, the other
+  known lines of the same isotope — faint. Under “Calibration” too are the scale,
+  the table of lines and the c0–c4 fields: the coefficients can be entered
+  by hand (E = c0 + c1·k + … + c4·k⁴, keV; the scale must grow with the
+  channel number over the whole spectrum) with “Apply”, then “Save to
+  settings”. Calibration by points (up to 4) for any isotope is there too:
+  with “Calibration” open, a click on a peak in the spectrum (or a drag
+  over it) fits the peak and puts its centroid into the row chosen with its
+  number button or into the first free one; you enter the line energy and
+  press “Build from points” (1 point — a line through zero, 2–3 — a line,
+  4 — a parabola; the energies must grow with the channel number). The
+  browser remembers the points, the plot marks them with numbers. The
+  calibration goes into files with the degree it has (XML,
+  N42, SPE — up to the 4th). “Cs-137 + K-40” looks only for 662 and
+  1461 keV, both required: with the barium X-ray the pair “32 + 1461” fitted
+  the spectrum as neatly as the right “32 + 662”. “Calibrate” does not take a spectrum below 50 thousand events: on a sparse
+  spectrum (right after “Reset”) false matches collect as many lines; of up
+  to eight best matches the one with consistent widths is taken (FWHM grows
+  roughly as the square root of energy) — on spectra thinned to 100
+  thousand events the lines are found correctly, on smaller ones the search
+  refuses rather than errs. The device stores the
+  calibration (`/calib`, NVS) together with a signature of the settings:
+  if the method, windows, L, G, “codes per channel”, polarity or rate
+  change, the block says the calibration must be made again, and the keV
+  scale is not applied. With a calibration the peak meter shows the
+  energy, FWHM in keV and the **resolution from the line energy**: the
+  percentage “width / position in channels” depends on the scale zero (from
+  +30 to −24 keV for different methods) and comparing methods by it is
+  unfair. The X axis switches to keV, XML, N42 and SPE files are exported
+  with the calibration (as BecqMoni writes it: a polynomial from the lowest
+  power), CSV — with an energy column. Checked (2026-11-06): on 14 Ra-226
+  spectra and 4 Cs-137 ones the lines are found correctly, deviations are
+  at most 1 keV, FWHM agrees with an independent “Gaussian + straight
+  line” fit within 1–3 %; on the device — 4 Ra-226 lines, 609 keV:
+  46.5 keV (7.63 %). Limitation: for lines with close neighbours (352 next
+  to 295, 1120 next to 1238 keV) the edge of the background window touches
+  the neighbouring peak, and the FWHM in the calibration table is
+  underestimated by 5–11 % (synthetic spectrum); for 609 and 662 keV it is
+  exact, ±1 %.
 - **Settings** — a separate page (link at the top): “Network” (address:
   DHCP or static), “Firmware” (version and update over the network) and
   “ADC settings” sections. The “Spectrum” and “Oscilloscope”
@@ -348,8 +407,19 @@ BecqMoni (answers to commands).
   `main/mca_hist.c`): it accumulates while the spectrum is acquired, even
   with the page closed; the page only fetches new samples. The CPS of an
   interval is the counts divided by the time acquisition actually ran
-  (without lost chunks). “Clear history” does not touch the spectrum, and
-  “Reset” does not touch the history. A gap in the plot appears only where
+  (without lost chunks). A plot step of 0.1, 0.25 and 0.5 s comes from the
+  fast history: 0.1 s samples over the last 10 minutes (60 KB of PSRAM),
+  written by a 100 ms timer in `main/main.c` (a sample is the events and
+  the acquisition time of the step; the sample number runs as a counter,
+  so a late call does not shift it into the next tenth). The page fetches
+  it 5 times a second while such a step is chosen. A 0.25 s step is made of
+  2–3 samples of 0.1 s (0.2 or 0.3 s), CPS by their real time. Checked on
+  the device (2026-11-06, ~120 cps): the sample step is exactly 0.1 s
+  (294 of 294), over 29 seconds 3579 events by the fast history against
+  3586 by the per-second one — the difference is at the second edges (the
+  timer and the one-second tick have different phases). “Clear history”
+  clears both without touching the spectrum; “Reset” does not touch the
+  history. A gap in the plot appears only where
   there was no acquisition. The plot used to break sometimes in the middle
   of acquisition too: the time of a sample was computed from the moment of
   each page request, network delay shifted neighbouring samples, and a
@@ -382,9 +452,9 @@ BecqMoni (answers to commands).
   frame: the baseline stays put on screen, and its slow drift shows under
   the plot as “drift”. Pressing again returns to per-frame measurement.
 - **Start/Stop apply to the open tab:** on “Spectrum” — spectrum acquisition
-  (together with “Reset”, the status line and acquisition
-  time/CPS/events; the time runs only while the spectrum is being
-  acquired), on “Oscilloscope” — only the oscilloscope: pause holds the last
+  (together with “Reset”, the status line — CPS, events, dead time,
+  load — and only the acquisition time next to the buttons; the time runs
+  only while the spectrum is being acquired), on “Oscilloscope” — only the oscilloscope: pause holds the last
   frame. Acquisition and the oscilloscope do not run together — the device
   has one mode. **The tabs only switch the view:** opening “Oscilloscope”
   does not start it. “Start” there, while acquisition is running, first
@@ -432,6 +502,112 @@ consecutive pulses.*
 
 *Time base 32768 samples (2 ms at 16 MHz) and the processing settings table:
 parameters of the other measurement method are dimmed.*
+
+## Dose rate from the spectrum
+
+When the device holds an energy calibration for the current settings, it
+computes the dose rate: each event adds the weight G(E) of its channel
+(`main/mca_dose.c`, the per-channel weight table is rebuilt when the
+calibration or the settings change). The status line shows the dose rate
+in µSv/h over the last 10 s of acquisition, updated every second (the
+tooltip has the window length, counting error and µR/h): the window length,
+not the display rate, sets the precision — at ~30 cps a 1 s window would
+give ±18 %, 10 s ±6 %. The device returns the weight sums and the
+acquisition time in `/dose` as one snapshot: the acquisition time in the
+statistics updates once a second, which in a 10 s window would give jumps
+of up to 10 %. The
+“Dose rate” block under the calibration the mean since “Reset” with its
+counting error. A calibration made with other settings — no dose, the
+block says so.
+
+- **G(E)** is a 5th-degree polynomial in ln E fitted on a Monte Carlo
+  model of the chosen NaI(Tl) block crystal (`tools/dosemodel`: photoabsorption
+  with iodine K X-ray escape, Klein–Nishina Compton, pairs; NIST XCOM cross
+  sections) so that the sum of weights over the spectrum gives H*(10)
+  (ICRP 74, table from the OpenMC data, MIT licence) and air kerma (NIST μen/ρ) for
+  33 keV … 3 MeV photons in a uniform isotropic field. The model
+  resolution is 47.2 keV at 609 keV, the threshold 25 keV, above 3 MeV the
+  weight grows as E.
+- **Model accuracy** (computed against true, 50 keV … 3 MeV): isotropic —
+  3 % on average, at most 14 %; source at the side — at most 17 %; at the
+  end face below 200 keV — down to −35 % (soft radiation is absorbed near
+  the surface, and the end face is smaller than the side). At 662 keV:
+  −5 / −6 / −12 %. A plain “k·E” weight would err from −38 to +112 %. The
+  housing, reflector, PMT and surroundings are not in the model.
+- **Model against the device** (2026-11-06): the “662 peak / Compton
+  300–450 keV” ratio for Cs-137 is 2.29 in the model, 2.08 in the device
+  spectrum (no background subtracted). Below 250 keV the device sees 2.5
+  times more than the model — scatter from the table, walls and
+  backscatter; for the dose these are real photons, G accounts for them.
+- **Two counting paths** (2026-11-06, Ra-226, ~4600 cps, 56 s): the device
+  by events — 6.53 µSv/h and 627 µR/h, the PC from the exported spectrum
+  and calibration with the same G from `tools/dosemodel` — 6.48 µSv/h and
+  622 µR/h; the difference is events above channel 2048 (in the dose, not
+  in the export) and different snapshot moments.
+- **Correction k** is a factor to both values (0.05 … 20, kept in the
+  device): a dosimeter next to the detector, “Reset”, a few minutes, the
+  dosimeter reading — “Fit k”. A flash write, as for any settings, costs
+  lost chunks.
+- **KCl check** (2026-11-07, `tools/dosemodel/mc_kcl.py`): 400 g of food
+  grade KCl in a Ø114×45 mm jar (bulk density 0.87 g/cm³, wall 0.5 mm),
+  the detector end face on the lid centre, a lead castle with a copper
+  cup; empty-castle background 1950 s, sample 1992 s, no losses. 400 g of
+  KCl emit 709 photons of 1461 keV per second (16.6 Bq/g, yield 10.66 %).
+  The net peak is 3.51 ± 0.05 cps, the NaI Ø40×40 model gives
+  2.37–2.67 cps (the crystal depth in the housing, 2–6 mm, is unknown):
+  32–48 % more measured. CsI Ø40×40 (3.44–3.95) or NaI ~Ø45×45
+  (3.33–3.82) would give as much; the block is taken as NaI Ø40×40, the
+  difference went into the correction k = 0.712 (middle of 0.675–0.761;
+  statistics ±1.5 %). A measurement through a spacer does not pin the
+  crystal depth: with 20 mm the count ratio changes by only 3.6 % for a
+  depth of 1→8 mm. It also shows the energy scale drifted by −4…−5 % over
+  the whole range (511 at 486, K-40 at 1390, 2614 at 2516 keV) — PMT gain
+  after the calibration; G(E) takes the energy from the scale, so the scale
+  should be refreshed before dose measurements.
+- Cosmic muons leave more than 3 MeV and go off scale, they are not in the
+  dose: at background the device shows less than a dosimeter (at sea level
+  the muon part is about 0.03 µSv/h).
+- **The detector block** is chosen under “Calibration”: NaI(Tl) Ø25×25,
+  30×40, 30×70, 40×40, 63×63, 80×80 (`tools/dosemodel/fit_blocks.py`,
+  each with its own G and its own correction k; the former single
+  correction went to 40×40). Model H*(10) error from 50 keV to 3 MeV:
+
+  | Block | isotropic, mean / max | side, max | end face, max | 662 keV: iso / side / end |
+  |---|---|---|---|---|
+  | Ø25×25 | 4.8 / 17 % | 16 % | 34 % | −8 / −10 / −14 % |
+  | Ø30×40 | 3.8 / 15 % | 11 % | 47 % | −5 / −5 / −19 % |
+  | Ø30×70 | 3.4 / 15 % | 19 % | 66 % | −5 / −1 / −37 % |
+  | Ø40×40 | 3.2 / 14 % | 17 % | 35 % | −5 / −6 / −12 % |
+  | Ø63×63 | 2.0 / 11 % | 16 % | 34 % | −2 / −3 / −13 % |
+  | Ø80×80 | 1.5 / 10 % | 16 % | 34 % | −1 / −3 / −14 % |
+
+  The long Ø30×70 shows 7 cm² from the end against 21 cm² from the side —
+  it underestimates soft radiation at the end face most of all. The block
+  housing is not in the model: thick-walled blocks overestimate the dose
+  below ~60 keV.
+- **Everything about calibration is under the “Calibration” button**:
+  energy, lines, points, coefficients, dose rate, block, dosimeter
+  correction, KCl sample; outside — a one-line summary (“energy: Ra-226 ·
+  dose: NaI 40×40, k 0.712”).
+- **KCl sample on the page**: “Store background” (the browser keeps the
+  empty-castle spectrum and time), the sample — “Compute from sample”. The
+  page fits the net K-40 peak (Gaussian + line in a −4…+4.5σ window,
+  centroid and width by a grid search, area by linear least squares) and
+  computes the same peak with the Monte Carlo model of the chosen block’s
+  crystal for a jar under the end face (2 million photons, ~1 s), offers
+  k = model / measured and warns of a scale shift above 2 %.
+  `tools/check_kcl.py` checks the page core against Python: the model on
+  four geometries (0.0…2.6 % apart with a 3σ statistical tolerance), the
+  peak area on the sample spectra (`tools/kcl_test.json`) — 3.639 against
+  3.589 cps from `curve_fit` in the same window (+1.4 %); it fails on a ×2
+  salt attenuation and on a wrong Gaussian normalisation. The area depends
+  on the fit window: −3…+3.5σ — 3.47, −5…+5.5σ — 3.63, −7…+8σ — 3.51 cps,
+  that is ±2–3 % systematics (the former k = 0.712 used a −7…+8σ window
+  and a 4.5 mm gap; the page with a 5 mm gap gives 0.665 ± 0.013).
+- A crystal of another size or CsI needs another G: add it to
+  `tools/dosemodel/fit_blocks.py` (CsI needs its own cross sections and
+  density), run it and rewrite `G_H10`, `G_KA` in `main/mca_dose.c` and the
+  `KDET` list on the page.
 
 ## Pulse shape filter
 
@@ -1044,7 +1220,65 @@ count rate or heavy event processing.
   the whole spectrum; shape match 0.998). The remaining 4 % is an assumption:
   the integration baseline (running average) slightly lowers the amplitude;
   on the model the same integration gives 17.61 versus 18.85 with an exact
-  baseline.
+  baseline. *Since 2026-11-06 the integration baseline is before the rise,
+  as for convolution (model: 19.19, convolution 19.19), see “609 keV
+  resolution”.*
+
+### 609 keV resolution (Ra-226): method and window
+
+Selection 2026-11-06: noisy PMT, Ra-226, ~4900 cps, 24 MHz, 10 minutes per
+run, spectrum reset before each. **The comparison is in keV**: each run is
+calibrated by the 352, 609, 1120 and 1764 keV lines (E = a·channel + b, the
+lines lie on the straight line within 5 keV), resolution is the FWHM of the
+609 keV peak in keV. The percentage “width in channels / position in
+channels” depends on the scale zero offset — from +30 to −24 keV for
+different methods — and comparing methods by it is unfair.
+
+| Method | FWHM 609, keV | % of 609 keV | In the peak, cps |
+|---|---|---|---|
+| trapezoid L10 G13 (as it was) | 69.9 | 11.47 | 296 |
+| trapezoid L10 G40 | 63.0 | 10.33 | 290 |
+| trapezoid L48 G98 | 55.2 | 9.07 | 276 |
+| convolution 19 + 152 | 54.0 | 8.86 | 288 |
+| integration 12 + 120 | 57.9 | 9.50 | 269 |
+| integration 19 + 152, running baseline | 49.4 | 8.12 | 261 |
+| integration 19 + 152, baseline before the rise | 49.0 | 8.04 | 262 |
+| integration 26 + 152 | 49.6 | 8.14 | 265 |
+| integration 19 + 200 (two runs) | 48.3 / 48.1 | 7.93 / 7.89 | 255 / 251 |
+| **integration 19 + 250** | **47.5** | **7.80** | 241 |
+| integration 19 + 320 | 47.7 | 7.83 | 228 |
+| final: 19 + 250, shape filter 25 %, 0.25 codes per channel | 47.2 | 7.75 | 238 |
+
+A repeat of the same run differed by 0.2 keV, the fit error is about
+0.3 keV. No chunk losses in any run, processing load 80–83 %.
+
+- **The pulse** (3000 raw oscilloscope frames of 32768 samples): baseline
+  noise 1.3 codes; rise 10–90 % — 0.5 µs (12 samples), from 10 % to the top
+  — 18; the top stays within 2 % of the maximum for only 5 samples; decay to
+  50 % in 1.4 µs, to 10 % in 4.8 µs, to 1 % in 12.5 µs (a slow tail).
+- **Height follows the charge poorly.** The flash shape varies from pulse to
+  pulse, and the height of a rounded top is a poor measure of energy. A
+  trapezoid with a short L measures exactly that; as L grows it approaches
+  integration (L48 — 55 keV). Best is the full charge: integration with a
+  window to the end of the tail.
+- **Trapezoid G larger than L + rise.** The trapezoid subtracts the sum of L
+  samples taken G samples back; with G = 13 and a rise of ~24 samples that
+  subtracted window landed on the pulse's own rise, and the amplitude
+  depended on its shape: G = 40 gives 63.0 keV instead of 69.9.
+- **“Before peak” 19**: from 10 % of the rise to the top is 18 samples; 12
+  cuts the rise (57.9 keV), 26 adds nothing. **“After peak” 250** (10.4 µs):
+  the tail drops to ~3 % by then, no gain beyond, but more pile-up — 241 →
+  228 cps in the peak at 320. The window is set in samples: at 20 MHz the
+  same time is 16 + 208.
+- **The shape filter** does not affect the 609 keV peak (48.9 versus
+  49.0 keV); it is needed near the threshold.
+- **In the code.** The integration baseline is now 32 samples before the
+  rise, as for convolution and the width measure (the running one is only a
+  fallback): scale zero −21 → −16.5 keV, resolution 49.4 → 49.0 keV (at the
+  edge of the error). “Baseline 2^N” is limited to 1–16: the device had 55,
+  and shifting a 32-bit number by 32 or more is undefined in C. The
+  remaining scale zero of −16 keV is probably NaI non-proportionality (an
+  assumption, not checked).
 
 ### Other
 
@@ -1081,6 +1315,22 @@ count rate or heavy event processing.
   actually elapsed time: the one-second tick comes from the lowest-priority
   main loop, and under core 0 load (for example, spectrum upload over COM)
   it stretched to 1.1–1.2 s, overstating the rate by 10–20 %.
+- CPS on the spectrum page is fast, for finding a source by hand: every
+  ~100 ms the device takes the events of that step, the page fetches the
+  number from `/cps` 10 times a second (only on the spectrum tab, no more
+  than one request at a time). The window adapts itself: while the count
+  is steady it grows up to 1 s; if the next 100 ms differ from the window
+  mean by more than 3σ of Poisson, the window is cut to those 100 ms. The
+  window length is in the tooltip of the big number. Model (200 runs of a
+  step): 130 → 260 cps — reaction 100 ms (90 %: 300 ms) against
+  500–600 ms for a 1 s window; at rest at 130 cps the scatter is ±11 %
+  against ±8.5 % for a 1 s window and ±28 % for bare 100 ms. On the device
+  (2026-11-06, ~114 cps, 15 s): scatter ±15 %, the window is shorter than
+  300 ms in 2 % of polls (false cuts on bursts); “Stop” — the number is 0
+  259 ms after the command, “Start” — 72 after 258 ms and 104 after
+  463 ms: the incomplete first interval and the polling add to the 100 ms
+  step. At a low count a step is caught later: 30 → 60 cps — median 0.4 s,
+  90 % — 0.8 s.
 
 ## Console diagnostics
 
@@ -1170,5 +1420,18 @@ on other ESP32-S3 boards:
   only).
 - `check_i18n.py` — checks that every label of the device pages has an
   English pair (`python tools/check_i18n.py`).
+- `check_kcl.py` — the KCl sample of the spectrum page: the 1461 keV peak
+  model and the net peak fit against `tools/dosemodel` and scipy
+  (`python tools/check_kcl.py`).
+- `check_cal.py` — the energy calibration of the spectrum page: takes its
+  core out of `mca_web.c` and runs it in node on synthetic Ra-226 and
+  Cs-137 spectra with a known scale and on a real device spectrum
+  (`cal_ra226_trap.json`) (`python tools/check_cal.py`).
+- `dosemodel/` — dose rate: `mc.py` — Monte Carlo response of a NaI
+  crystal, `fitg.py` — the G(E) fit and its accuracy by energies and
+  directions (`cd tools/dosemodel && python fitg.py`); data — NIST XCOM,
+  NIST air μen/ρ, ICRP 74 H*(10) from OpenMC (`photons_H10.txt`);
+  `mc_kcl.py` — the expected 1461 keV peak from a KCl jar under the
+  crystal end face.
 - `ota.py` — flashing over the network (`python tools/ota.py <ip>`, see
   “Updating over the network”).

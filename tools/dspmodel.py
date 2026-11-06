@@ -461,11 +461,17 @@ class DSP:
                     if self.since >= p.search:
                         ipk, isum = -1, 0
                         if p.algo == 1:
-                            ib = base_fp >> 8
-                            num, den = self.amp_integrate(
+                            # база - 32 отсчёта до «пробой - L», как в прошивке
+                            s_, den = self.amp_integrate(
                                 self.peak_pos, p.int_rise, p.int_fall,
-                                L, G, ib)
-                            ipk, isum = self.int_pk, num + den * ib
+                                L, G, 0)
+                            ipk, isum = self.int_pk, s_
+                            e = self.cross_pos - L
+                            if e - 32 >= 0:
+                                num = s_ * 32 - den * sum(self.w[e - 32:e])
+                                den *= 32
+                            else:
+                                num = s_ - den * (base_fp >> 8)
                         elif conv_ok and self.amp_conv(self.peak_pos, end) is not None:
                             num, den, ipk = self.amp_conv(self.peak_pos, end)
                             isum = -1

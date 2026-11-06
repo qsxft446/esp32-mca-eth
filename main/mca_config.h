@@ -193,6 +193,13 @@ typedef struct {
     uint64_t skipped_shape;     /* отброшено фильтром формы     */
     int32_t  baseline;          /* текущий уровень нуля         */
     uint32_t cps;
+    uint32_t cps_fast;          /* быстрый CPS: окно 100 мс ... 1 с,
+                                   подстраивается само (mca_dsp_tick_fast) */
+    uint32_t cps_fast_ms;       /* длина его окна сейчас, мс             */
+    double   dose_h;            /* сумма весов H*(10) с «Сброса», пЗв    */
+    double   dose_k;            /* сумма весов кермы с «Сброса», пГр     */
+    float    dose_h_fast;       /* то же в секунду, окно быстрого CPS    */
+    float    dose_k_fast;
     uint32_t freq_hz;
     uint32_t run_ms;            /* время набора: только пока спектр
                                    набирается, «Сброс» обнуляет      */

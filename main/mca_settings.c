@@ -137,6 +137,41 @@ void mca_settings_save_params(const mca_params_t *p)
         ESP_LOGW(TAG, "настройки не сохранены: %s", esp_err_to_name(e));
 }
 
+size_t mca_settings_load_calib(char *buf, size_t n)
+{
+    if (n < 2) return 0;
+    nvs_handle_t h;
+    if (nvs_open(NS, NVS_READONLY, &h) != ESP_OK) return 0;
+    size_t len = n - 1;
+    const esp_err_t e = nvs_get_blob(h, "cal", buf, &len);
+    nvs_close(h);
+    if (e != ESP_OK) return 0;
+    buf[len] = 0;
+    return len;
+}
+
+/* Запись во флеш останавливает и второе ядро (кэш выключен на время
+ * записи) - это потерянные чанки, как и у любых настроек; калибровку
+ * сохраняют редко. */
+esp_err_t mca_settings_save_calib(const char *s, size_t len)
+{
+    if (len > MCA_CALIB_MAX) return ESP_ERR_INVALID_SIZE;
+    nvs_handle_t h;
+    esp_err_t e = nvs_open(NS, NVS_READWRITE, &h);
+    if (e == ESP_OK) {
+        if (len) e = nvs_set_blob(h, "cal", s, len);
+        else {
+            e = nvs_erase_key(h, "cal");
+            if (e == ESP_ERR_NVS_NOT_FOUND) e = ESP_OK;
+        }
+        if (e == ESP_OK) e = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (e != ESP_OK)
+        ESP_LOGW(TAG, "калибровка не сохранена: %s", esp_err_to_name(e));
+    return e;
+}
+
 void mca_settings_save_freq(int idx)
 {
     if (idx < 0 || idx >= MCA_FREQ_COUNT) return;

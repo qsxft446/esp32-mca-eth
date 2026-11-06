@@ -613,7 +613,7 @@ check("mofs и mbuck найдены на странице",
       'function mofs(' in js12 and 'function mbuck(' in js12)
 js12 = "var MH={o:null};\n" + js12 + """
 var fs=require('fs'),a=JSON.parse(fs.readFileSync(process.argv[2],'utf8')),T=[],C=[],D=[];
-a.forEach(function(b){var o0=mofs(b[0],b[1]);b[2].forEach(function(e){T.push(o0+e*100);C.push(100);D.push(1000)})});
+a.forEach(function(b){var o0=mofs(MH,b[0],b[1]);b[2].forEach(function(e){T.push(o0+e*100);C.push(100);D.push(1000)})});
 var B=mbuck(T,C,D,1000);console.log(JSON.stringify({T:T,bt:B.t}));"""
 
 
@@ -830,10 +830,13 @@ ai_ = [x for _, x in di_.events]
 mi_ = statistics.median(ai_)
 mi_ = statistics.mean([x for x in ai_ if abs(x - mi_) < 0.5 * mi_])
 # шкала интегрирования без ошибки базы: высота x среднее формы по окну 13 + 36
-# (у интегрирования в модели своя медленная база, при частых импульсах в неё
-# подмешиваются хвосты, и оно занижено - поэтому сравнение с расчётом)
 exp_ = 30 * w_true12 / 50
 print(f"  интегрирование тех же импульсов: среднее {mi_:.2f}; без ошибки базы - {exp_:.2f}")
+# прежде база интегрирования была бегущей: в неё подмешивались хвосты частых
+# импульсов, и амплитуда выходила на ~7 % ниже (17.61). Теперь база - перед
+# фронтом этого импульса, как у свёртки
+check("интегрирование: база перед фронтом - амплитуда без сноса (±3 % от расчёта)",
+      abs(mi_ - exp_) <= 0.03 * exp_, f"{mi_:.2f} против {exp_:.2f}")
 check("свёртка - в шкале интегрирования (высота x среднее формы по окну, ±3 %)",
       abs(res[2][0] - exp_) <= 0.03 * exp_, f"{res[2][0]:.2f} против {exp_:.2f}")
 check("свёртка на малых высотах точнее трапеции (белый шум)", res[2][1] < 0.85 * res[0][1],

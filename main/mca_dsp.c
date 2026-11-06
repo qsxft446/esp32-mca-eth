@@ -100,6 +100,9 @@ static bool s_vec_ok;
 /* Счётчики, которые копит только задача обработки, без мьютекса;
  * в статистику они уходят раз на чанк (см. конец mca_dsp_process). */
 static uint32_t s_ev_pend, s_ovf_pend;   /* событий и зашкалов за чанк   */
+/* доза: таблица весов по каналам (mca_dose.c) и суммы весов за чанк */
+static const float * volatile s_dose_g;
+static float s_dh_pend, s_dk_pend;
 static uint64_t s_busy_cyc;              /* тактов обработки с замера    */
 /* Такты по этапам с замера (под LOCK): копия чанка, разность трапеции,
  * порог и события - и сколько отсчётов на них пришлось. */
@@ -275,6 +278,8 @@ static void stats_clear_locked(void)
                                     программ на ПК копились через «Сброс» */
     s_st.shape_checked     = 0;
     s_st.skipped_shape     = 0;
+    s_st.dose_h            = 0;
+    s_st.dose_k            = 0;
     s_req_hist_clear       = true;
     s_last_events = 0;
     s_run_ns      = 0;
@@ -418,6 +423,11 @@ static void record_event(int64_t num, int32_t den, const mca_params_t *p)
     }
     s_hist[ch]++;
     s_ev_pend++;
+    const float *g = s_dose_g;
+    if (g) {
+        s_dh_pend += g[2 * ch];
+        s_dk_pend += g[2 * ch + 1];
+    }
 }
 
 /* Сумма 32 отсчётов базы, кончающихся перед e (e - 32 >= 0). */
@@ -1059,12 +1069,26 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n, bool own_head)
                         int64_t num;
                         int32_t den, ipk = -1, isum = 0;
                         if (p.algo == 1) {
-                            const int32_t ib = base_fp >> 8;
-                            num = amp_integrate(s_peak_pos, p.int_rise,
-                                                p.int_fall, L, G, ib,
-                                                &den, &ipk);
-                            /* сумма окна без вычета базы - для меры формы */
-                            isum = (int32_t)(num + (int64_t)den * ib);
+                            /* БАЗА - 32 отсчёта, кончающиеся за L до
+                             * пробоя порога, как у свёртки и меры
+                             * ширины: она стоит прямо перед этим
+                             * импульсом и вычитает и хвост предыдущего.
+                             * Бегущая база (base_fp) копит и отсчёты
+                             * хвостов в пределах «окна базы», и на
+                             * 4500 имп/с её сносит (модель: амплитуда
+                             * ниже на ~7 %). Она - только запасной
+                             * случай, когда окно базы не легло в буфер. */
+                            const int e = s_cross_pos - L;
+                            const int64_t s = amp_integrate(
+                                s_peak_pos, p.int_rise, p.int_fall, L, G, 0,
+                                &den, &ipk);
+                            isum = (int32_t)s;  /* без базы - для меры формы */
+                            if (e - 32 >= 0) {
+                                num = s * 32 - (int64_t)den * shape_base32(e);
+                                den *= 32;
+                            } else {
+                                num = s - (int64_t)den * (base_fp >> 8);
+                            }
                         } else if (conv_ok &&
                                    amp_conv(s_peak_pos, end, &p, &num, &den, &ipk)) {
                             isum = -1;          /* вершина есть, суммы нет */
@@ -1153,6 +1177,8 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n, bool own_head)
     s_st.samples_processed += n;
     s_st.baseline           = base_fp >> 8;
     s_st.total_events      += s_ev_pend;
+    s_st.dose_h            += s_dh_pend;
+    s_st.dose_k            += s_dk_pend;
     s_st.overflow          += s_ovf_pend;
     s_st.shape_checked     += s_shp_chk_pend;
     s_st.skipped_shape     += s_shp_rej_pend;
@@ -1163,6 +1189,7 @@ void IRAM_ATTR mca_dsp_process(const uint16_t *data, size_t n, bool own_head)
     s_cyc_n      += n;
     UNLOCK();
     s_ev_pend = s_ovf_pend = 0;
+    s_dh_pend = s_dk_pend = 0;
     s_shp_chk_pend = s_shp_rej_pend = 0;
 }
 
@@ -1210,6 +1237,109 @@ void mca_dsp_tick_1s(void)
     s_cyc_n = 0;
     UNLOCK();
     if (s_watch_s > 0) s_watch_s--;
+}
+
+/* БЫСТРЫЙ CPS для перемещения источника: звать из таймера 100 мс. Окно подстраивается само: каждый шаг - интервал «события
+ * за шаг, время шага по часам». Пока счёт ровный, окно растёт до 10
+ * интервалов (~1 с, разброс как у посекундного CPS); если новый интервал
+ * отличается от среднего по окну больше чем на 3 сигмы Пуассона, старое
+ * окно забывается и цифра - по одному этому интервалу. Модель (2026-11-06,
+ * 200 прогонов скачка): 130 -> 260 имп/с - реакция 100 мс (90 %: 300 мс)
+ * против 500-600 мс у окна 1 с; на месте при 130 имп/с разброс ±11 %
+ * против ±8.5 % у окна 1 с и ±28 % у голых 100 мс. */
+void mca_dsp_tick_fast(void)
+{
+    enum { K = 10 };
+    static uint32_t c[K], d[K];          /* события и мкс интервала */
+    static double hh[K], kk[K];          /* суммы весов дозы за интервал */
+    static int n, head;
+    static int64_t t_prev;
+    static uint64_t e_prev;
+    static double h_prev, k_prev;
+    const int64_t now = esp_timer_get_time();
+    LOCK();
+    const uint64_t ev = s_st.total_events;
+    const double dh = s_st.dose_h, dk = s_st.dose_k;
+    UNLOCK();
+    if (!t_prev || ev < e_prev) {        /* первый шаг или «Сброс» */
+        t_prev = now;
+        e_prev = ev;
+        h_prev = dh;
+        k_prev = dk;
+        n = 0;
+        LOCK();
+        s_st.cps_fast = 0;
+        s_st.cps_fast_ms = 0;
+        s_st.dose_h_fast = s_st.dose_k_fast = 0;
+        UNLOCK();
+        return;
+    }
+    const uint32_t dc = (uint32_t)(ev - e_prev);
+    const uint32_t dd = (uint32_t)(now - t_prev);
+    if (dd < 1000) return;               /* шаг меньше 1 мс - копим дальше */
+    t_prev = now;
+    e_prev = ev;
+    const double ih = dh - h_prev, ik = dk - k_prev;
+    h_prev = dh;
+    k_prev = dk;
+    if (n) {
+        uint64_t sc = 0, sd = 0;
+        for (int k = 0; k < n; k++) {
+            const int i = (head - 1 - k + K) % K;
+            sc += c[i];
+            sd += d[i];
+        }
+        /* ожидание на этот интервал по скорости окна */
+        const float lam = sd ? (float)sc * (float)dd / (float)sd : 0.0f;
+        const float dev = (float)dc - lam;
+        if (dev * dev > 9.0f * (lam > 1.0f ? lam : 1.0f)) n = 0;
+    }
+    c[head] = dc;
+    d[head] = dd;
+    hh[head] = ih;
+    kk[head] = ik;
+    head = (head + 1) % K;
+    if (n < K) n++;
+    uint64_t sc = 0, sd = 0;
+    double sh = 0, sk = 0;
+    for (int k = 0; k < n; k++) {
+        const int i = (head - 1 - k + K) % K;
+        sc += c[i];
+        sd += d[i];
+        sh += hh[i];
+        sk += kk[i];
+    }
+    const uint32_t r = sd ? (uint32_t)((sc * 1000000ULL + sd / 2) / sd) : 0;
+    LOCK();
+    s_st.cps_fast = r;
+    s_st.cps_fast_ms = (uint32_t)(sd / 1000);
+    s_st.dose_h_fast = sd ? (float)(sh * 1e6 / (double)sd) : 0.0f;
+    s_st.dose_k_fast = sd ? (float)(sk * 1e6 / (double)sd) : 0.0f;
+    UNLOCK();
+}
+
+void mca_dsp_dose_snap(double *h_psv, double *k_pgy, uint64_t *events,
+                       uint64_t *run_ns)
+{
+    LOCK();
+    *h_psv  = s_st.dose_h;
+    *k_pgy  = s_st.dose_k;
+    *events = s_st.total_events;
+    *run_ns = s_run_ns;
+    UNLOCK();
+}
+
+void mca_dsp_dose_table(const float *g)
+{
+    s_dose_g = g;
+}
+
+void mca_dsp_run_snap(uint64_t *events, uint64_t *run_ns)
+{
+    LOCK();
+    *events = s_st.total_events;
+    *run_ns = s_run_ns;
+    UNLOCK();
 }
 
 /* ---- фильтр формы: управление из других задач ---- */
@@ -1427,6 +1557,12 @@ void mca_dsp_set_params(const mca_params_t *in)
     if (s_par.int_fall > 400) s_par.int_fall = 400;
     if (s_par.baseline_win < 1)    s_par.baseline_win = 1;
     if (s_par.baseline_win > 4095) s_par.baseline_win = 4095;
+    /* «База 2^N» - сдвиг 32-битного числа: сдвиг на 32 и больше в C не
+     * определён (на приборе стояло 55 - бегущая база интегрирования вела
+     * себя непредсказуемо). База обновляется раз в 64 отсчёта, так что
+     * постоянная времени 2^N x 64 отсчётов: 10 - 2.7 мс, 16 - 0.17 с на 24 МГц. */
+    if (s_par.baseline_shift < 1)  s_par.baseline_shift = 1;
+    if (s_par.baseline_shift > 16) s_par.baseline_shift = 16;
     s_par.shape_on = s_par.shape_on ? 1 : 0;
     if (s_par.shape_tol < 1)   s_par.shape_tol = 1;
     if (s_par.shape_tol > 200) s_par.shape_tol = 200;

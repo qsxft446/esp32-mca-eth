@@ -9,6 +9,7 @@
 #include "mca_emu.h"
 #include "scope_codec.h"
 #include "mca_hist.h"
+#include "mca_dose.h"
 #include "mca_time.h"
 #include "mca_ota.h"
 #include "mca_oled.h"
@@ -19,6 +20,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <inttypes.h>
+#include <math.h>
 #include "esp_random.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -173,7 +175,7 @@ static const char LJS[] =
 "document.addEventListener('DOMContentLoaded',function(){tsync();setInterval(tsync,3600000)});";
 
 static const char PAGE[] =
-"<!DOCTYPE html><html lang=ru><head><meta charset=utf-8>"
+"<!DOCTYPE html><html lang=ru><head><meta charset=utf-8><link rel=icon href=/favicon.ico>"
 "<meta name=viewport content='width=device-width,initial-scale=1'>"
 "<title>MCA · AD9226</title><link rel=stylesheet href=/s.css><script src=/l.js></script></head><body>"
 "<header><div class=brand><img src=/logo.png?v=2 alt=''>MCA "
@@ -200,17 +202,18 @@ static const char PAGE[] =
 "<button class='btn amber' onclick=run(0) data-en='&#9632; Stop'>&#9632; Стоп</button>"
 "<button class='btn red' id=bclr onclick=cmd('clear') data-en='&#8634; Reset'>&#8634; Сброс</button></div>"
 "<div class=ml id=g_big style='display:flex;align-items:center;gap:16px;flex-wrap:wrap'>"
-"<span class=big id=bt>00:00:00</span><span class=mut>|</span>"
-"<span class='big ac'><span id=bc>0</span><span class=mut style=font-size:12px> CPS</span></span>"
-"<span class=mut>|</span>"
-"<span class='big w'><span id=be>0</span><span class=mut style=font-size:12px data-en=' events'> событий</span></span>"
+"<span class=big id=bt title='Время набора спектра' data-en-title='Spectrum acquisition time'>00:00:00</span>"
 "</div></div>"
 "<div class=row>"
 "<span class=grp id=g_sp><span class=lbl data-en='Y scale'>Шкала Y</span>"
 "<span class=seg><button id=blin onclick=setLog(0)>Lin</button>"
 "<button id=blog class=on onclick=setLog(1)>Log</button></span>"
+/* ось X: каналы или кэВ (кэВ - только с годной калибровкой) */
+"<span class=lbl style=margin-left:8px data-en='X axis'>ось X</span>"
+"<span class=seg><button id=cax0 onclick=calAx(0) data-en='channels'>каналы</button>"
+"<button id=cax1 onclick=calAx(1) data-en='keV'>кэВ</button></span>"
 "<input type=checkbox id=lg checked hidden>"
-"<span class=lbl style=margin-left:8px data-en='peak from'>пик от</span><input id=pka type=number value=0 onchange=poll()>"
+"<span class=lbl style=margin-left:8px title='Пик можно выделить мышью на графике: щелчок по пику - выделить его, протяжка - свой участок, двойной щелчок - сбросить' data-en-title='A peak can be selected with the mouse on the plot: a click on a peak selects it, a drag - your own range, a double click - reset' data-en='peak from'>пик от</span><input id=pka type=number value=0 onchange=poll()>"
 "<span class=lbl data-en='to'>до</span><input id=pkb type=number value=0 onchange=poll()>"
 "<span class=lbl style=margin-left:8px title='Сохранить спектр файлом: "
 "XML - ResultDataFile (BecqMoni), CSV - канал и счёт, N42 - ANSI N42.42, SPE - SpectraLine. "
@@ -280,14 +283,75 @@ static const char PAGE[] =
 "задать до / после вершины</button>"
 "<button class='btn sm' onclick=rulClr() data-en='clear'>сбросить</button></div></section>"
 "<section class='panel pad'><div id=sc class=mono style=min-height:110px></div></section>"
+/* КАЛИБРОВКА ПО ЭНЕРГИИ - только на вкладке «Спектр»: линии изотопа ищет
+   и подгоняет страница (cal*), прибор хранит результат (/calib) */
+"<section class='panel pad' id=g_cal>"
+/* снаружи - только кнопка и сводка в строку; всё остальное - в calbody */
+"<div class=grp><button class='btn sm' id=cbt onclick=calTab() title='Калибровка по энергии, линии, мощность дозы, блок детектирования, проба KCl' "
+"data-en-title='Energy calibration, lines, dose rate, detector block, KCl sample' data-en='Calibration'>Калибровка</button>"
+"<span id=csum class=mut style=font-size:12px></span></div>"
+"<div id=calbody hidden>"
+"<div class=grp style=margin-top:10px>"
+"<b style=color:#e8efe2 data-en='Energy calibration'>Калибровка по энергии</b>"
+"<span class=lbl data-en='isotope'>изотоп</span>"
+"<select id=cis><option value=ra226>Ra-226 (352, 609, 1120, 1764)</option>"
+"<option value=cs137>Cs-137 (32, 662)</option><option value=th232>Th-232 (239, 583, 911, 2615)</option>"
+"<option value=cs137k40>Cs-137 + K-40 (662, 1461)</option><option value=co60>Co-60 (1173, 1332)</option></select>"
+"<button class='btn sm' onclick=calAuto() title='Найти линии изотопа в спектре, подогнать пики и построить шкалу E(канал). В прибор она попадает кнопкой «Сохранить в настройки»' "
+"data-en-title='Find the isotope lines in the spectrum, fit the peaks and build the E(channel) scale. It goes to the device with the “Save to settings” button' data-en='Calibrate'>Откалибровать</button>"
+"<button class='btn sm' id=cbl onclick=calLines() title='Отметить на графике линии изотопа: использованные для калибровки - ярко, остальные - бледно' "
+"data-en-title='Mark the isotope lines on the plot: the ones used for the calibration - bright, the others - faint' data-en='Show calibration lines'>Показать линии калибровки</button>"
+"<button class='btn sm green' id=cbs onclick=calSaveBtn() title='Сохранить калибровку в приборе: она переживёт перезагрузку и пойдёт в выгружаемые файлы' "
+"data-en-title='Save the calibration in the device: it survives a reboot and goes into the exported files' data-en='Save to settings'>Сохранить в настройки</button>"
+"</div>"
+"<div id=cst style=font-size:12.5px></div>"
+"<div id=cmsg style=font-size:12.5px></div>"
+"<div id=cout class=mono style='font-size:12px;overflow-x:auto'></div>"
+"<div id=cman></div>"
+/* мощность дозы по спектру (mca_dose.h): средняя с «Сброса» и поправка k */
+"<div class=grp style=margin-top:14px><b style=color:#e8efe2 data-en='Dose rate'>Мощность дозы</b>"
+"<span id=dsv style=font-size:12.5px></span></div>"
+"<div class=grp style=margin-top:4px><span class=lbl title='Под этот кристалл подогнана функция G(E): вес события в дозе' "
+"data-en-title='The G(E) function, the weight of an event in the dose, is fitted to this crystal' data-en='detector block'>блок детектирования</span>"
+"<select id=ddet onchange=doseDet()><option value=0>NaI &Oslash;25&times;25</option><option value=1>NaI &Oslash;30&times;40</option><option value=2>NaI &Oslash;30&times;70</option><option value=3>NaI &Oslash;40&times;40</option><option value=4>NaI &Oslash;63&times;63</option><option value=5>NaI &Oslash;80&times;80</option></select></div>"
+"<div class=grp style=margin-top:4px><span class=lbl title='Положите дозиметр рядом с детектором, нажмите «Сброс», подождите несколько минут и впишите его показание' "
+"data-en-title='Put a dosimeter next to the detector, press “Reset”, wait a few minutes and enter its reading' data-en='dosimeter reading, µSv/h'>показание дозиметра, мкЗв/ч</span>"
+"<input id=ddm type=text inputmode=decimal style=width:96px>"
+"<button class='btn sm' onclick=doseFit() data-en='Fit k'>Подогнать k</button>"
+"<button class='btn sm' onclick=doseK(1) data-en='k = 1'>k = 1</button>"
+"<span id=dmsg style=font-size:12.5px></span></div>"
+/* проба KCl: фон пустого домика и проба - два набора одинаковой длины;
+   пик 1461 кэВ против модели кристалла (kcl* в скрипте) -> поправка k */
+"<div class=grp style=margin-top:14px><b style=color:#e8efe2 data-en='KCl sample'>Проба KCl</b>"
+"<span class=mut style=font-size:12px data-en='pure dry KCl in a cylindrical jar, the detector end face on the lid centre'>"
+"чистый сухой KCl в цилиндрической банке, детектор торцом на крышке по центру</span></div>"
+"<div class=grp style=margin-top:4px>"
+"<span class=lbl data-en='KCl, g'>KCl, г</span><input id=kms type=text inputmode=decimal value=400 style=width:64px>"
+"<span class=lbl data-en='jar Ø, mm'>банка Ø, мм</span><input id=kdi type=text inputmode=decimal value=114 style=width:56px>"
+"<span class=lbl data-en='layer, mm'>слой, мм</span><input id=kht type=text inputmode=decimal value=45 style=width:56px>"
+"<span class=lbl title='Стенка банки плюс расстояние от торца блока до кристалла (обычно 2-6 мм)' "
+"data-en-title='The jar wall plus the distance from the block end to the crystal (usually 2-6 mm)' data-en='salt to crystal, mm'>от соли до кристалла, мм</span>"
+"<input id=kgp type=text inputmode=decimal value=5 style=width:48px></div>"
+"<div class=grp style=margin-top:4px>"
+"<button class='btn sm' onclick=kclBg() title='Пустой домик: «Сброс», набор, затем эта кнопка - спектр фона запомнит браузер' "
+"data-en-title='Empty castle: “Reset”, acquire, then this button - the browser stores the background spectrum' data-en='Store background'>Запомнить фон</button>"
+"<button class='btn sm' onclick=kclRun() title='Проба в домике: «Сброс», набор столько же, затем эта кнопка' "
+"data-en-title='Sample in the castle: “Reset”, acquire as long, then this button' data-en='Compute from sample'>Посчитать по пробе</button>"
+"<button class='btn sm green' id=kbk disabled onclick=kclSave() data-en='Save k'>Записать k</button>"
+"<span id=kbg class=mut style=font-size:12px></span></div>"
+"<div id=kmsg style=font-size:12.5px;margin-top:4px></div>"
+"</div></section>"
 /* МОНИТОРИНГ CPS - только на вкладке «Спектр» */
 "<section class='panel pad' id=g_mon>"
 "<div class=grp style=margin-bottom:10px>"
 "<b style=color:#e8efe2 data-en='CPS monitor'>Мониторинг CPS</b>"
 "<span class=mut id=mtime style=font-size:11.5px></span><span class=ml></span>"
-"<span class=lbl title='По скольку секунд складывать отсчёты в одну точку графика' "
-"data-en-title='How many seconds of samples go into one point of the plot' data-en='averaging, s'>усреднение, с</span>"
-"<input id=mint type=number min=1 max=3600 value=1 onchange=mdraw()>"
+"<span class=lbl title='По скольку секунд складывать отсчёты в одну точку графика. Шаг меньше секунды - из быстрой истории прибора: по 0.1 с за последние 10 минут' "
+"data-en-title='How many seconds of samples go into one point of the plot. A step below a second comes from the fast history of the device: 0.1 s samples over the last 10 minutes' data-en='averaging, s'>усреднение, с</span>"
+"<select id=mint onchange=mstp()><option value=0.1>0.1</option><option value=0.25>0.25</option><option value=0.5>0.5</option>"
+"<option value=1 selected>1</option><option value=2>2</option><option value=5>5</option><option value=10>10</option>"
+"<option value=30>30</option><option value=60>60</option><option value=300>300</option><option value=600>600</option>"
+"<option value=3600>3600</option></select>"
 "<span class=lbl title='Сколько времени видно на графике. Колесо мыши меняет масштаб, двойной щелчок возвращает к этому окну' "
 "data-en-title='How much time the plot shows. The mouse wheel changes the zoom, double click returns to this window' data-en='window'>окно</span>"
 "<select id=mwin onchange=mwsel()><option value=30000 data-en='30 s'>30 с</option><option value=120000 data-en='2 min'>2 мин</option>"
@@ -357,7 +421,9 @@ static const char PAGE[] =
    берётся отсюда: Unix-время и смещение пояса в минутах. Ответ идёт
    как вложение, поэтому страница никуда не уходит. */
 "function expo(f){var d=new Date();"
-"location.href='/export.'+f+'?t='+Math.floor(d/1000)+'&tz='+(-d.getTimezoneOffset())}"
+"location.href='/export.'+f+'?t='+Math.floor(d/1000)+'&tz='+(-d.getTimezoneOffset())+"
+/* калибровка - в файл (XML, N42, SPE, CSV), только если она от этих настроек */
+"(calOk()?CAL.c.map(function(v,i){return '&c'+i+'='+v}).join(''):'')}"
 /* MDLOCK - окно, в течение которого ответы /stat не трогают DM: ответ,
    ушедший с прибора ДО новой команды, вернул бы прежний режим. */
 "var cv=document.getElementById('cv'),cx=cv.getContext('2d');"
@@ -391,6 +457,13 @@ static const char PAGE[] =
 "if(lg)v=Math.round(Math.exp(v)-1);else v=Math.round(v);"
 "cx.fillStyle='#6b756a';cx.fillText(v,3,y-3)}"
 /* ШКАЛА КАНАЛОВ СНИЗУ */
+/* ось в кэВ: засечки на круглых энергиях, место - по обратной калибровке */
+"if(nch>0&&window.CALAX&&calOk()){var e0=Math.max(0,calE(0)),e1=calE(nch),es=nicestep(e1-e0,8);cx.textAlign='center';"
+"for(var e=Math.ceil(e0/es)*es;e<=e1;e+=es){var x=calCh(e)*W/nch;if(!(x>=0&&x<=W))continue;"
+"cx.strokeStyle='rgba(255,255,255,.035)';cx.beginPath();cx.moveTo(x,TOPM);cx.lineTo(x,H-BOTM);cx.stroke();"
+"cx.strokeStyle='#283024';cx.beginPath();cx.moveTo(x,H-BOTM);cx.lineTo(x,H-BOTM+4);cx.stroke();"
+"cx.fillStyle='#6b756a';cx.fillText(Math.round(e),Math.min(Math.max(x,14),W-14),H-8)}"
+"cx.textAlign='left';cx.fillStyle='#34d3c0';cx.fillText(L('кэВ','keV'),W-28,H-BOTM-4)}else "
 "if(nch>0){var st=nicestep(nch,8);cx.textAlign='center';"
 "for(var c=0;c<=nch;c+=st){var x=c*W/nch;"
 "cx.strokeStyle='rgba(255,255,255,.035)';cx.beginPath();"
@@ -503,7 +576,7 @@ static const char PAGE[] =
    Полувысота отсчитывается от ЛИНИИ ФОНА, проведённой по краям
    выделенного участка: без вычитания подложки комптоновский
    пьедестал завышал бы FWHM. */
-"function peakInfo(a){window.PKMARK=null;"
+"function peakInfo(a){window.PKMARK=null;window.PKINFO=null;"
 "var A=+document.getElementById('pka').value|0,"
 "B=+document.getElementById('pkb').value|0;"
 "if(A<0)A=0;if(B>a.length-1)B=a.length-1;"
@@ -531,9 +604,15 @@ static const char PAGE[] =
 "var fw=xr-xl;"
 "if(!(fw>0))return ' &nbsp; <span style=color:#ff8a82>'+L('полувысота не найдена - расширьте диапазон','half maximum not found - widen the range')+'</span>';"
 "var res=cen>0?100*fw/cen:0;"
-"window.PKMARK=[A,B,xl,xr];"
+"window.PKMARK=[A,B,xl,xr];var fk=calOk()?calE(xr)-calE(xl):0;"
+"window.PKINFO={cen:cen,fw:fw,res:res,fk:fk,rk:calOk()?100*fk/calE(cen):0};"
 "return '<br><b>'+L('пик:</b> центр ','peak:</b> centroid ')+cen.toFixed(1)+L(' кан',' ch')+' &nbsp; '+"
-"'FWHM '+fw.toFixed(1)+L(' кан',' ch')+' &nbsp; <b>'+L('разрешение ','resolution ')+res.toFixed(2)+' %</b>'+"
+"'FWHM '+fw.toFixed(1)+L(' кан',' ch')+' &nbsp; <b>'+(calOk()?L('по каналам ','by channels '):L('разрешение ','resolution '))+res.toFixed(2)+' %</b>'+"
+/* С калибровкой: энергия, FWHM в кэВ и разрешение от ЭНЕРГИИ линии.
+   Процент по каналам зависит от нуля шкалы (у разных способов от +30 до
+   -24 кэВ, замер 2026-11-06) - сравнивать по нему способы нечестно. */
+"(calOk()?' &nbsp; <b style=color:#34d3c0>'+calE(cen).toFixed(1)+L(' кэВ, FWHM ',' keV, FWHM ')+(calE(xr)-calE(xl)).toFixed(1)+"
+"L(' кэВ = ',' keV = ')+(100*(calE(xr)-calE(xl))/calE(cen)).toFixed(2)+L(' % по энергии',' % by energy')+'</b>':'')+"
 "' <span style=opacity:.6>('+L('площадь за вычетом фона ','net area ')+Math.round(sw)+')</span>'}"
 /* Границы участка (оранжевым) и точки полувысоты (зелёным). */
 "function drawPk(nch,W,H){var m=window.PKMARK;if(!m)return;"
@@ -708,8 +787,8 @@ static const char PAGE[] =
 "for(var i=0;i<2;i++)document.getElementById('bx'+i).className=i==window.XAX?'on':'';"
 "var SCM=1;"
 "function showCtl(){var m=document.getElementById('md').value,sp=(m=='0'||m=='2'),sc=!sp;"
-"cv.style.cursor=sc?'crosshair':'';cv.style.touchAction=sc?'none':'';"
-"var v={g_sp:sp,g_sc:sc,g_zm:sc,g_leg:sc,g_rul:sc,g_big:sp,bclr:sp,st:sp,g_mon:sp};"
+"cv.style.cursor='crosshair';cv.style.touchAction=sc?'none':'pan-y';"
+"var v={g_sp:sp,g_sc:sc,g_zm:sc,g_leg:sc,g_rul:sc,g_big:sp,bclr:sp,st:sp,g_mon:sp,g_cal:sp};"
 "for(var k in v){var e=document.getElementById(k);if(e)e.style.display=v[k]?'':'none'}"
 "if(sp)setTimeout(mdraw,0)}"
 "function hl(){var m=document.getElementById('md').value,g=(m=='3')?'1':(m=='2'?'0':m);"
@@ -735,26 +814,18 @@ static const char PAGE[] =
 "document.getElementById('sc').innerHTML=L('Осциллограф остановлен. «Старт» запустит его','The oscilloscope is stopped. “Start” launches it')+"
 "(window.SPRUN?L(' &mdash; набор спектра при этом остановится.',' &mdash; spectrum acquisition will stop then.'):'.')}"
 "if(md=='0'||md=='2'){mload();fetch('/spectrum').then(r=>r.json()).then(function(j){"
-"draw(j.d,document.getElementById('lg').checked);"
-"var a=j.d,mx=0,tot=0,pk=0;"
-"for(var i=0;i<a.length;i++){tot+=a[i];if(a[i]>mx){mx=a[i];pk=i}}"
-"var s=L('всего в спектре: ','total in spectrum: ')+tot+L('   максимум ','   max ')+mx+L(' в канале ',' in channel ')+pk+"
-"L('   каналов: ','   channels: ')+a.length;"
-"s+=peakInfo(a);"
-"drawPk(a.length,cv.width,cv.height);"
-"document.getElementById('sc').innerHTML=s})}"
-"fetch('/stat').then(r=>r.json()).then(function(j){"
+"window.LASTSPEC=j.d;specRender();calShow()})}"
+"fetch('/stat').then(r=>r.json()).then(function(j){window.FHZ=j.freq;window.RUNMS=j.ms;"
 /* Строка статуса: значения через разделители,
    подписи приглушены. Время, CPS и события - ещё и крупно в панели,
    состояние набора и частота - в шапке. */
-"var dt=j.samp>0?100*j.dead/j.samp:0;"
+"var dt=j.samp>0?100*j.dead/j.samp:0,cp=window.CPSFT>Date.now()-600?window.CPSF:j.cps;"
 "document.getElementById('st').innerHTML="
-"'<span class=ac>CPS '+j.cps+'</span><span class=sep>|</span>'+"
+"'<span class=ac>CPS <span id=stc>'+cp+'</span></span><span class=sep>|</span>'+"
+"'<span id=std class=ac'+(window.DOSEF?'':' hidden')+' title=\"'+(window.DOSET||'')+'\">'+(window.DOSEF||'')+'</span><span id=stds class=sep'+(window.DOSEF?'':' hidden')+'>|</span>'+"
 "'<span class=w>'+j.ev+' <span class=mut>'+L('событий','events')+'</span></span><span class=sep>|</span>'+"
 "'<span title=\"'+L('зависит от Перезапуск и Поиск пика','depends on Re-arm and Peak search')+'\"><span class=mut>'+"
 "L('мёртвое','dead')+'</span> '+dt.toFixed(1)+'%</span>'+"
-"'<span class=sep>|</span><span><span class=mut>'+L('истинно','true')+'</span> '+"
-"(j.cps/Math.max(0.01,1-dt/100)).toFixed(0)+L(' имп/с',' cps')+'</span>'+"
 /* загрузка обработки - та же, что в «Диагностике»: около 100% - не
    успевает, пойдут потерянные чанки */
 "'<span class=sep>|</span><span title=\"'+L('Доля времени, когда обработка потока занята чанками (как в «Диагностике»). '+"
@@ -766,8 +837,6 @@ static const char PAGE[] =
 "'самопроверку при старте, обработка идёт обычным кодом - медленнее.','Vector instructions failed the self-test at start, '+"
 "'processing runs plain code - slower.')+'\">'+L('векторы выкл.','vectors off')+'</span>':'');"
 "document.getElementById('bt').textContent=hms(j.ms/1000);"
-"document.getElementById('bc').textContent=j.cps;"
-"document.getElementById('be').textContent=j.ev;"
 /* часы прибора - в заголовке мониторинга */
 "var mt=document.getElementById('mtime');if(mt&&j.tsrc!==undefined){var dd=new Date(j.tnow);"
 "mt.textContent=L('время прибора ','device time ')+(j.tnow?p2(dd.getHours())+':'+p2(dd.getMinutes())+':'+"
@@ -864,17 +933,26 @@ static const char PAGE[] =
    для графика часы прибора не обязательны. CPS интервала - импульсы,
    делённые на время, пока реально шёл набор. */
 "function p2(x){return (x<10?'0':'')+x}"
-"var MH={ep:-1,nx:0,t:[],c:[],d:[],busy:0,bn:0,B:null},MV={span:0,end:0,live:0,tA:0,pw:1,x0:0,hx:null};"
-"function mload(){if(MH.busy)return;MH.busy=1;"
-"fetch('/hist?from='+MH.nx).then(function(r){return r.arrayBuffer()}).then(function(b){MH.busy=0;"
+/* Две истории прибора: MH - по 1 с (6 ч), MF - по 0.1 с (10 мин, /hist?f=1)
+   для шага графика меньше секунды. Быструю страница дочитывает 5 раз в
+   секунду (из опроса CPS), пока выбран такой шаг. */
+"var MH={ep:-1,nx:0,t:[],c:[],d:[],busy:0,bn:0,B:null,f:0,sp:1000},MF={ep:-1,nx:0,t:[],c:[],d:[],busy:0,f:1,sp:100,tk:0},"
+"MV={span:0,end:0,live:0,tA:0,pw:1,x0:0,hx:null};"
+"function mstep(){return Math.round((+document.getElementById('mint').value||1)*1000)}"
+"function mfast(){return mstep()<1000}"
+"function msrc(){return mfast()?MF:MH}"
+"function mstp(){MV.end=0;if(mfast())mload1(MF,1);mdraw()}"
+"function mload(){mload1(MH,0);if(mfast())mload1(MF,1)}"
+"function mload1(H,f){if(H.busy)return;H.busy=1;"
+"fetch('/hist?'+(f?'f=1&':'')+'from='+H.nx).then(function(r){return r.arrayBuffer()}).then(function(b){H.busy=0;"
 "if(b.byteLength<28)return;var v=new DataView(b),ep=v.getUint32(0,true),fs=v.getUint32(4,true),"
-"nx=v.getUint32(8,true),nds=v.getUint32(12,true),n=v.getUint32(16,true),now=Date.now();"
-"if(ep!==MH.ep){MH.ep=ep;MH.t=[];MH.c=[];MH.d=[];MV.end=0;MH.o=null}"
-"var o0=mofs(now,nds);"
+"nx=v.getUint32(8,true),nds=v.getUint32(12,true),n=v.getUint32(16,true),len=v.getUint32(20,true)||21600,now=Date.now();"
+"if(ep!==H.ep){H.ep=ep;H.t=[];H.c=[];H.d=[];if(H==msrc())MV.end=0;H.o=null}"
+"var o0=mofs(H,now,nds);"
 "for(var i=0;i<n&&38+10*i<=b.byteLength;i++){var o=28+10*i;"
-"MH.t.push(o0+v.getUint32(o,true)*100);MH.c.push(v.getUint32(o+4,true));MH.d.push(v.getUint16(o+8,true))}"
-"var ex=MH.t.length-21600;if(ex>0){MH.t.splice(0,ex);MH.c.splice(0,ex);MH.d.splice(0,ex)}"
-"MH.nx=fs+n;if(MH.nx<nx)mload();else mdraw()}).catch(function(){MH.busy=0})}"
+"H.t.push(o0+v.getUint32(o,true)*100);H.c.push(v.getUint32(o+4,true));H.d.push(v.getUint16(o+8,true))}"
+"var ex=H.t.length-len;if(ex>0){H.t.splice(0,ex);H.c.splice(0,ex);H.d.splice(0,ex)}"
+"H.nx=fs+n;if(H.nx<nx)mload1(H,f);else if(H==msrc()||!f)mdraw()}).catch(function(){H.busy=0})}"
 /* Сдвиг часов прибора относительно браузера - один на всю историю.
    Раньше время отсчёта считалось от момента своего запроса («сейчас минус
    возраст»), и у каждой порции был свой сдвиг: задержка сети и округление
@@ -882,27 +960,27 @@ static const char PAGE[] =
    секунде два отсчёта, следующая пустая, и график рвался (у прибора шаг
    отсчётов ровно 1.0 с: 280 из 284). Пересчёт - только при расхождении
    больше 2 с (перевели часы компьютера). */
-"function mofs(now,nds){var o=now-nds*100;if(MH.o==null||Math.abs(o-MH.o)>2000)MH.o=o;return MH.o}"
+"function mofs(H,now,nds){var o=now-nds*100;if(H.o==null||Math.abs(o-H.o)>2000)H.o=o;return H.o}"
 /* Интервалы по step мс, выровненные по часам; отдаются только законченные
    (конец не позже последнего отсчёта). T - время конца отсчёта. */
-"function mbuck(T,C,D,step){var o={t:[],c:[],d:[]},k=-1,cur=NaN,n=T.length;if(!n)return o;"
-"var last=T[n-1];for(var i=0;i<n;i++){var b=Math.floor(T[i]/step)*step;if(b+step>last+500)break;"
+"function mbuck(T,C,D,step,sp){var o={t:[],c:[],d:[]},k=-1,cur=NaN,n=T.length;if(!n)return o;"
+"var last=T[n-1];for(var i=0;i<n;i++){var b=Math.floor(T[i]/step)*step;if(b+step>last+(sp||1000)/2)break;"
 "if(b!==cur){cur=b;o.t.push(b);o.c.push(0);o.d.push(0);k++}o.c[k]+=C[i];o.d[k]+=D[i]}return o}"
 "function mrel(c){return c>0?(100/Math.sqrt(c)).toFixed(2):'—'}"
 "function mcard(id,v,s){document.getElementById(id).textContent=v==null?'—':v.toFixed(1);"
 "document.getElementById(id+'s').textContent=s}"
 "function mdraw(){var gm=document.getElementById('g_mon');if(!gm||gm.style.display=='none')return;"
-"var st=Math.max(1,+document.getElementById('mint').value|0)*1000,B=mbuck(MH.t,MH.c,MH.d,st),"
+"var st=mstep(),HS=msrc(),B=mbuck(HS.t,HS.c,HS.d,st,HS.sp),"
 "n=MH.t.length,N=B.t.length;MH.bn=N;MH.B=B;"
 "var ct=0,dt=0;for(var i=0;i<n;i++){ct+=MH.c[i];dt+=MH.d[i]}"
 "mcard('mc1',n&&MH.d[n-1]?MH.c[n-1]*1000/MH.d[n-1]:null,L('за последнюю секунду набора','over the last second of acquisition'));"
 "mcard('mc2',dt?ct*1000/dt:null,dt?'δ '+mrel(ct)+' % · '+ct+L(' имп. за ',' counts in ')+hms(dt/1000):"
 "L('история копится, пока идёт набор спектра','history accumulates while the spectrum is acquired'));"
 "var lb=N-1;mcard('mc3',N&&B.d[lb]?B.c[lb]*1000/B.d[lb]:null,"
-"N?'δ '+mrel(B.c[lb])+' % · '+B.c[lb]+L(' имп. за ',' counts in ')+(B.d[lb]/1000).toFixed(1)+L(' с',' s'):'');"
+"N?'δ '+mrel(B.c[lb])+' % · '+B.c[lb]+L(' имп. за ',' counts in ')+(B.d[lb]/1000).toFixed(st<1000?2:1)+L(' с',' s'):'');"
 "mchart();"
 "var h='';for(var i=N-1;i>=Math.max(0,N-100);i--){var d=new Date(B.t[i]);"
-"h+='<tr><td>'+p2(d.getHours())+':'+p2(d.getMinutes())+':'+p2(d.getSeconds())+'</td><td>'+(B.d[i]/1000).toFixed(1)+"
+"h+='<tr><td>'+p2(d.getHours())+':'+p2(d.getMinutes())+':'+p2(d.getSeconds())+(st<1000?'.'+Math.floor(d.getMilliseconds()/100):'')+'</td><td>'+(B.d[i]/1000).toFixed(st<1000?2:1)+"
 "'</td><td>'+B.c[i]+'</td><td>'+(B.d[i]?(B.c[i]*1000/B.d[i]).toFixed(1):'—')+'</td><td>'+mrel(B.c[i])+'</td></tr>'}"
 "document.getElementById('mtb').innerHTML=h}"
 /* График: интервалы (с разрывом, где набора не было) и скользящее
@@ -913,7 +991,7 @@ static const char PAGE[] =
 "g.font='11px ui-monospace,monospace';g.textBaseline='middle';MV.pw=x1-x0;MV.x0=x0;"
 "if(N<1){g.fillStyle='#6b756a';g.fillText(L('нет данных: история копится, пока идёт набор спектра',"
 "'no data: history accumulates while the spectrum is acquired'),x0+10,y0+24);return}"
-"var stp=Math.max(1,+document.getElementById('mint').value|0)*1000,"
+"var stp=mstep(),"
 "w=Math.min(200,Math.max(2,+document.getElementById('msma').value|0)),Y=[],S=[],a=0;"
 "for(var i=0;i<N;i++){Y.push(B.d[i]>0?B.c[i]*1000/B.d[i]:0);a+=Y[i];if(i>=w)a-=Y[i-w];S.push(a/Math.min(i+1,w))}"
 /* Окно ПО ВРЕМЕНИ: MV.span мс, кончая MV.end (0 - текущий момент, окно
@@ -965,8 +1043,8 @@ static const char PAGE[] =
 "(function(){var c2=document.getElementById('mcv'),dr=0,dx=0,dB=0;"
 "c2.addEventListener('wheel',function(ev){if(!MH.bn)return;ev.preventDefault();"
 "var fr=Math.min(1,Math.max(0,(ev.offsetX-MV.x0)/MV.pw)),tc=MV.tA+fr*MV.span,"
-"stp=Math.max(1,+document.getElementById('mint').value|0)*1000,"
-"ns=Math.min(21600000,Math.max(Math.max(5000,3*stp),MV.span*(ev.deltaY<0?0.8:1.25))),nB=tc+(1-fr)*ns;"
+"stp=mstep(),"
+"ns=Math.min(21600000,Math.max(Math.max(mfast()?1000:5000,3*stp),MV.span*(ev.deltaY<0?0.8:1.25))),nB=tc+(1-fr)*ns;"
 "MV.span=ns;MV.end=nB>=MV.live?0:nB;mchart()},{passive:false});"
 "c2.addEventListener('mousedown',function(ev){if(!MH.bn)return;dr=1;dx=ev.clientX;dB=MV.end||MV.live;"
 "c2.style.cursor='grabbing'});"
@@ -978,12 +1056,12 @@ static const char PAGE[] =
 "c2.addEventListener('mouseleave',function(){MV.hx=null;mchart()});"
 "c2.addEventListener('dblclick',function(){mwsel()});c2.style.cursor='grab'})();"
 /* выгрузка точек графика файлом */
-"function mcsv(){var st=Math.max(1,+document.getElementById('mint').value|0)*1000,B=mbuck(MH.t,MH.c,MH.d,st);"
+"function mcsv(){var st=mstep(),HS=msrc(),B=mbuck(HS.t,HS.c,HS.d,st,HS.sp);"
 "if(!B.t.length){alert(L('Нет данных','No data'));return}"
 "var s='time,dt_s,counts,cps,rel_err_pct\\r\\n';"
 "for(var i=0;i<B.t.length;i++){var d=new Date(B.t[i]),z=-d.getTimezoneOffset();"
 "s+=d.getFullYear()+'-'+p2(d.getMonth()+1)+'-'+p2(d.getDate())+'T'+p2(d.getHours())+':'+p2(d.getMinutes())+':'+"
-"p2(d.getSeconds())+(z>=0?'+':'-')+p2(Math.floor(Math.abs(z)/60))+':'+p2(Math.abs(z)%60)+','+(B.d[i]/1000).toFixed(3)+','+"
+"p2(d.getSeconds())+'.'+String(d.getMilliseconds()+1000).slice(1)+(z>=0?'+':'-')+p2(Math.floor(Math.abs(z)/60))+':'+p2(Math.abs(z)%60)+','+(B.d[i]/1000).toFixed(3)+','+"
 "B.c[i]+','+(B.d[i]?(B.c[i]*1000/B.d[i]).toFixed(3):'')+','+(B.c[i]?(100/Math.sqrt(B.c[i])).toFixed(3):'')+'\\r\\n'}"
 "var a=document.createElement('a'),n=new Date();a.href=URL.createObjectURL(new Blob([s],{type:'text/csv'}));"
 "a.download='mca_cps_'+n.getFullYear()+p2(n.getMonth()+1)+p2(n.getDate())+'_'+p2(n.getHours())+p2(n.getMinutes())+"
@@ -994,6 +1072,437 @@ static const char PAGE[] =
 /* вкладка из ссылки с других страниц: #scope или #spectrum - только вид */
 "if(location.hash=='#scope'){window.VINIT=1;tab(SCM)}else if(location.hash=='#spectrum'){window.VINIT=1;tab(0)}"
 "setInterval(poll,1000);poll();wsOpen();sloop();"
+/* CPS 10 раз в секунду: /cps - быстрый CPS прибора (окно 100 мс ... 1 с,
+   при скачке счёта - 100 мс). Только на спектре и при видимой вкладке,
+   не больше одного запроса сразу (медленная связь не копит очередь). */
+/* МОЩНОСТЬ ДОЗЫ. Быстрая - в строке статуса из /cps (то же окно, что у
+   быстрого CPS); средняя с «Сброса» и поправка k - в блоке калибровки из
+   /dose раз в секунду. */
+"function d3(v){return v>=100?v.toFixed(0):v>=10?v.toFixed(1):v>=1?v.toFixed(2):v.toFixed(3)}"
+/* в строке статуса - мкЗв/ч за скользящие 10 с набора, раз в секунду (из
+   /dose): точность задаёт длина окна, а не частота показа - при ~30 имп/с
+   окно 1 с дало бы ±18 %, 10 с - ±6 %. После «Сброса» окно копится. */
+"var DRING=[];"
+"function doseRing(j){if(!j.ok||j.hs==null){DRING=[];window.DOSEF='';doseStd();return}"
+"var z=DRING.length?DRING[DRING.length-1]:null;if(z&&(j.s<z.s||j.n<z.n))DRING=[],z=null;"
+"if(!z||j.s>z.s)DRING.push({s:j.s,h:j.hs,r:j.ks,n:j.n});"
+"while(DRING.length>2&&DRING[DRING.length-1].s-DRING[1].s>=10)DRING.shift();"
+"var a=DRING[0],b=DRING[DRING.length-1],dt=b.s-a.s,dn=b.n-a.n;"
+"if(DRING.length<2||dt<0.5){if(!z)window.DOSEF='';doseStd();return}"
+"window.DOSEF=d3((b.h-a.h)*3600e-6/dt*j.k)+L(' мкЗв/ч',' µSv/h');"
+"window.DOSET=L('за последние ','over the last ')+dt.toFixed(0)+L(' с набора, δ ',' s of acquisition, δ ')+(dn>0?(100/Math.sqrt(dn)).toFixed(0)+' %':'-')+"
+"' · '+d3((b.r-a.r)*3600e-6/dt/8.764e-3*j.k)+L(' мкР/ч',' µR/h');doseStd()}"
+"function doseStd(){var e=document.getElementById('std'),w=document.getElementById('stds');"
+"if(e){e.textContent=window.DOSEF||'';e.title=window.DOSET||'';e.hidden=!window.DOSEF}if(w)w.hidden=!window.DOSEF}"
+"var DOSE=null;"
+"function doseLoad(){fetch('/dose').then(function(r){return r.json()}).then(function(j){DOSE=j;doseRing(j);doseShow()}).catch(function(){})}"
+"function doseShow(){var e=document.getElementById('dsv'),j=DOSE;if(!e||!j)return;"
+"var sd=document.getElementById('ddet');if(sd&&document.activeElement!==sd&&j.det!=null)sd.value=j.det;if(window.calSum)calSum();"
+"if(!j.ok){e.innerHTML='<span class=mut>'+(j.why==2?L('калибровка по энергии набрана при других настройках - доза не считается',"
+"'the energy calibration was made with other settings - the dose is not computed'):j.why==1?L('нужна калибровка по энергии, сохранённая в приборе',"
+"'needs an energy calibration saved in the device'):L('доза не считается','the dose is not computed'))+'</span>';return}"
+"e.innerHTML=L('средняя с «Сброса» ','mean since “Reset” ')+'<b>'+d3(j.h)+L(' мкЗв/ч',' µSv/h')+'</b> · '+d3(j.r)+L(' мкР/ч',' µR/h')+"
+"' <span class=mut>'+L('за ','over ')+hms(j.s)+(j.n>0?', δ '+(100/Math.sqrt(j.n)).toFixed(1)+' %':'')+"
+"L('; поправка k = ','; correction k = ')+(+j.k).toFixed(3)+'</span>'}"
+"function doseDet(){var v=document.getElementById('ddet').value;fetch('/dose?det='+v).then(function(r){return r.json()}).then(function(j){DOSE=j;doseShow();"
+"doseMsg(j.set?L('блок выбран; доза с «Сброса» смешана со старым блоком - нажмите «Сброс»','the block is selected; the dose since “Reset” is mixed with the old block - press “Reset”'):"
+"L('блок не выбран','the block was not selected'),!j.set)}).catch(function(){doseMsg(L('нет связи с прибором','no connection with the device'),1)})}"
+"function doseMsg(t,bad){var e=document.getElementById('dmsg');if(e)e.innerHTML=t?'<span style=color:'+(bad?'#ff8a82':'#7ee081')+'>'+t+'</span>':''}"
+"function doseK(k){fetch('/dose?k='+k).then(function(r){return r.json()}).then(function(j){DOSE=j;doseShow();"
+"doseMsg(j.set?L('поправка k = ','correction k = ')+(+j.k).toFixed(3)+L(' записана в прибор',' saved in the device'):"
+"L('поправка не записана','the correction was not saved'),!j.set)}).catch(function(){doseMsg(L('нет связи с прибором','no connection with the device'),1)})}"
+"function doseFit(){var v=+document.getElementById('ddm').value.trim().replace(',','.'),j=DOSE;"
+"if(!(v>0)){doseMsg(L('впишите показание дозиметра, мкЗв/ч','enter the dosimeter reading, µSv/h'),1);return}"
+"if(!j||!j.ok||!(j.h0>0)){doseMsg(L('доза ещё не считается','the dose is not computed yet'),1);return}"
+"if(j.s<60){doseMsg(L('наберите хотя бы минуту после «Сброса»','acquire at least a minute after “Reset”'),1);return}"
+"var k=v/j.h0;if(k<0.05||k>20){doseMsg(L('поправка ','correction ')+k.toFixed(3)+L(' вне 0.05...20 - проверьте показание и калибровку',' is outside 0.05...20 - check the reading and the calibration'),1);return}"
+"doseK(k.toFixed(4))}"
+"setInterval(function(){if(!isScope()&&!document.hidden)doseLoad()},1000);doseLoad();"
+"var CPSB=0;setInterval(function(){if(CPSB||document.hidden||isScope())return;CPSB=1;"
+"fetch('/cps').then(function(r){return r.json()}).then(function(j){CPSB=0;window.CPSF=j.cpsf;window.CPSFT=Date.now();"
+"var e=document.getElementById('stc');if(e){e.textContent=j.cpsf;e.title=L('окно ','window ')+j.cpsw+L(' мс',' ms')}"
+"if(mfast()&&++MF.tk%2==0)mload1(MF,1)}"
+").catch(function(){CPSB=0})},100);"
+/* КАЛИБРОВКА ПО ЭНЕРГИИ. Ядро (calcore.js в разработке: поиск линий,
+   подгонка пиков, полином) проверено node на 14 спектрах Ra-226 и 4 - Cs-137
+   против независимой подгонки гаусс + фон, и на прореженных спектрах:
+   от 100 тыс. событий линии находятся верно, меньше - поиск отказывается
+   (2026-11-06); tools/check_cal.py. */
+"var CALISO={ra226:['Ra-226',[351.93,609.31,1120.29,1764.49]],"
+"cs137:['Cs-137',[32.19,661.66]],"
+"cs137k40:['Cs-137 + K-40',[661.66,1460.82]],"
+"th232:['Th-232',[238.63,583.19,911.20,2614.51]],"
+"co60:['Co-60',[1173.23,1332.49]]};"
+"function calEv(c,x){var e=0;for(var i=c.length-1;i>=0;i--)e=e*x+c[i];return e}"
+"function calDv(c,x){var d=0;for(var i=c.length-1;i>=1;i--)d=d*x+i*c[i];return d}"
+"function calChv(c,E){var x=(E-c[0])/c[1];"
+"for(var i=0;i<40&&c.length>2;i++){var d=calDv(c,x);if(!d)break;var f=calEv(c,x)-E;x-=f/d;if(Math.abs(f)<1e-6)break}"
+"return x}"
+"function calFit1(a,A,B){A=Math.max(0,Math.round(A));B=Math.min(a.length-1,Math.round(B));"
+"if(B-A<8)return null;"
+"var b0=(a[A]+a[A+1]+a[A+2])/3,b1=(a[B]+a[B-1]+a[B-2])/3,xa=A+1,xb=B-1,v=[],mx=0,pk=-1;"
+"for(var i=A;i<=B;i++)v[i-A]=a[i]-(b0+(b1-b0)*(i-xa)/(xb-xa));"
+"for(var i=A+1;i<B;i++){var s=(v[i-A-1]+v[i-A]+v[i-A+1])/3;if(s>mx){mx=s;pk=i}}"
+"if(pk<0||mx<=3)return null;"
+"var l=pk,r=pk;while(l>A&&v[l-1-A]>0.45*mx)l--;while(r<B&&v[r+1-A]>0.45*mx)r++;"
+"if(r-l<2){l=Math.max(A,pk-1);r=Math.min(B,pk+1)}"
+"var S=[0,0,0,0,0],T=[0,0,0];"
+"for(var i=l;i<=r;i++){var y=v[i-A];if(y<=0)continue;var x=i-pk,ly=Math.log(y);"
+"S[0]+=y;S[1]+=y*x;S[2]+=y*x*x;S[3]+=y*x*x*x;S[4]+=y*x*x*x*x;T[0]+=y*ly;T[1]+=y*ly*x;T[2]+=y*ly*x*x}"
+"var M=[[S[0],S[1],S[2],T[0]],[S[1],S[2],S[3],T[1]],[S[2],S[3],S[4],T[2]]];"
+"for(var i=0;i<3;i++){var m=i;for(var j=i+1;j<3;j++)if(Math.abs(M[j][i])>Math.abs(M[m][i]))m=j;"
+"var t=M[i];M[i]=M[m];M[m]=t;if(!M[i][i])return null;"
+"for(var j=0;j<3;j++)if(j!=i){var f=M[j][i]/M[i][i];for(var q=i;q<4;q++)M[j][q]-=f*M[i][q]}}"
+"var p0=M[0][3]/M[0][0],p1=M[1][3]/M[1][1],p2=M[2][3]/M[2][2];"
+"if(!(p2<0))return null;"
+"var sg=Math.sqrt(-1/(2*p2)),mu=pk-p1/(2*p2);"
+"if(!(mu>A&&mu<B))return null;"
+"return {mu:mu,fw:2.3548*sg,h:Math.exp(p0-p1*p1/(4*p2)),area:Math.exp(p0-p1*p1/(4*p2))*sg*2.5066}}"
+"function calHM(a,mu,fw){var sg=fw/2.3548,A=Math.max(1,Math.round(mu-3*sg)),B=Math.min(a.length-2,Math.round(mu+3*sg));"
+"if(B-A<6)return 0;"
+"var b0=(a[A-1]+a[A]+a[A+1])/3,b1=(a[B-1]+a[B]+a[B+1])/3,s=[];"
+"for(var i=A;i<=B;i++){var bg=b0+(b1-b0)*(i-A)/(B-A),t=0;for(var j=-1;j<=1;j++)t+=a[i+j];s[i-A]=t/3-bg}"
+"var pk=0;for(var i=1;i<s.length;i++)if(s[i]>s[pk])pk=i;var hm=s[pk]/2;if(!(hm>0))return 0;"
+"var i=pk;while(i>0&&s[i-1]>=hm)i--;if(i==0)return 0;var xl=A+i-(s[i]-hm)/(s[i]-s[i-1]);"
+"i=pk;while(i<s.length-1&&s[i+1]>=hm)i++;if(i==s.length-1)return 0;var xr=A+i+(s[i]-hm)/(s[i]-s[i+1]);"
+"return xr-xl}"
+"function calFit(a,A,B){var f=calFit1(a,A,B);if(!f)return null;"
+"var g=calFit1(a,f.mu-1.27*f.fw,f.mu+1.27*f.fw);if(!g||Math.abs(g.mu-f.mu)>=f.fw)g=f;"
+"var w=calHM(a,g.mu,g.fw);if(w>0)g.fw=w;return g}"
+"function calCands(a){var n=a.length,s=[];"
+"for(var i=0;i<n;i++){var t=0,c=0;for(var j=-2;j<=2;j++)if(i+j>=0&&i+j<n){t+=a[i+j];c++}s[i]=t/c}"
+"var C=[];"
+"for(var i=3;i<n-3;i++){if(s[i]<5)continue;var w=Math.max(3,Math.round(0.02*i)),ok=1;"
+"for(var j=Math.max(0,i-w);j<=Math.min(n-1,i+w);j++)if(s[j]>s[i]||(s[j]==s[i]&&j<i)){ok=0;break}if(!ok)continue;"
+"var g=Math.max(12,Math.round(0.15*i)),lo=s[i];"
+"for(var j=Math.max(0,i-g);j<=Math.min(n-1,i+g);j++)if(s[j]<lo)lo=s[j];"
+"if(s[i]>1.15*lo)C.push([i,s[i]])}return C}"
+"function calFind(a,E){var C=calCands(a),M=[];"
+"for(var p=0;p<E.length;p++)for(var q=p+1;q<E.length;q++)"
+"for(var i=0;i<C.length;i++)for(var j=i+1;j<C.length;j++){"
+"var k1=(E[q]-E[p])/(C[j][0]-C[i][0]),k0=E[p]-k1*C[i][0];"
+"if(!(k1>0)||Math.abs(k0)>80)continue;"
+"if(k0+k1*(a.length-1)>20000)continue;"
+"var sc=0,m=[];"
+"for(var k=0;k<E.length;k++){var x=(E[k]-k0)/k1,bi=-1,bd=Math.max(3,0.03*x);"
+"for(var u=0;u<C.length;u++){var d=Math.abs(C[u][0]-x);if(d<=bd){bd=d;bi=u}}"
+"if(bi>=0){var r=(C[bi][0]-x)/Math.max(3,0.03*x);sc+=1000-300*r*r+Math.log(1+C[bi][1]);m[k]=C[bi][0]}}"
+"M.push({sc:sc,m:m,key:m.join(',')})}"
+"M.sort(function(x,y){return y.sc-x.sc});"
+"var need=E.length>=4?3:2,best=null,seen={},tried=0;"
+"for(var t=0;t<M.length&&tried<8;t++){if(seen[M[t].key])continue;seen[M[t].key]=1;tried++;"
+"var R=[];"
+"for(var k=0;k<E.length;k++){if(M[t].m[k]===undefined)continue;var x=M[t].m[k],h=Math.max(6,0.08*x);"
+"var f=calFit(a,x-h,x+h);"
+"if(f&&f.area>=50&&f.fw>0.005*f.mu&&f.fw<0.5*f.mu)R.push({E:E[k],ch:f.mu,fw:f.fw,area:f.area})}"
+"if(R.length<need)continue;"
+"var c=calPoly(R);if(!c)continue;"
+"var ws=R.map(function(l){return (calEv(c,l.ch+l.fw/2)-calEv(c,l.ch-l.fw/2))/Math.sqrt(l.E)}),"
+"sp=Math.max.apply(null,ws)/Math.min.apply(null,ws),rs=0;"
+"R.forEach(function(l){var d=(l.E-calEv(c,l.ch))/l.E;rs+=d*d});rs=Math.sqrt(rs/R.length);"
+"var chk=!R.some(function(l){return l.E<100});"
+"if((chk&&!(sp<2.2))||calEv(c,a.length-1)>20000)continue;"
+"var q2=1000*R.length-(chk?300*(sp-1):0)-3e4*rs+1e-3*M[t].sc;"
+"if(!best||q2>best.q)best={q:q2,R:R}}"
+"return best?best.R:[]}"
+"function calPoly(P){var n=P.length;if(!n)return null;"
+"if(n==1)return [0,P[0].E/P[0].ch];"
+"var d=n>=4?3:2,A=[],y=[];"
+"for(var i=0;i<n;i++){var r=[];for(var k=0;k<d;k++)r.push(Math.pow(P[i].ch,k));A.push(r);y.push(P[i].E)}"
+"var M=[];for(var r=0;r<d;r++){M[r]=[];for(var c=0;c<d;c++){var s=0;for(var i=0;i<n;i++)s+=A[i][r]*A[i][c];M[r][c]=s}"
+"var s=0;for(var i=0;i<n;i++)s+=A[i][r]*y[i];M[r][d]=s}"
+"for(var i=0;i<d;i++){var m=i;for(var j=i+1;j<d;j++)if(Math.abs(M[j][i])>Math.abs(M[m][i]))m=j;"
+"var t=M[i];M[i]=M[m];M[m]=t;if(!M[i][i])return null;"
+"for(var j=0;j<d;j++)if(j!=i){var f=M[j][i]/M[i][i];for(var q=i;q<=d;q++)M[j][q]-=f*M[i][q]}}"
+"var c=[];for(var i=0;i<d;i++)c.push(M[i][d]/M[i][i]);"
+"if(!(c[1]>0))return null;return c}"
+"var CAL={c:null},CALDIRTY=0;"
+"try{window.CALAX=+(localStorage.getItem('mca_calax')||0);window.CALLN=+(localStorage.getItem('mca_calln')||0);window.CALTAB=+(localStorage.getItem('mca_caltab')||0)}"
+"catch(e){window.CALAX=0;window.CALLN=0;window.CALTAB=0}"
+"function calSN(){return [L('способ','method'),L('до вершины','before peak'),L('после вершины','after peak'),'L','G',L('плато','flat top'),L('кодов на канал','codes per channel'),L('полярность','polarity'),L('частота','rate')]}"
+"function calSig(){var p=PC||{};return [p.algo,p.int_rise,p.int_fall,p.trap_L,p.trap_G,p.flat_avg,p.cpc,p.polarity,window.FHZ||0].join(',')}"
+"function calOk(){return !!(CAL.c&&CAL.sig==calSig())}"
+"function calE(x){return calEv(CAL.c,x)}"
+"function calCh(E){return calChv(CAL.c,E)}"
+"function calMsg(t,bad){var e=document.getElementById('cmsg');if(e)e.innerHTML=t?'<span style=color:'+(bad?'#ff8a82':'#7ee081')+'>'+t+'</span>':''}"
+"function calLoad(){fetch('/calib').then(function(r){return r.json()}).then(function(j){if(j&&j.c&&j.c.length>=2&&!CALDIRTY)CAL=j;calShow();calManRender()}).catch(function(){})}"
+"function calStore(v){try{localStorage.setItem(v[0],v[1])}catch(e){}}"
+"function calSet(Ls,name){var c=calPoly(Ls);"
+"if(!c){calMsg(L('шкала не строится: проверьте линии','the scale cannot be built: check the lines'),1);return}"
+"CAL={c:c,sig:calSig(),iso:name,t:Math.floor(Date.now()/1000),"
+"lines:Ls.map(function(l){return [l.E,+l.ch.toFixed(2),+l.fw.toFixed(2)]})};"
+"CALDIRTY=1;"
+"calMsg(L('калибровка готова, но ещё не сохранена: проверьте линии и нажмите «Сохранить в настройки»',"
+"'the calibration is ready but not saved yet: check the lines and press “Save to settings”'),0);"
+"calShow();calManRender();poll()}"
+"function calAuto(){var a=window.LASTSPEC;"
+"if(!a||!a.length){calMsg(L('спектра ещё нет','no spectrum yet'),1);return}"
+"var tot=0;for(var i=0;i<a.length;i++)tot+=a[i];"
+"if(tot<50000){calMsg(L('в спектре мало событий (','too few events in the spectrum (')+tot+L(') - наберите хотя бы 50 тысяч',') - acquire at least 50 thousand'),1);return}"
+"var iso=CALISO[document.getElementById('cis').value],Ls=calFind(a,iso[1]);"
+"if(!Ls.length){calMsg(L('линии ','lines of ')+iso[0]+L(' не найдены: наберите спектр подольше или выберите другой изотоп',' not found: acquire longer or choose another isotope'),1);return}"
+"calSet(Ls,iso[0])}"
+"function calSaveBtn(){if(!CAL.c){calMsg(L('сохранять нечего: сначала «Откалибровать»','nothing to save: “Calibrate” first'),1);return}"
+"if(!CALDIRTY){calMsg(L('эта калибровка уже сохранена в приборе','this calibration is already saved in the device'),0);return}"
+"if(!calOk()){calMsg(L('настройки сменились после калибровки - нажмите «Откалибровать» заново','the settings changed after the calibration - press “Calibrate” again'),1);return}"
+"fetch('/calib',{method:'POST',body:JSON.stringify(CAL)}).then(function(r){return r.json()}).then(function(j){"
+"if(j.ok){CALDIRTY=0;calMsg(L('калибровка сохранена в приборе','the calibration is saved in the device'),0)}"
+"else calMsg(L('калибровка не сохранилась в приборе','the calibration was not saved in the device'),1);calShow()}).catch(function(){"
+"calMsg(L('нет связи с прибором - калибровка не сохранена','no connection with the device - the calibration is not saved'),1)})}"
+"function calLines(){if(!window.CALLN&&!calOk()){calMsg(L('нет калибровки для этих настроек: сначала «Откалибровать»','no calibration for these settings: “Calibrate” first'),1);return}"
+"window.CALLN=window.CALLN?0:1;calStore(['mca_calln',window.CALLN]);calShow();specRender()}"
+"function calTab(){window.CALTAB=window.CALTAB?0:1;calStore(['mca_caltab',window.CALTAB]);calShow();calManRender()}"
+"function calManRender(){var m=document.getElementById('cman');if(!m)return;"
+"if(!window.CALTAB){m.innerHTML='';return}"
+"var c=CAL.c||[],h='<div class=grp style=margin-top:8px><span class=lbl>'+"
+"L('коэффициенты вручную, E = c0 + c1&middot;k + &hellip; + c4&middot;k<sup>4</sup>, кэВ','coefficients by hand, E = c0 + c1&middot;k + &hellip; + c4&middot;k<sup>4</sup>, keV')+'</span>';"
+"for(var i=0;i<5;i++)h+='<span style=white-space:nowrap><span class=lbl>c'+i+'</span> <input id=cc'+i+' type=text inputmode=decimal style=width:128px value='+(c[i]===undefined||(i>1&&!c[i])?'':(i==0?+c[i].toFixed(4):(i==1?+c[i].toPrecision(8):c[i].toExponential(6))))+'></span>';"
+"h+='<button class=\\\"btn sm\\\" onclick=calManual()>'+L('Применить','Apply')+'</button></div>';m.innerHTML=h+'<div id=cpts></div>';calPtRender()}"
+"var CALPT=[null,null,null,null],CALPA=-1;"
+"try{var q0=JSON.parse(localStorage.getItem('mca_calpt')||'null');if(q0&&q0.length==4)CALPT=q0}catch(e){}"
+"function calPtSave(){calStore(['mca_calpt',JSON.stringify(CALPT)])}"
+"function calPtSync(){for(var i=0;i<4;i++){var e=document.getElementById('cpe'+i);if(e&&CALPT[i])CALPT[i].E=e.value.replace(/[^0-9.,eE+-]/g,'')}}"
+"function calPtIn(){calPtSync();calPtSave()}"
+"function calPtRender(){var m=document.getElementById('cpts');if(!m)return;"
+"var h='<div class=grp style=margin-top:8px><span class=lbl>'+L('по точкам: щёлкните по пику на спектре (или протяните по нему) - центр пика встанет в строку, выбранную кнопкой номера, или в первую свободную; впишите энергию линии',"
+"'by points: click a peak on the spectrum (or drag over it) - the peak centroid goes to the row chosen with its number button or to the first free one; enter the line energy')+'</span></div>';"
+"for(var i=0;i<4;i++){var p=CALPT[i];"
+"h+='<div class=grp style=margin-top:4px><button class=\\\"btn sm'+(CALPA==i?' on':'')+'\\\" onclick=calPtSel('+i+') title=\\\"'+"
+"L('следующий щелчок по спектру - в эту строку','the next click on the spectrum goes to this row')+'\\\">'+(i+1)+'</button> '+"
+"'<span style=display:inline-block;min-width:190px>'+(p?L('канал ','channel ')+p.ch.toFixed(1)+(calOk()?' <span class=mut>(&asymp; '+calE(p.ch).toFixed(1)+L(' кэВ',' keV')+')</span>':''):"
+"'<span class=mut>'+L('пусто','empty')+'</span>')+'</span> <span class=lbl>E, '+L('кэВ','keV')+'</span> '+"
+"'<input id=cpe'+i+' type=text inputmode=decimal style=width:96px oninput=calPtIn()'+(p?' value='+(p.E||'\\\"\\\"'):' disabled')+'> '+"
+"'<button class=\\\"btn sm\\\" onclick=calPtDel('+i+') title=\\\"'+L('очистить строку','clear the row')+'\\\">&times;</button></div>'}"
+"h+='<div class=grp style=margin-top:4px><button class=\\\"btn sm\\\" onclick=calPts()>'+L('Построить по точкам','Build from points')+'</button> '+"
+"'<span class=mut>'+L('1 точка - прямая через ноль, 2-3 - прямая, 4 - парабола','1 point - a line through zero, 2-3 - a line, 4 - a parabola')+'</span></div>';"
+"m.innerHTML=h}"
+"function calPtSel(i){calPtSync();CALPA=CALPA==i?-1:i;calPtRender()}"
+"function calPtDel(i){calPtSync();CALPT[i]=null;if(CALPA==i)CALPA=-1;calPtSave();calPtRender();specRender()}"
+"function calPtAdd(ch,fw){if(!window.CALTAB)return 0;calPtSync();"
+"var i=CALPA>=0?CALPA:CALPT.indexOf(null);"
+"if(i<0){calMsg(L('все 4 строки заняты: выберите строку кнопкой номера или очистите её','all 4 rows are taken: choose a row with its number button or clear it'),1);return 0}"
+"CALPT[i]={ch:+ch.toFixed(2),fw:+fw.toFixed(2),E:CALPT[i]&&CALPT[i].E||''};CALPA=-1;calPtSave();calPtRender();calMsg('');"
+"var e=document.getElementById('cpe'+i);if(e&&!e.value)try{e.focus({preventScroll:true})}catch(_){}return 1}"
+"function calPts(){calPtSync();var P=[],bad=0;"
+"CALPT.forEach(function(p,i){if(!p||bad)return;var E=+String(p.E).replace(',','.');"
+"if(String(p.E).trim()===''||!(E>0)||!isFinite(E)){bad=i+1;return}P.push({ch:p.ch,fw:p.fw,E:E})});"
+"if(bad){calMsg(L('строка ','row ')+bad+L(': впишите энергию линии в кэВ',': enter the line energy in keV'),1);return}"
+"if(!P.length){calMsg(L('точек нет: щёлкните по пику на спектре','no points: click a peak on the spectrum'),1);return}"
+"P.sort(function(a,b){return a.ch-b.ch});"
+"for(var i=1;i<P.length;i++){if(P[i].ch-P[i-1].ch<1){calMsg(L('две строки на одном пике','two rows on the same peak'),1);return}"
+"if(!(P[i].E>P[i-1].E)){calMsg(L('энергии должны расти вместе с номером канала','the energies must grow with the channel number'),1);return}}"
+"var c=calPoly(P);if(!c){calMsg(L('шкала не строится: проверьте точки','the scale cannot be built: check the points'),1);return}"
+"var n=(window.LASTSPEC&&LASTSPEC.length)||(PC&&PC.nch)||2048;"
+"for(var k=0;k<=64;k++)if(!(calDv(c,k*(n-1)/64)>0)){calMsg(L('по этим точкам шкала не растёт на всём спектре: проверьте энергии','with these points the scale does not grow over the whole spectrum: check the energies'),1);return}"
+"calSet(P,L('по точкам','by points'))}"
+"function calManual(){var c=[];"
+"for(var i=0;i<5;i++){var v=document.getElementById('cc'+i).value.trim().replace(',','.');c.push(v===''?0:+v)}"
+"if(c.some(function(v){return !isFinite(v)})){calMsg(L('коэффициенты - это числа','the coefficients must be numbers'),1);return}"
+"while(c.length>2&&c[c.length-1]==0)c.pop();"
+"var n=(window.LASTSPEC&&LASTSPEC.length)||(PC&&PC.nch)||2048;"
+"for(var k=0;k<=64;k++)if(!(calDv(c,k*(n-1)/64)>0)){calMsg(L('шкала должна расти с номером канала на всём спектре (каналы 0-','the scale must grow with the channel number over the whole spectrum (channels 0-')+(n-1)+')',1);return}"
+"CAL={c:c,sig:calSig(),iso:L('вручную','by hand'),t:Math.floor(Date.now()/1000),lines:[]};CALDIRTY=1;"
+"calMsg(L('коэффициенты применены, но ещё не сохранены: «Сохранить в настройки»','the coefficients are applied but not saved yet: “Save to settings”'),0);"
+"calShow();calManRender();poll()}"
+"function calSum(){var e=document.getElementById('csum');if(!e)return;"
+"var s=CAL.c?(calOk()?L('энергия: ','energy: ')+(CAL.iso||''):L('калибровка по энергии при других настройках','energy calibration made with other settings')):L('нет калибровки по энергии','no energy calibration');"
+"if(CAL.c&&CALDIRTY)s+=L(' (не сохранена)',' (not saved)');"
+"if(window.DOSE&&DOSE.det!=null&&window.KDET)s+=' · '+L('доза: ','dose: ')+'NaI '+KDET[DOSE.det].join('×')+', k '+(+DOSE.k).toFixed(3);"
+"e.textContent=s}"
+"function calAx(v){window.CALAX=v;calStore(['mca_calax',v]);calShow();poll()}"
+"function calShow(){var o=document.getElementById('cout'),st=document.getElementById('cst');if(!o||!st)return;"
+"for(var i=0;i<2;i++){var b=document.getElementById('cax'+i);if(b)b.className=i==(window.CALAX&&calOk()?1:0)?'on':''}"
+"var b1=document.getElementById('cax1');if(b1){b1.disabled=!calOk();b1.title=calOk()?'':L('нет годной калибровки','no valid calibration')}"
+"var bl=document.getElementById('cbl');if(bl){bl.innerHTML=window.CALLN?L('Скрыть линии калибровки','Hide calibration lines'):L('Показать линии калибровки','Show calibration lines');"
+"bl.className='btn sm'+(window.CALLN?' on':'')}"
+"var bt=document.getElementById('cbt');if(bt)bt.innerHTML=(window.CALTAB?'&#9662; ':'&#9656; ')+L('Калибровка','Calibration');"
+"var cb=document.getElementById('calbody');if(cb)cb.hidden=!window.CALTAB;calSum();"
+"var bs=document.getElementById('cbs');if(bs)bs.disabled=!(CAL.c&&CALDIRTY&&calOk());"
+"if(!CAL.c){st.innerHTML='<span class=mut>'+L('калибровки нет: выберите изотоп и «Откалибровать»','no calibration: choose the isotope and “Calibrate”')+'</span>';o.innerHTML='';return}"
+"var l6=(CAL.lines||[]).filter(function(l){return Math.abs(l[0]-609.31)<1||Math.abs(l[0]-661.66)<1})[0],c=CAL.c,s1='';"
+"if(l6){var fk=calEv(c,l6[1]+l6[2]/2)-calEv(c,l6[1]-l6[2]/2);s1=', '+Math.round(l6[0])+L(' кэВ: FWHM ',' keV: FWHM ')+fk.toFixed(1)+L(' кэВ (',' keV (')+(100*fk/l6[0]).toFixed(2)+' %)'}"
+"var s=(CAL.iso||'')+((CAL.lines||[]).length?', '+CAL.lines.length+L(' линии',' lines'):'')+s1+(CAL.t?' &nbsp;<span class=mut>'+new Date(CAL.t*1000).toLocaleString()+'</span>':'');"
+"if(CALDIRTY)s+=' &nbsp;<b style=color:#f0c45a>'+L('не сохранена','not saved')+'</b>';"
+"if(!calOk()){var a=(CAL.sig||'').split(','),b=calSig().split(','),d=[];"
+"var sn=calSN();for(var i=0;i<sn.length;i++)if(a[i]!=b[i])d.push(sn[i]);"
+"s+='<br><b style=color:#ff8a82>'+L('калибровка набрана при других настройках','the calibration was made with other settings')+"
+"(d.length?' ('+L('изменились: ','changed: ')+d.join(', ')+')':'')+"
+"L(' - шкала в кэВ не действует; нажмите «Откалибровать»',' - the keV scale is not applied; press “Calibrate”')+'</b>'}"
+"st.innerHTML=s;"
+"if(!window.CALTAB){o.innerHTML='';return}"
+"var t='E = '+c[0].toFixed(2);"
+"for(var i=1;i<c.length;i++)if(c[i]||i==1)t+=' '+(c[i]<0?'&minus; ':'+ ')+Math.abs(c[i]).toPrecision(i==1?6:4)+'&middot;k'+(i>1?'<sup>'+i+'</sup>':'');"
+"t+=L(' кэВ (k - канал); ноль шкалы ',' keV (k - channel); scale zero ')+c[0].toFixed(1)+L(' кэВ',' keV');"
+"if(CAL.lines&&CAL.lines.length){t+='<table style=margin-top:6px><tr><th>'+L('линия, кэВ','line, keV')+'</th><th>'+L('канал','channel')+"
+"'</th><th>FWHM, '+L('кэВ','keV')+'</th><th>'+L('разрешение','resolution')+'</th><th>'+L('отклонение, кэВ','deviation, keV')+'</th></tr>';"
+"CAL.lines.forEach(function(l){var fk=calEv(c,l[1]+l[2]/2)-calEv(c,l[1]-l[2]/2);"
+"t+='<tr><td>'+l[0].toFixed(2)+'</td><td>'+l[1].toFixed(1)+'</td><td>'+fk.toFixed(1)+'</td><td>'+(100*fk/l[0]).toFixed(2)+"
+"' %</td><td>'+(l[0]-calEv(c,l[1])).toFixed(1)+'</td></tr>'});t+='</table>'}"
+"o.innerHTML=t}"
+"calLoad();"
+/* СПЕКТР: линии калибровки на графике (использованные - ярко, остальные
+   линии того же изотопа - бледно), выделение пика мышью (щелчок - пик
+   вокруг точки: максимум в ±4 % и подгонка, участок центр ±1.5 FWHM;
+   протяжка - свой участок; двойной щелчок - сброс), итог измерителя и
+   показания курсора прямо на графике. */
+"var ISOALL={'Ra-226':[186.21,241.99,295.22,351.93,609.31,768.36,934.06,1120.29,1238.11,1377.67,1764.49,2204.21],"
+"'Cs-137':[32.19,661.66],'Cs-137 + K-40':[32.19,661.66,1460.82],'Th-232':[238.63,338.32,583.19,727.33,911.20,968.97,2614.51],"
+"'Co-60':[1173.23,1332.49]};"
+"var SSEL=null,SHOV=null;"
+"function spX(c,W,n){return c*W/n}"
+"function spCh(x,W,n){return x*n/W}"
+"function specRender(){var a=window.LASTSPEC;if(!a||!a.length||isScope())return;"
+"draw(a,document.getElementById('lg').checked);"
+"var mx=0,tot=0,pk=0;for(var i=0;i<a.length;i++){tot+=a[i];if(a[i]>mx){mx=a[i];pk=i}}"
+"var s=L('всего в спектре: ','total in spectrum: ')+tot+L('   максимум ','   max ')+mx+L(' в канале ',' in channel ')+pk+"
+"L('   каналов: ','   channels: ')+a.length;"
+"s+=peakInfo(a);"
+"specOver(a);"
+"drawPk(a.length,cv.width,cv.height);"
+"document.getElementById('sc').innerHTML=s}"
+"function specOver(a){var W=cv.width,H=cv.height,n=a.length;cx.save();cx.font='11px ui-monospace,monospace';"
+"if(window.CALLN&&calOk()){var used=(CAL.lines||[]).map(function(l){return l[0]}),all=ISOALL[CAL.iso]||[],occ=[];"
+"var marks=(CAL.lines||[]).map(function(l){return [l[0],l[1],1]})"
+".concat(all.filter(function(e){return used.every(function(u){return Math.abs(u-e)>0.5})}).map(function(e){return [e,calCh(e),0]}));"
+"marks.forEach(function(m){var x=spX(m[1],W,n);if(!(x>=0&&x<=W))return;"
+"cx.strokeStyle=m[2]?'rgba(240,196,90,.75)':'rgba(240,196,90,.28)';cx.setLineDash(m[2]?[5,3]:[2,4]);cx.lineWidth=1;"
+"cx.beginPath();cx.moveTo(x,TOPM+14);cx.lineTo(x,H-BOTM);cx.stroke();cx.setLineDash([]);"
+"var t=String(Math.round(m[0])),tw=cx.measureText(t).width,tx=Math.min(Math.max(x,tw/2+2),W-tw/2-2),x0=tx-tw/2-3,x1=tx+tw/2+3;"
+"if(occ.some(function(o){return x1>o[0]&&x0<o[1]}))return;occ.push([x0,x1]);"
+"cx.fillStyle=m[2]?'#f0c45a':'rgba(240,196,90,.55)';cx.textAlign='center';cx.fillText(t,tx,TOPM+11)});cx.textAlign='left'}"
+"if(window.CALTAB&&window.CALPT)CALPT.forEach(function(p,i){if(!p)return;var x=spX(p.ch,W,n);if(!(x>=0&&x<=W))return;"
+"cx.strokeStyle='rgba(52,211,192,.7)';cx.setLineDash([3,3]);cx.lineWidth=1;cx.beginPath();cx.moveTo(x,TOPM+50);cx.lineTo(x,H-BOTM);cx.stroke();cx.setLineDash([]);"
+"cx.fillStyle='#34d3c0';cx.beginPath();cx.arc(x,TOPM+44,7,0,2*Math.PI);cx.fill();cx.fillStyle='#0c0f0b';cx.textAlign='center';cx.fillText(String(i+1),x,TOPM+48);cx.textAlign='left'});"
+"if(SSEL){var x0=spX(Math.min(SSEL[0],SSEL[1]),W,n),x1=spX(Math.max(SSEL[0],SSEL[1]),W,n);"
+"cx.fillStyle='rgba(240,196,90,.12)';cx.fillRect(x0,TOPM,x1-x0,plotH(H))}"
+"var A=+document.getElementById('pka').value|0,B=+document.getElementById('pkb').value|0;"
+"if(B>A+4){var xa=spX(A,W,n),xb=spX(B,W,n);cx.fillStyle='rgba(52,211,192,.07)';cx.fillRect(xa,TOPM,xb-xa,plotH(H));"
+"var P=window.PKINFO;if(P){var t=calOk()?calE(P.cen).toFixed(1)+L(' кэВ  FWHM ',' keV  FWHM ')+P.fk.toFixed(1)+L(' кэВ  ',' keV  ')+P.rk.toFixed(2)+' %':"
+"L('кан ','ch ')+P.cen.toFixed(1)+'  FWHM '+P.fw.toFixed(1)+L(' кан  ',' ch  ')+P.res.toFixed(2)+' %';"
+"var tw=cx.measureText(t).width+12,xc=spX(P.cen,W,n),bx=Math.min(Math.max(xc-tw/2,2),W-tw-2);"
+"cx.fillStyle='rgba(12,15,11,.88)';cx.fillRect(bx,TOPM+18,tw,18);cx.strokeStyle='#34d3c0';cx.strokeRect(bx+.5,TOPM+18.5,tw-1,17);"
+"cx.fillStyle='#e8efe2';cx.fillText(t,bx+6,TOPM+31)}}"
+"if(SHOV!=null&&SHOV>=0&&SHOV<n){var xh=spX(SHOV,W,n);cx.strokeStyle='rgba(255,255,255,.25)';cx.beginPath();cx.moveTo(xh,TOPM);cx.lineTo(xh,H-BOTM);cx.stroke();"
+"var t=(calOk()?calE(SHOV).toFixed(1)+L(' кэВ',' keV')+' | ':'')+L('канал ','channel ')+Math.round(SHOV)+' | '+a[Math.round(SHOV)];"
+"var tw=cx.measureText(t).width;cx.fillStyle='rgba(12,15,11,.85)';cx.fillRect(W-tw-12,H-BOTM-20,tw+8,16);"
+"cx.fillStyle='#cfe0cc';cx.fillText(t,W-tw-8,H-BOTM-8)}"
+"cx.restore()}"
+"function specPick(c){var a=window.LASTSPEC;if(!a)return;var n=a.length,w=Math.max(3,Math.round(0.04*c)),pk=-1,m=-1;"
+"for(var i=Math.max(1,Math.round(c)-w);i<=Math.min(n-2,Math.round(c)+w);i++){var v=a[i-1]+a[i]+a[i+1];if(v>m){m=v;pk=i}}"
+"if(pk<0)return;var h=Math.max(6,0.08*pk),f=calFit(a,pk-h,pk+h);"
+"if(f&&f.fw>2&&Math.abs(f.mu-pk)<0.5*f.fw+2){specSet(f.mu-1.5*f.fw,f.mu+1.5*f.fw);calPtAdd(f.mu,f.fw)}"
+"else{specSet(pk-h,pk+h);if(window.CALTAB)calMsg(L('здесь пик не подогнался - точка не записана','no peak could be fitted here - the point is not recorded'),1)}}"
+"function specSet(A,B){document.getElementById('pka').value=Math.max(0,Math.floor(Math.min(A,B)));"
+"document.getElementById('pkb').value=Math.min(window.LASTSPEC.length-1,Math.ceil(Math.max(A,B)));specRender()}"
+"(function(){var down=null;"
+"cv.addEventListener('pointerdown',function(e){if(isScope()||!window.LASTSPEC)return;var n=window.LASTSPEC.length;"
+"down={x:e.offsetX,c:spCh(e.offsetX,cv.width,n)};SSEL=null;try{cv.setPointerCapture(e.pointerId)}catch(_){}});"
+"cv.addEventListener('pointermove',function(e){if(isScope()||!window.LASTSPEC)return;var n=window.LASTSPEC.length,c=spCh(e.offsetX,cv.width,n);"
+"SHOV=c;if(down&&Math.abs(e.offsetX-down.x)>4)SSEL=[down.c,c];specRender()});"
+"cv.addEventListener('pointerup',function(e){if(isScope()||!down)return;var n=window.LASTSPEC.length,c=spCh(e.offsetX,cv.width,n);"
+"if(Math.abs(e.offsetX-down.x)>4){specSet(down.c,c);if(window.CALTAB){var f=calFit(window.LASTSPEC,Math.min(down.c,c),Math.max(down.c,c));"
+"if(f&&f.fw>2)calPtAdd(f.mu,f.fw);else calMsg(L('здесь пик не подогнался - точка не записана','no peak could be fitted here - the point is not recorded'),1)}}else specPick(down.c);down=null;SSEL=null;specRender()});"
+"cv.addEventListener('pointerleave',function(){if(isScope())return;SHOV=null;if(!down)specRender()});"
+"cv.addEventListener('dblclick',function(){if(isScope())return;document.getElementById('pka').value=0;document.getElementById('pkb').value=0;specRender()})})();"
+/* ПРОБА KCl. Ядро (kclcore.js): модель Монте-Карло пика 1461 кэВ от банки
+   KCl под торцом кристалла NaI (порт tools/dosemodel/mc_kcl.py) и подгонка
+   чистого пика по фону и пробе; tools/check_kcl.py. */
+"var KXS=[[0.003,0.02459,700.3,0],[0.00347168,0.02851,481.7,0],[0.00401752,0.03305,331.3,0],[0.00464919,0.03778,631.4,0],[0.00538016,0.0428,694.7,0],[0.00622607,0.0481,480.7,0],[0.00720498,0.05363,327.6,0],[0.0083378,0.05961,223,0],[0.00964872,0.06572,151.2,0],[0.0111658,0.07151,101.9,0],[0.0129213,0.07748,68.54,0],[0.0149529,0.08395,46.09,0],[0.0173039,0.08951,30.77,0],[0.0200245,0.09467,20.55,0],[0.0231729,0.09942,13.63,0],[0.0268164,0.1037,9.051,0],[0.0286,0.1055,7.557,0],[0.0310326,0.1075,6.005,0],[0.0331,0.109,5.002,0],[0.03318,0.109,29.74,0],[0.0359118,0.1107,24.19,0],[0.0415581,0.1133,16.49,0],[0.0480921,0.1152,11.18,0],[0.0556535,0.1165,7.513,0],[0.0644038,0.117,5.025,0],[0.0745298,0.1168,3.349,0],[0.0862479,0.1159,2.223,0],[0.0998084,0.1144,1.47,0],[0.115501,0.1123,0.9699,0],[0.133661,0.1096,0.6385,0],[0.154676,0.1064,0.4209,0],[0.178995,0.1029,0.277,0],[0.207138,0.09908,0.1828,0],[0.239706,0.09506,0.121,0],[0.277394,0.09087,0.08044,0],[0.321008,0.08661,0.05384,0],[0.371479,0.08229,0.03634,0],[0.429886,0.07796,0.02475,0],[0.497475,0.07366,0.01705,0],[0.512,0.07282,0.01588,0],[0.575692,0.06941,0.01192,0],[0.666206,0.06522,0.008419,0],[0.770952,0.06113,0.006053,0],[0.892166,0.05717,0.004457,0],[1.0221,0.05355,0.003322,0],[1.03244,0.05329,0.00325,1.062e-08],[1.19477,0.04957,0.002434,8.079e-05],[1.38262,0.046,0.00186,0.000435],[1.461,0.0447,0.001683,0.00064],[1.6,0.04257,0.001429,0.001073]];"
+"var KCL_MU=0.050891, KCL_G=16.63*0.1066, NAI_RHO=3.67, K40_E=1.46082;"
+"var KDET=[[25,25],[30,40],[30,70],[40,40],[63,63],[80,80]];"
+"function kRng(seed){var a=seed>>>0;return function(){a=(a+0x6D2B79F5)>>>0;var t=a;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296}}"
+"function kxs(E){var T=KXS,n=T.length,i=0;if(E<=T[0][0])i=0;else if(E>=T[n-1][0])i=n-2;else{while(T[i+1][0]<E)i++}"
+"var a=T[i],b=T[i+1],f=Math.log(E/a[0])/Math.log(b[0]/a[0]),r=[];"
+"for(var k=1;k<4;k++){var y0=a[k],y1=b[k];r.push(y0>0&&y1>0?Math.exp(Math.log(y0)+f*Math.log(y1/y0)):(f<0.5?y0:y1))}"
+"return r}"
+"function kCyl(px,py,pz,dx,dy,dz,R,h2){var t1,t2,a=dx*dx+dy*dy,c=px*px+py*py-R*R;"
+"if(a<1e-12){if(c>0)return null;t1=-1e30;t2=1e30}else{var b=2*(px*dx+py*dy),D=b*b-4*a*c;if(D<0)return null;var q=Math.sqrt(D);t1=(-b-q)/(2*a);t2=(-b+q)/(2*a)}"
+"var z1,z2;if(Math.abs(dz)<1e-12){if(Math.abs(pz)>h2)return null;z1=-1e30;z2=1e30}else{var za=(-h2-pz)/dz,zb=(h2-pz)/dz;z1=Math.min(za,zb);z2=Math.max(za,zb)}"
+"var ti=Math.max(t1,z1),to=Math.min(t2,z2);return ti<to?[ti,to]:null}"
+"function kIso(rnd){var c=2*rnd()-1,f=2*Math.PI*rnd(),s=Math.sqrt(1-c*c);return [s*Math.cos(f),s*Math.sin(f),c]}"
+"function kKN(k,rnd){var e0=1/(1+2*k);for(;;){var a1=-Math.log(e0),a2=0.5*(1-e0*e0),e;"
+"if(rnd()<a1/(a1+a2))e=Math.exp(-a1*rnd());else e=Math.sqrt(e0*e0+(1-e0*e0)*rnd());"
+"var t=(1-e)/(k*e),g=1-e*t*(2-t)/(1+e*e);if(rnd()<=g)return e}}"
+"function kRot(d,ct,rnd){var f=2*Math.PI*rnd(),st=Math.sqrt(Math.max(0,1-ct*ct)),ux=d[0],uy=d[1],uz=d[2],cf=Math.cos(f),sf=Math.sin(f),o;"
+"if(Math.abs(uz)>0.99999)o=[st*cf,st*sf,(uz>0?1:-1)*ct];"
+"else{var s=Math.sqrt(1-uz*uz);o=[st*(ux*uz*cf-uy*sf)/s+ux*ct,st*(uy*uz*cf+ux*sf)/s+uy*ct,-st*cf*s+uz*ct]}"
+"var m=Math.hypot(o[0],o[1],o[2]);return [o[0]/m,o[1]/m,o[2]/m]}"
+"function kTrack(E0,p,d,R,h2,rnd){var st=[[E0,p,d]],dep=0;"
+"while(st.length){var q=st.pop(),E=q[0],P=q[1].slice(),D=q[2];"
+"for(;;){var iv=kCyl(P[0],P[1],P[2],D[0],D[1],D[2],R,h2);if(!iv||iv[1]<=0)break;"
+"var x=kxs(E),mi=x[0]*NAI_RHO,mp=x[1]*NAI_RHO,mq=(E>1.022?x[2]:0)*NAI_RHO,mt=mi+mp+mq,s=-Math.log(rnd())/mt;"
+"if(s>=iv[1])break;P=[P[0]+D[0]*s,P[1]+D[1]*s,P[2]+D[2]*s];var r=rnd()*mt;"
+"if(r<mp){if(E>0.03317&&rnd()<0.83*0.88){dep+=E-0.0286;st.push([0.0286,P,kIso(rnd)])}else dep+=E;break}"
+"if(r<mp+mq){dep+=E-2*0.51099895;var u=kIso(rnd);st.push([0.51099895,P,u]);st.push([0.51099895,P,[-u[0],-u[1],-u[2]]]);break}"
+"var k=E/0.51099895,e=kKN(k,rnd),ct=1-(1-e)/(k*e);dep+=E*(1-e);E*=e;D=kRot(D,Math.max(-1,Math.min(1,ct)),rnd);"
+"if(E<0.003){dep+=E;break}}}"
+"return dep}"
+"function kclEff(o,n,rnd,acc){var R=o.R,h2=o.H/2,z0=-(h2+o.gap),mu=KCL_MU*o.rho,s1=acc?acc.s1:0,s2=acc?acc.s2:0;"
+"for(var i=0;i<n;i++){var r=o.rs*Math.sqrt(rnd()),f=2*Math.PI*rnd(),px=r*Math.cos(f),py=r*Math.sin(f),pz=z0-o.hs*rnd(),d=kIso(rnd);"
+"if(d[2]<=0)continue;var iv=kCyl(px,py,pz,d[0],d[1],d[2],R,h2);if(!iv||iv[0]<=0)continue;"
+"var Lp=(z0-pz)/d[2],a=d[0]*d[0]+d[1]*d[1];if(a>1e-12){var b=2*(px*d[0]+py*d[1]),c=px*px+py*py-o.rs*o.rs;Lp=Math.min(Lp,(-b+Math.sqrt(b*b-4*a*c))/(2*a))}"
+"var w=Math.exp(-mu*Lp),t=iv[0]+1e-7,dep=kTrack(K40_E,[px+d[0]*t,py+d[1]*t,pz+d[2]*t],d,R,h2,rnd);"
+"if(Math.abs(dep-K40_E)<0.002){s1+=w;s2+=w*w}}"
+"return {s1:s1,s2:s2}}"
+"function kclPeak(s,ts,b,tb,E){var n=Math.min(s.length,b.length),net=[],va=[];"
+"for(var i=0;i<n;i++){net.push(s[i]/ts-b[i]/tb);va.push(Math.max(s[i],1)/(ts*ts)+Math.max(b[i],1)/(tb*tb))}"
+"var sm=[];for(var i=0;i<n;i++){var t=0,c=0;for(var j=-4;j<=4;j++)if(i+j>=0&&i+j<n){t+=net[i+j];c++}sm.push(t/c)}"
+"var pk=-1;for(var i=0;i<n;i++)if(E[i]>1461*0.85&&E[i]<1461*1.15&&(pk<0||sm[i]>sm[pk]))pk=i;"
+"if(pk<0||!(sm[pk]>0))return null;"
+"var l=pk,r=pk;while(l>0&&sm[l]>sm[pk]/2)l--;while(r<n-1&&sm[r]>sm[pk]/2)r++;"
+"var s0=Math.max(2,(r-l)/2.3548),best=null;"
+"for(var a=-10;a<=10;a++)for(var q=0;q<=16;q++){var mu=pk+a*s0/10,sg=s0*(0.6+0.05*q),x0=Math.round(mu-4*sg),x1=Math.round(mu+4.5*sg);"
+"if(x0<0||x1>=n)continue;var M=[[0,0,0],[0,0,0],[0,0,0]],V=[0,0,0];"
+"for(var i=x0;i<=x1;i++){var g=Math.exp(-0.5*Math.pow((i-mu)/sg,2))/(sg*2.5066283),f=[g,1,(i-mu)/sg],w=1/va[i];"
+"for(var u=0;u<3;u++){V[u]+=w*f[u]*net[i];for(var v=0;v<3;v++)M[u][v]+=w*f[u]*f[v]}}"
+"var C=kInv3(M);if(!C)continue;var P=[0,0,0];for(var u=0;u<3;u++)for(var v=0;v<3;v++)P[u]+=C[u][v]*V[v];"
+"var x2=0;for(var i=x0;i<=x1;i++){var g=Math.exp(-0.5*Math.pow((i-mu)/sg,2))/(sg*2.5066283),y=P[0]*g+P[1]+P[2]*(i-mu)/sg-net[i];x2+=y*y/va[i]}"
+"x2/=Math.max(1,x1-x0+1-5);if(!best||x2<best.x2)best={x2:x2,A:P[0],eA:Math.sqrt(C[0][0]),mu:mu,sg:sg}}"
+"if(!best)return null;var k=Math.floor(best.mu),fr=best.mu-k,Ec=E[k]+(E[k+1]-E[k])*fr,de=E[k+1]-E[k];"
+"return {area:best.A,err:best.eA*Math.sqrt(Math.max(1,best.x2)),E:Ec,fw:2.3548*best.sg*de,chi2:best.x2}}"
+"function kInv3(m){var a=m[0][0],b=m[0][1],c=m[0][2],d=m[1][0],e=m[1][1],f=m[1][2],g=m[2][0],h=m[2][1],i=m[2][2],"
+"A=e*i-f*h,B=-(d*i-f*g),C=d*h-e*g,D=a*A+b*B+c*C;if(!D)return null;"
+"return [[A/D,-(b*i-c*h)/D,(b*f-c*e)/D],[B/D,(a*i-c*g)/D,-(a*f-c*d)/D],[C/D,-(a*h-b*g)/D,(a*e-b*d)/D]]}"
+/* конец ядра пробы KCl */
+"var KCLR=null,KCLF=['kms','kdi','kht','kgp'];"
+"function kclMsg(t,bad){var e=document.getElementById('kmsg');if(e)e.innerHTML=t?'<span style=color:'+(bad?'#ff8a82':'#7ee081')+'>'+t+'</span>':''}"
+"function kclIn(){var o={};KCLF.forEach(function(id){var e=document.getElementById(id);if(e){o[id]=+e.value.trim().replace(',','.');calStore(['mca_'+id,e.value])}});return o}"
+"function kclBgGet(){try{return JSON.parse(localStorage.getItem('mca_kclbg')||'null')}catch(e){return null}}"
+"function kclBgShow(){var b=kclBgGet(),e=document.getElementById('kbg');if(!e)return;"
+"e.textContent=b?L('фон: ','background: ')+hms(b.ms/1000)+', '+b.n+L(' событий',' events'):L('фон не запомнен','no background stored')}"
+"function kclInit(){KCLF.forEach(function(id){try{var v=localStorage.getItem('mca_'+id),e=document.getElementById(id);if(v!=null&&e)e.value=v}catch(_){}});kclBgShow()}"
+"function kclBg(){var a=window.LASTSPEC;"
+"if(!a||!a.length||!window.RUNMS){kclMsg(L('спектра ещё нет','no spectrum yet'),1);return}"
+"if(RUNMS<300000){kclMsg(L('наберите фон хотя бы 5 минут','acquire the background for at least 5 minutes'),1);return}"
+"var n=0;for(var i=0;i<a.length;i++)n+=a[i];"
+"try{localStorage.setItem('mca_kclbg',JSON.stringify({d:Array.prototype.slice.call(a),ms:RUNMS,sig:calSig(),n:n,t:Date.now()}))}"
+"catch(e){kclMsg(L('браузер не дал сохранить фон','the browser refused to store the background'),1);return}"
+"kclBgShow();kclMsg(L('фон запомнен в браузере: поставьте пробу KCl, нажмите «Сброс» и наберите столько же','the background is stored in the browser: put the KCl sample, press “Reset” and acquire as long'),0)}"
+"function kclRun(){var b=kclBgGet(),a=window.LASTSPEC,o=kclIn(),bk=document.getElementById('kbk');KCLR=null;if(bk)bk.disabled=true;"
+"if(!b){kclMsg(L('сначала наберите фон пустого домика и нажмите «Запомнить фон»','first acquire the empty-castle background and press “Store background”'),1);return}"
+"if(!a||!a.length||!window.RUNMS||RUNMS<300000){kclMsg(L('наберите пробу хотя бы 5 минут','acquire the sample for at least 5 minutes'),1);return}"
+"if(b.sig!=calSig()){kclMsg(L('фон набран при других настройках - наберите его заново','the background was acquired with other settings - acquire it again'),1);return}"
+"if(!calOk()){kclMsg(L('нужна калибровка по энергии для этих настроек','needs an energy calibration for these settings'),1);return}"
+"if(!(o.kms>0&&o.kdi>0&&o.kht>0&&o.kgp>=0)){kclMsg(L('впишите массу соли, диаметр банки, высоту слоя и зазор','enter the salt mass, jar diameter, layer height and gap'),1);return}"
+"var E=[];for(var i=0;i<a.length;i++)E.push(calE(i));"
+"var p=kclPeak(a,RUNMS/1000,b.d,b.ms/1000,E);"
+"if(!p||!(p.area>3*p.err)){kclMsg(L('пик K-40 не найден: наберите пробу подольше и проверьте калибровку','the K-40 peak is not found: acquire the sample longer and check the calibration'),1);return}"
+"var di=(window.DOSE&&DOSE.det!=null)?DOSE.det:3,det=KDET[di],rs=o.kdi/20,hs=o.kht/10,"
+"geo={R:det[0]/20,H:det[1]/10,rs:rs,hs:hs,rho:o.kms/(Math.PI*rs*rs*hs),gap:o.kgp/10},N=2000000,done=0,acc={s1:0,s2:0},rnd=kRng(12345);"
+"(function step(){acc=kclEff(geo,200000,rnd,acc);done+=200000;"
+"if(done<N){kclMsg(L('считаю модель: ','computing the model: ')+Math.round(100*done/N)+' %',0);setTimeout(step,0);return}"
+"var src=o.kms*KCL_G,pr=acc.s1/N*src,pe=Math.sqrt(acc.s2)/N*src,k=pr/p.area,ek=k*Math.sqrt(Math.pow(pe/pr,2)+Math.pow(p.err/p.area,2)),"
+"sh=100*(p.E/1460.82-1),t=L('пик K-40: ','K-40 peak: ')+'<b>'+p.area.toFixed(3)+' &plusmn; '+p.err.toFixed(3)+L(' имп/с',' cps')+'</b>'+"
+"L(' на ',' at ')+p.E.toFixed(0)+L(' кэВ',' keV')+', FWHM '+p.fw.toFixed(0)+L(' кэВ',' keV')+'; '+"
+"L('модель (','model (')+'NaI '+det.join('×')+L(', плотность соли ',', salt density ')+geo.rho.toFixed(2)+L(' г/см³): ',' g/cm³): ')+"
+"pr.toFixed(3)+' &plusmn; '+pe.toFixed(3)+L(' имп/с',' cps')+' &rarr; <b>k = '+k.toFixed(3)+' &plusmn; '+ek.toFixed(3)+'</b>'+"
+"L(' (статистика; сейчас k = ',' (statistics; now k = ')+(window.DOSE?(+DOSE.k).toFixed(3):'?')+')';"
+"if(Math.abs(sh)>2)t+='<br><span style=color:#f0c45a>'+L('шкала энергии у 1461 кэВ сдвинута на ','the energy scale at 1461 keV is off by ')+sh.toFixed(1)+L(' % - перекалибруйте её, иначе доза тоже сдвинута',' % - recalibrate it, or the dose is off too')+'</span>';"
+"if(k<0.5||k>2)t+='<br><span style=color:#ff8a82>'+L('k далеко от 1: проверьте блок детектирования, массу и размеры','k is far from 1: check the detector block, the mass and the dimensions')+'</span>';"
+"KCLR={k:k};if(bk)bk.disabled=false;"
+"document.getElementById('kmsg').innerHTML=t})()}"
+"function kclSave(){if(!KCLR)return;doseK(KCLR.k.toFixed(4))}"
+"kclInit();"
 "</script></body></html>";
 
 /* ---------------- обработчики ---------------- */
@@ -1187,6 +1696,81 @@ static esp_err_t h_shape(httpd_req_t *r)
     return e;
 }
 
+/* /cps - только CPS, для опроса 10 раз в секунду со страницы спектра:
+ * cpsf - быстрый CPS (окно от 100 мс до 1 с, при скачке счёта - 100 мс,
+ * см. mca_dsp_tick_fast), cpsw - длина его окна, мс; cps - за прошлую
+ * целую секунду, ev - всего событий, run - идёт набор. */
+static esp_err_t h_cps(httpd_req_t *r)
+{
+    mca_stats_t s;
+    mca_dsp_get_stats(&s);
+    /* dh, dr - мощность дозы тем же быстрым окном: мкЗв/ч (H*(10)) и мкР/ч,
+     * с поправкой k; dok - доза считается (есть калибровка для этих
+     * настроек, mca_dose.h) */
+    const float k = mca_dose_k();
+    const bool dok = mca_dose_state() == MCA_DOSE_OK;
+    char buf[160];
+    const int n = snprintf(buf, sizeof(buf),
+        "{\"cpsf\":%lu,\"cpsw\":%lu,\"cps\":%lu,\"ev\":%llu,\"run\":%d,"
+        "\"dok\":%d,\"dh\":%.4g,\"dr\":%.4g}",
+        (unsigned long)s.cps_fast, (unsigned long)s.cps_fast_ms,
+        (unsigned long)s.cps,
+        (unsigned long long)s.total_events, mca_spec_run ? 1 : 0, dok ? 1 : 0,
+        dok ? k * MCA_DOSE_USVH(s.dose_h_fast, 1.0) : 0.0,
+        dok ? k * MCA_DOSE_URH(s.dose_k_fast, 1.0) : 0.0);
+    if (n < 0 || n >= (int)sizeof(buf)) return httpd_resp_send_500(r);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, buf, n);
+}
+
+/* /dose - мощность дозы: ok, why (mca_dose_why_t), det - блок
+ * детектирования (MCA_DOSE_DET_NAME), k - его поправка, s - время набора с
+ * «Сброса», с; h0, r0 - средние с «Сброса» без поправки, мкЗв/ч и мкР/ч;
+ * h, r - с поправкой; n - событий.
+ * /dose?det=3 - выбрать блок; /dose?k=1.23 - записать поправку блока
+ * (0.05 ... 20). Таблицы под новый блок - на следующем секундном тике. */
+static esp_err_t h_dose(httpd_req_t *r)
+{
+    char q[48], v[24];
+    int set = -1;
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+        if (httpd_query_key_value(q, "det", v, sizeof(v)) == ESP_OK) {
+            char *end;
+            const long d = strtol(v, &end, 10);
+            set = (end != v && mca_dose_set_det((int)d) == ESP_OK) ? 1 : 0;
+        }
+        if (httpd_query_key_value(q, "k", v, sizeof(v)) == ESP_OK) {
+            char *end;
+            const double k = strtod(v, &end);
+            set = (end != v && mca_dose_set_k((float)k) == ESP_OK) ? 1 : 0;
+        }
+    }
+    /* суммы и время набора - одним снимком: run_ms в статистике
+     * обновляется раз в секунду, а суммы - на каждом чанке, и в окне 10 с
+     * на странице это давало бы скачки до 10 % */
+    double dh, dk;
+    uint64_t ev, rn;
+    mca_dsp_dose_snap(&dh, &dk, &ev, &rn);
+    const double sec = rn / 1e9;
+    const bool ok = mca_dose_state() == MCA_DOSE_OK;
+    const double h0 = (ok && sec > 0) ? MCA_DOSE_USVH(dh, sec) : 0;
+    const double r0 = (ok && sec > 0) ? MCA_DOSE_URH(dk, sec) : 0;
+    const float k = mca_dose_k();
+    /* hs, ks - суммы весов с «Сброса» без поправки, пЗв и пГр: по ним
+     * страница считает мощность дозы за скользящие 10 с */
+    char buf[320];
+    const int n = snprintf(buf, sizeof(buf),
+        "{\"ok\":%d,\"why\":%d,\"det\":%d,\"k\":%.5g,\"s\":%.4f,\"n\":%llu,"
+        "\"h0\":%.5g,\"r0\":%.5g,\"h\":%.5g,\"r\":%.5g,\"hs\":%.9g,\"ks\":%.9g,\"set\":%d}",
+        ok ? 1 : 0, (int)mca_dose_state(), mca_dose_det(), k, sec,
+        (unsigned long long)ev, h0, r0, h0 * k, r0 * k, dh, dk, set);
+    if (n < 0 || n >= (int)sizeof(buf)) return httpd_resp_send_500(r);
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    return httpd_resp_send(r, buf, n);
+}
+
 static esp_err_t h_stat(httpd_req_t *r)
 {
     mca_prof_web_begin(PROF_EP_STAT);
@@ -1366,6 +1950,47 @@ static esp_err_t h_time(httpd_req_t *r)
     return httpd_resp_send(r, buf, n);
 }
 
+/* /calib - калибровка по энергии. GET отдаёт сохранённую строку JSON (или
+ * {}), POST с телом сохраняет её (до MCA_CALIB_MAX байт; пустое тело или {}
+ * - стереть). Составляет и разбирает её страница, прибор только хранит.
+ * Буферы статические: запросы веб-сервер обрабатывает по одному. */
+static char s_calbuf[MCA_CALIB_MAX + 1];
+
+static esp_err_t h_calib_get(httpd_req_t *r)
+{
+    const size_t n = mca_settings_load_calib(s_calbuf, sizeof(s_calbuf));
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
+    if (!n) return httpd_resp_sendstr(r, "{}");
+    return httpd_resp_send(r, s_calbuf, n);
+}
+
+static esp_err_t h_calib_post(httpd_req_t *r)
+{
+    if (r->content_len > MCA_CALIB_MAX) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "calibration too long");
+        return ESP_FAIL;
+    }
+    size_t got = 0;
+    while (got < r->content_len) {
+        const int k = httpd_req_recv(r, s_calbuf + got, r->content_len - got);
+        if (k == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (k <= 0) return ESP_FAIL;
+        got += (size_t)k;
+    }
+    s_calbuf[got] = 0;
+    size_t len = got;
+    if (len == 2 && !strcmp(s_calbuf, "{}")) len = 0;
+    if (len && (s_calbuf[0] != '{' || s_calbuf[len - 1] != '}')) {
+        httpd_resp_send_err(r, HTTPD_400_BAD_REQUEST, "not a JSON object");
+        return ESP_FAIL;
+    }
+    const esp_err_t e = mca_settings_save_calib(s_calbuf, len);
+    mca_dose_calib_changed();           /* таблицы дозы - по новой шкале */
+    httpd_resp_set_type(r, "application/json");
+    return httpd_resp_sendstr(r, e == ESP_OK ? "{\"ok\":1}" : "{\"ok\":0}");
+}
+
 /* /hist?from=N - история CPS (mca_hist.h), двоичная, little-endian:
  * 7 x uint32 (эпоха, номер первого отданного отсчёта, номер следующего,
  * время прибора с включения в 0.1 с, сколько отдано, длина кольца,
@@ -1375,19 +2000,23 @@ static esp_err_t h_hist(httpd_req_t *r)
 {
     char q[48], v[16];
     uint32_t from = 0;
+    bool fast = false;                  /* f=1 - быстрая история, по 0.1 с */
     if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
         if (httpd_query_key_value(q, "clear", v, sizeof(v)) == ESP_OK)
             mca_hist_clear();
+        if (httpd_query_key_value(q, "f", v, sizeof(v)) == ESP_OK)
+            fast = v[0] == '1';
         if (httpd_query_key_value(q, "from", v, sizeof(v)) == ESP_OK)
             from = (uint32_t)strtoul(v, NULL, 10);
     }
     /* веб-сервер обрабатывает запросы по одному - общий буфер безопасен */
     static mca_hist_sample_t buf[1024];
     uint32_t first = 0, next = 0, epoch = 0;
-    const size_t n = mca_hist_copy(from, buf, 1024, &first, &next, &epoch);
+    const size_t n = mca_hist_copy_ex(fast, from, buf, 1024, &first, &next, &epoch);
     const uint32_t h[7] = { epoch, first, next,
                             (uint32_t)(esp_timer_get_time() / 100000),
-                            (uint32_t)n, MCA_HIST_LEN, 0 };
+                            (uint32_t)n, fast ? MCA_HIST_FAST_LEN : MCA_HIST_LEN,
+                            fast ? 100 : 1000 };   /* шаг отсчётов, мс */
     httpd_resp_set_type(r, "application/octet-stream");
     httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     esp_err_t e = httpd_resp_send_chunk(r, (const char *)h, sizeof(h));
@@ -1595,7 +2224,7 @@ static void net_init(void)
 /* Та же шапка, что на главной, но без индикаторов состояния - только
  * переключатель языка. Заголовок вкладки - на двух языках. */
 #define SUB_HEAD(TITLE, TITLE_EN) \
-"<!DOCTYPE html><html lang=ru><head><meta charset=utf-8>" \
+"<!DOCTYPE html><html lang=ru><head><meta charset=utf-8><link rel=icon href=/favicon.ico>" \
 "<meta name=viewport content='width=device-width,initial-scale=1'>" \
 "<title data-en='" TITLE_EN " · MCA'>" TITLE " · MCA</title>" \
 "<link rel=stylesheet href=/s.css><script src=/l.js></script></head><body>" \
@@ -1661,8 +2290,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 /* фильтр формы (mca_dsp.c, shape_check): включается здесь же, сразу */
 "<section class='panel pad'>"
 "<h3 data-en='Pulse shape filter'>Фильтр формы импульса</h3>"
-"<p class=n style=margin-top:0 data-en='Rejects pulses that differ from the learned reference. Helps with a noisy power supply or a poor-quality PMT.'>"
-"Отбрасывает импульсы, отличающиеся от набранного эталона. Помогает при шумном питании или некачественном ФЭУ.</p>"
+"<p class=n style=margin-top:0 data-en='Rejects pulses that differ from the learned reference. Helps with a noisy power supply or when working with a poor-quality PMT.'>"
+"Отбрасывает импульсы, отличающиеся от набранного эталона. Помогает при шумном питании или при работе с некачественным ФЭУ.</p>"
 "<div class=grp style='margin:8px 0'>"
 "<label><input type=checkbox id=sh_on onchange=shSet()> <span data-en='filter on'>фильтр включён</span></label>"
 "<label><span data-en='tolerance, %'>допуск, %</span> <input id=sh_tol type=number min=1 max=200 style=width:70px onchange=shSet()></label>"
@@ -1754,8 +2383,8 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "'ADC sample rate. Higher - more detailed pulse shape, but processing may not keep up: watch lost chunks on the “Diagnostics” page. Measured on this board (about 3500 cps), spectrum processing takes about 70 % of the core at 16 MHz and about 90 % at 20 MHz; with a higher count rate the load is higher. Filter parameters are set in samples, so at another rate the same L or G is a different time.'),"
 "polarity:L('0 - импульсы вверх от базовой линии, 1 - вниз (например, анод ФЭУ напрямую). При 1 сигнал переворачивается ещё до обработки, и порог и спектр работают как с импульсами вверх; осциллограф синхронизируется по фронту вниз. Постоянная составляющая сигнала на обработку не влияет - её вычитает трапеция.',"
 "'0 - pulses go up from the baseline, 1 - down (for example, PMT anode directly). With 1 the signal is inverted before processing, so the threshold and spectrum work as with upward pulses; the oscilloscope triggers on a falling edge. A DC offset of the signal does not affect processing - the trapezoid subtracts it.'),"
-"algo:L('Трапеция: амплитуда по вершине трапеции (окно L, зазор G, по желанию среднее по плато). Интегрирование: среднее отсчётов импульса вокруг вершины за вычетом базовой линии (до и после вершины, база 2^N, окно базы). Свёртка с эталоном: высота, при которой эталонный импульс фильтра формы лучше всего ложится на импульс - в неё идёт весь импульс, каждый отсчёт с весом своей доли сигнала (так берёт высоту BecqMoni для звуковой карты), база - 32 отсчёта перед началом фронта, шкала - как у интегрирования; нужен набранный эталон на этом окне «до / после вершины» и этой частоте, без него амплитуда считается трапецией; новый эталон очищает спектр. Поля, которые при выбранном способе ни на что не влияют, в таблице приглушены. Обнаружение события в обоих способах одинаковое - по выходу трапеции, поэтому L, G, порог, гистерезис, перезапуск и поиск пика нужны всегда. Шкалы трапеции и интегрирования различаются (свёртка - в шкале интегрирования) - после переключения подберите «Кодов на канал». Смена способа очищает спектр.',"
-"'Trapezoid: amplitude from the trapezoid top (window L, gap G, optionally flat-top average). Integration: mean of the pulse samples around the peak minus the baseline (before and after peak, baseline 2^N, baseline window). Convolution with the reference: the height at which the shape-filter reference pulse fits the pulse best - the whole pulse goes into it, each sample weighted by its share of the signal (this is how BecqMoni takes the height for a sound card), the baseline is 32 samples before the rise starts, the scale is that of integration; it needs a learned reference for this “before / after peak” window and this rate, without one the amplitude is computed by the trapezoid; a new reference clears the spectrum. Fields that have no effect with the selected method are dimmed in the table. Event detection is the same for both methods - on the trapezoid output, so L, G, threshold, hysteresis, re-arm and peak search are always needed. The trapezoid and integration scales differ (convolution uses the integration scale) - after switching, adjust “Codes per channel”. Changing the method clears the spectrum.'),"
+"algo:L('Трапеция: амплитуда по вершине трапеции (окно L, зазор G, по желанию среднее по плато). Интегрирование: среднее отсчётов импульса вокруг вершины (до и после вершины) за вычетом базы - 32 отсчётов перед фронтом этого импульса. Свёртка с эталоном: высота, при которой эталонный импульс фильтра формы лучше всего ложится на импульс - в неё идёт весь импульс, каждый отсчёт с весом своей доли сигнала (так берёт высоту BecqMoni для звуковой карты), база - 32 отсчёта перед началом фронта, шкала - как у интегрирования; нужен набранный эталон на этом окне «до / после вершины» и этой частоте, без него амплитуда считается трапецией; новый эталон очищает спектр. Поля, которые при выбранном способе ни на что не влияют, в таблице приглушены. Обнаружение события в обоих способах одинаковое - по выходу трапеции, поэтому L, G, порог, гистерезис, перезапуск и поиск пика нужны всегда. Шкалы трапеции и интегрирования различаются (свёртка - в шкале интегрирования) - после переключения подберите «Кодов на канал». Смена способа очищает спектр.',"
+"'Trapezoid: amplitude from the trapezoid top (window L, gap G, optionally flat-top average). Integration: mean of the pulse samples around the peak (before and after peak) minus the baseline - 32 samples before the rise of this pulse. Convolution with the reference: the height at which the shape-filter reference pulse fits the pulse best - the whole pulse goes into it, each sample weighted by its share of the signal (this is how BecqMoni takes the height for a sound card), the baseline is 32 samples before the rise starts, the scale is that of integration; it needs a learned reference for this “before / after peak” window and this rate, without one the amplitude is computed by the trapezoid; a new reference clears the spectrum. Fields that have no effect with the selected method are dimmed in the table. Event detection is the same for both methods - on the trapezoid output, so L, G, threshold, hysteresis, re-arm and peak search are always needed. The trapezoid and integration scales differ (convolution uses the integration scale) - after switching, adjust “Codes per channel”. Changing the method clears the spectrum.'),"
 "int_rise:L('Интегрирование: сколько отсчётов ДО вершины включать в сумму. Смотрите на картинку импульса и считайте по сетке.',"
 "'Integration: how many samples BEFORE the peak to include in the sum. Look at the pulse picture and count by the grid.'),"
 "int_fall:L('Интегрирование: сколько отсчётов ПОСЛЕ вершины включать в сумму. Обычно заметно больше, чем до вершины, потому что спад длиннее фронта.',"
@@ -1776,12 +2405,12 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "'How many samples to skip unconditionally after the peak, regardless of hysteresis. Protection against chatter on the falling tail. This is NOT a loss metric but a detector re-arm parameter.'),"
 "search:L('Сколько отсчётов после срабатывания порога перебирать в поисках максимума трапеции. Должно накрывать весь импульс.',"
 "'How many samples after the threshold crossing to search for the trapezoid maximum. Must cover the whole pulse.'),"
-"baseline_shift:L('Только для интегрирования: трапеция вычитает базу сама. Постоянная времени фильтра, отслеживающего нулевой уровень. Больше значение - медленнее и плавнее подстройка. Обычно 8-12.',"
-"'Integration only: the trapezoid subtracts the baseline itself. Time constant of the filter that tracks the zero level. Larger value - slower and smoother tracking. Usually 8-12.'),"
+"baseline_shift:L('Бегущая база - запасная для интегрирования (основная - 32 отсчёта перед фронтом импульса); трапеция вычитает базу сама. Постоянная времени фильтра, отслеживающего нулевой уровень. Больше значение - медленнее и плавнее подстройка. Обычно 8-12, допустимо 1-16.',"
+"'Running baseline - a fallback for integration (the main one is 32 samples before the rise of the pulse); the trapezoid subtracts the baseline itself. Time constant of the filter that tracks the zero level. Larger value - slower and smoother tracking. Usually 8-12, allowed 1-16.'),"
 "flat_avg:L('Только для трапеции. 1 = амплитуда как среднее по плоской вершине трапеции, 0 = по максимуму. Проверено симуляцией: усреднение выигрывает ТОЛЬКО при длинном плато (G минус L не меньше 19). При коротком плато максимум даёт даже меньший разброс, поэтому при (G-L) меньше 16 происходит автоматический откат на максимум. Смещение максимума растёт с шумом, но это постоянный сдвиг для всех амплитуд - уходит в калибровку, ширину пиков не портит.',"
 "'Trapezoid only. 1 = amplitude as the mean over the flat top of the trapezoid, 0 = maximum. Verified by simulation: averaging wins ONLY with a long flat top (G minus L at least 19). With a short flat top the maximum gives even less spread, so with (G-L) below 16 it automatically falls back to the maximum. The bias of the maximum grows with noise, but it is a constant shift for all amplitudes - it goes into calibration and does not widen the peaks.'),"
-"baseline_win:L('Только для интегрирования. Окно приёма отсчёта в базовую линию, коды АЦП. В среднее берутся только отсчёты, лежащие ближе этого значения к текущей оценке нуля - иначе длинные хвосты импульсов утянут базовую линию вверх. Ставить примерно вдвое-втрое больше размаха шума.',"
-"'Integration only. Acceptance window for a sample into the baseline, ADC codes. Only samples closer than this to the current zero estimate are averaged - otherwise long pulse tails would pull the baseline up. Set about two to three times the noise swing.'),"
+"baseline_win:L('Только для бегущей базы (запасной у интегрирования). Окно приёма отсчёта в базовую линию, коды АЦП. В среднее берутся только отсчёты, лежащие ближе этого значения к текущей оценке нуля - иначе длинные хвосты импульсов утянут базовую линию вверх. Ставить примерно вдвое-втрое больше размаха шума.',"
+"'Running baseline only (a fallback for integration). Acceptance window for a sample into the baseline, ADC codes. Only samples closer than this to the current zero estimate are averaged - otherwise long pulse tails would pull the baseline up. Set about two to three times the noise swing.'),"
 "pileup_pre_pct:L('Если ПЕРЕД пиком трапеция уже выше этого процента от амплитуды - импульс сидит на хвосте предыдущего, бракуем. Меньше процент - строже отбраковка.',"
 "'If BEFORE the peak the trapezoid is already above this percentage of the amplitude - the pulse sits on the tail of the previous one, reject. Lower percentage - stricter rejection.'),"
 "pileup_post_pct:L('Если ПОСЛЕ пика трапеция не упала ниже этого процента - на импульс наложился следующий, бракуем. Меньше процент - строже отбраковка.',"
@@ -2540,10 +3169,10 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "зазор G задают и обнаружение, и измерение; дополнительно «Средн. по "
 "плато». Базовая линия не нужна: трапеция вычитает её сама.</td></tr>"
 "<tr><td>Интегрирование</td><td>Амплитуда &mdash; среднее отсчётов "
-"импульса вокруг вершины за вычетом базовой линии. Свои параметры: "
-"«До вершины», «После вершины» (сколько "
-"отсчётов брать, считаются прямо по осциллографу), «База 2^N» и «Окно "
-"базы». Масштаб у способов разный &mdash; после переключения подберите "
+"импульса вокруг вершины за вычетом базы &mdash; 32 отсчётов перед фронтом этого же "
+"импульса, как у свёртки. Свои параметры: «До вершины», «После вершины» (сколько "
+"отсчётов брать, считаются прямо по осциллографу). «База 2^N» и «Окно базы» нужны, только "
+"если перед импульсом нет этих 32 отсчётов (у самого начала потока). Масштаб у способов разный &mdash; после переключения подберите "
 "«Кодов на канал». Смена способа очищает спектр.</td></tr>"
 "<tr><td>Свёртка с эталоном</td><td>Амплитуда &mdash; высота, при которой эталонный "
 "импульс фильтра формы лучше всего ложится на импульс (как в BecqMoni); база &mdash; 32 "
@@ -2569,9 +3198,10 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "событий от неё не зависит &mdash; спектр не сжимается и не "
 "сбрасывается. Прибор копит все 8192 канала.</td></tr>"
 "<tr><td>База 2^N<br><code>baseline_shift</code></td><td>Постоянная "
-"времени фильтра, отслеживающего нулевой уровень между импульсами. "
+"времени фильтра, отслеживающего нулевой уровень между импульсами (бегущая "
+"база: запасная для интегрирования и показ базы на странице). "
 "Больше значение &mdash; медленнее и плавнее подстройка. Обычно "
-"8&ndash;12.</td></tr>"
+"8&ndash;12, допустимо 1&ndash;16.</td></tr>"
 "<tr><td>Окно базы<br><code>baseline_win</code></td><td>В среднее "
 "берутся только отсчёты, отстоящие от текущей оценки нуля не дальше "
 "этого значения. Нужно потому, что между импульсами сигнал редко "
@@ -2609,14 +3239,51 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "<tr><th>Режим</th><th>Назначение</th></tr>"
 "<tr><td>Спектр</td><td>Набор гистограммы. Поля «пик от / до» выделяют "
 "участок спектра: для него считаются центр, ширина на полувысоте и "
-"разрешение. Кнопки «выгрузить» сохраняют спектр файлом: "
+"разрешение. Пик удобнее выделять мышью прямо на графике: <b>щелчок</b> по пику "
+"&mdash; участок вокруг него (центр ±1.5 FWHM), <b>протяжка</b> &mdash; свой участок, "
+"<b>двойной щелчок</b> &mdash; сброс; итог подписывается над пиком, а под курсором "
+"видны канал, энергия и счёт. Всё про калибровку &mdash; под кнопкой «Калибровка» (снаружи "
+"только сводка в строку). Блок «Калибровка по энергии»: выберите изотоп и "
+"«Откалибровать» &mdash; страница найдёт линии, подгонит пики и построит шкалу E(канал); "
+"«Сохранить в настройки» записывает её в прибор (до этого она только на странице и "
+"помечена «не сохранена»). «Показать линии калибровки» отмечает линии изотопа на "
+"графике; под кнопкой же &mdash; шкала, таблица линий и поля c0&ndash;c4: коэффициенты "
+"можно вписать вручную (E = c0 + c1&middot;k + &hellip; + c4&middot;k<sup>4</sup>, кэВ) и нажать "
+"«Применить». Там же калибровка <b>по точкам</b> (до 4): при открытой «Калибровке» щелчок "
+"по пику на спектре (или протяжка по нему) подгоняет пик и ставит его центр в строку, "
+"выбранную кнопкой номера, или в первую свободную; впишите энергию линии и нажмите "
+"«Построить по точкам» (1 точка &mdash; прямая через ноль, 2&ndash;3 &mdash; прямая, 4 &mdash; "
+"парабола). <b>Мощность дозы</b> считается по спектру, когда в приборе сохранена калибровка "
+"для текущих настроек: каждое событие добавляет вес G(E) своей энергии, функция G подогнана по "
+"модели кристалла выбранного блока &mdash; NaI(Tl) Ø25×25, 30×40, 30×70, 40×40, 63×63 или 80×80 "
+"(Монте-Карло, H*(10) по ICRP 74 и керма в воздухе); у каждого блока своя поправка k. "
+"В строке статуса &mdash; мощность дозы в мкЗв/ч за последние 10 с набора, обновляется раз в "
+"секунду (в подсказке &mdash; окно, погрешность и мкР/ч), в блоке «Мощность "
+"дозы» &mdash; средняя с «Сброса». Ошибка модели от 50 кэВ до 3 МэВ &mdash; в среднем 3 %, "
+"до 14&ndash;17 %, если источник сбоку; в торец детектора мягкое излучение занижается до "
+"35 %. Поправку k можно подогнать по дозиметру: положите его рядом, «Сброс», подождите "
+"несколько минут, впишите показание и «Подогнать k». Или <b>пробой KCl</b>: пустой домик &mdash; "
+"«Сброс», набор, «Запомнить фон» (спектр хранит браузер); банка с KCl под торцом детектора "
+"&mdash; «Сброс», набор столько же, впишите массу, диаметр банки, высоту слоя и зазор от соли "
+"до кристалла, «Посчитать по пробе»: страница подгонит чистый пик 1461 кэВ, посчитает его "
+"по модели кристалла (Монте-Карло прямо в браузере) и предложит k = модель / измерено "
+"(«Записать k»). Космические мюоны (за шкалой) в дозу не "
+"входят, поэтому на фоне прибор показывает меньше дозиметра. Шкала годится, пока не сменились способ измерения, окна, L, G, «кодов на канал», "
+"полярность и частота; иначе блок скажет, что калибровку пора набрать заново. "
+"С калибровкой измеритель пика показывает энергию и разрешение <b>от энергии "
+"линии</b> &mdash; процент по каналам зависит от нуля шкалы, и сравнивать по нему "
+"способы нечестно; ось X переключается «каналы / кэВ» над графиком, линии изотопа "
+"на графике &mdash; использованные для калибровки ярко, остальные бледно, а файлы "
+"выгружаются с калибровкой. Кнопки «выгрузить» сохраняют спектр файлом: "
 "XML (ResultDataFile, открывается в BecqMoni), CSV (канал и счёт), "
 "N42 (ANSI N42.42) и SPE (SpectraLine). "
 "Выгружаются каналы, видимые на экране; время замера берётся из часов "
 "компьютера &mdash; своих часов у прибора нет. Ниже &mdash; мониторинг CPS: история за "
 "6 часов по секунде хранится в приборе и копится, пока идёт набор, даже при "
 "закрытой странице; график складывает её в интервалы «усреднение, с» и рисует "
-"скользящее среднее. Видно окно по времени (по умолчанию последние 30 с, выбор "
+"скользящее среднее. Шаг 0.1, 0.25 и 0.5 с берётся из быстрой истории прибора: "
+"по 0.1 с за последние 10 минут (шаг 0.25 с &mdash; по 2&ndash;3 таких отсчёта, CPS по "
+"их настоящему времени). Видно окно по времени (по умолчанию последние 30 с, выбор "
 "«окно»), оно едет за новыми данными; колесо &mdash; масштаб, перетаскивание "
 "&mdash; сдвиг в прошлое (там окно стоит на месте), двойной щелчок &mdash; обратно "
 "к окну и текущему моменту. CPS интервала &mdash; импульсы, делённые "
@@ -2733,9 +3400,11 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "gap G set both detection and measurement; in addition “Flat-top avg”. No baseline "
 "is needed: the trapezoid subtracts it itself.</td></tr>"
 "<tr><td>Integration</td><td>Amplitude &mdash; the mean of the pulse samples around "
-"the peak minus the baseline. Its own parameters: “Before peak”, “After peak” (how "
-"many samples to take, counted straight from the oscilloscope), “Baseline 2^N” and "
-"“Baseline window”. The methods have different scales &mdash; after switching, "
+"the peak minus the baseline &mdash; 32 samples before the rise of the same pulse, as in "
+"convolution. Its own parameters: “Before peak”, “After peak” (how many samples to take, "
+"counted straight from the oscilloscope). “Baseline 2^N” and “Baseline window” are needed "
+"only if those 32 samples are not there before the pulse (at the very start of the "
+"stream). The methods have different scales &mdash; after switching, "
 "adjust “Codes per channel”. Changing the method clears the spectrum.</td></tr>"
 "<tr><td>Convolution with the reference</td><td>Amplitude &mdash; the height at which the "
 "shape-filter reference pulse fits the pulse best (as in BecqMoni); the baseline is 32 samples "
@@ -2761,8 +3430,9 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "depend on it &mdash; the spectrum is neither compressed nor reset. The device "
 "accumulates all 8192 channels.</td></tr>"
 "<tr><td>Baseline 2^N<br><code>baseline_shift</code></td><td>Time constant of the "
-"filter that tracks the zero level between pulses. Larger value &mdash; slower and "
-"smoother tracking. Usually 8&ndash;12.</td></tr>"
+"filter that tracks the zero level between pulses (running baseline: a fallback for "
+"integration and the baseline shown on the page). Larger value &mdash; slower and "
+"smoother tracking. Usually 8&ndash;12, allowed 1&ndash;16.</td></tr>"
 "<tr><td>Baseline window<br><code>baseline_win</code></td><td>Only samples within "
 "this distance from the current zero estimate are averaged. This is needed because "
 "between pulses the signal rarely returns to the true zero &mdash; unfinished tails "
@@ -2795,15 +3465,53 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "<h4>Modes</h4><table>"
 "<tr><th>Mode</th><th>Purpose</th></tr>"
 "<tr><td>Spectrum</td><td>Histogram acquisition. The “peak from / to” fields select "
-"a part of the spectrum: the centroid, FWHM and resolution are computed for it. The "
-"“export” buttons save the spectrum to a file: XML (ResultDataFile, opens in "
+"a part of the spectrum: the centroid, FWHM and resolution are computed for it. A peak is "
+"easier to select with the mouse right on the plot: a <b>click</b> on a peak &mdash; the "
+"range around it (centroid ±1.5 FWHM), a <b>drag</b> &mdash; your own range, a <b>double "
+"click</b> &mdash; reset; the result is labelled above the peak, and the channel, energy and "
+"count are shown under the cursor. Everything about calibration is under the “Calibration” "
+"button (outside - a one-line summary). The “Energy calibration” block: choose the isotope and "
+"“Calibrate” &mdash; the page finds the lines, fits the peaks and builds the E(channel) scale; "
+"“Save to settings” writes it to the device (until then it is only on the page and marked "
+"“not saved”). “Show calibration lines” marks the isotope lines on the plot; under the same "
+"button are the scale, the table of lines and the c0&ndash;c4 fields: the coefficients can be "
+"entered by hand (E = c0 + c1&middot;k + &hellip; + c4&middot;k<sup>4</sup>, keV) with "
+"“Apply”. Calibration <b>by points</b> (up to 4) is there too: with “Calibration” open, a click "
+"on a peak in the spectrum (or a drag over it) fits the peak and puts its centroid into the row "
+"chosen with its number button or into the first free one; enter the line energy and press "
+"“Build from points” (1 point &mdash; a line through zero, 2&ndash;3 &mdash; a line, 4 &mdash; "
+"a parabola). The <b>dose rate</b> is computed from the spectrum when the device holds a "
+"calibration for the current settings: each event adds the weight G(E) of its energy, the G "
+"function is fitted on a model of the crystal of the chosen block &mdash; NaI(Tl) Ø25×25, 30×40, "
+"30×70, 40×40, 63×63 or 80×80 (Monte Carlo, H*(10) by ICRP 74 and air kerma); each block has its "
+"own correction k. The status line shows the dose rate in µSv/h over the last 10 s of "
+"acquisition, updated every second (the tooltip has the window, error and µR/h), the “Dose "
+"rate” block the mean since “Reset”. The model error from 50 keV to 3 MeV is 3 % on average, "
+"up to 14&ndash;17 % with the source at the side; at the detector end face soft radiation is "
+"underestimated by up to 35 %. The correction k can be fitted by a dosimeter: put it next to "
+"the detector, “Reset”, wait a few minutes, enter its reading and “Fit k”. Or with a <b>KCl "
+"sample</b>: empty castle &mdash; “Reset”, acquire, “Store background” (the browser keeps the "
+"spectrum); a KCl jar under the detector end face &mdash; “Reset”, acquire as long, enter the mass, "
+"jar diameter, layer height and the gap from the salt to the crystal, “Compute from sample”: "
+"the page fits the net 1461 keV peak, computes it by the crystal model (Monte Carlo right in "
+"the browser) and offers k = model / measured (“Save k”). Cosmic muons "
+"(off scale) are not in the dose, so at background the device shows less than a dosimeter. "
+"The scale is valid until the measurement method, windows, L, G, “codes per channel”, "
+"polarity or rate change; otherwise the block says the calibration must be made again. "
+"With a calibration the peak meter shows the energy and the resolution <b>from the line "
+"energy</b> &mdash; the percentage by channels depends on the scale zero, and comparing "
+"methods by it is unfair; the X axis switches “channels / keV” above the plot, the isotope "
+"lines on the plot &mdash; the ones used for the calibration bright, the others faint, and "
+"files are exported with the calibration. The “export” buttons save the spectrum to a file: XML (ResultDataFile, opens in "
 "BecqMoni), CSV (channel and count), N42 (ANSI N42.42) and SPE (SpectraLine). The "
 "channels visible on screen are exported; the measurement time is taken from the "
 "computer clock &mdash; the device has no clock of its own. Below is the CPS "
 "monitor: a 6-hour history at one sample per second is kept in the device and "
 "accumulates while the spectrum is acquired, even with the page closed; the "
-"plot sums it into “averaging, s” intervals and draws a moving average. It "
-"shows a time window (the last 30 s by default, the “window” selector) that "
+"plot sums it into “averaging, s” intervals and draws a moving average. A step "
+"of 0.1, 0.25 and 0.5 s comes from the fast history of the device: 0.1 s samples "
+"over the last 10 minutes (a 0.25 s step takes 2&ndash;3 such samples, CPS by their "
+"real time). It shows a time window (the last 30 s by default, the “window” selector) that "
 "follows new data; wheel &mdash; zoom, drag &mdash; move into the past (the "
 "window then stays put), double click &mdash; back to the window and now. The CPS "
 "of an interval is the counts divided by the time acquisition actually ran; "
@@ -2875,7 +3583,9 @@ static esp_err_t h_help(httpd_req_t *r)
  * (BecqMoni), CSV - заголовок и строки «канал,счёт», N42 - ANSI
  * N42.42-2011, SPE - ЛСРМ
  * SpectraLine (текстовый заголовок и счёты uint32 little-endian).
- * Калибровки в кэВ у нас нет - её блоки в файлах просто пропускаются.
+ * Калибровка по энергии - из запроса: c0, c1 и, если есть, c2..c4 (E =
+ * c0 + c1*канал + ... + c4*канал^4, кэВ). Её присылает страница, если калибровка
+ * годится для нынешних настроек; без неё блоки калибровки пропускаются.
  * Выгружается то, что видно на экране:
  * первые nch каналов.
  * Часов реального времени у прибора нет, поэтому время замера
@@ -2893,6 +3603,8 @@ typedef struct {
      * обязана жить до конца отправки, поэтому она здесь, а не на стеке
      * вспомогательной функции */
     char      disp[96];
+    double    cal[5];         /* калибровка E(канал), от младшей степени   */
+    int       ncal;           /* сколько коэффициентов (0 - нет, 2..5)     */
 } exp_snap_t;
 
 #define TMA(t) (t)->tm_year + 1900, (t)->tm_mon + 1, (t)->tm_mday, \
@@ -2924,14 +3636,25 @@ static bool exp_snap(httpd_req_t *r, exp_snap_t *s)
                 : 0.0;
     s->tlive = s->treal * (1.0 - dead);
 
-    char q[64], v[24];
+    char q[256], v[32];
     long long t = 0;
     int tz = 0;
+    s->ncal = 0;
     if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
         if (httpd_query_key_value(q, "t", v, sizeof(v)) == ESP_OK)
             t = atoll(v);
         if (httpd_query_key_value(q, "tz", v, sizeof(v)) == ESP_OK)
             tz = atoi(v);
+        static const char *ck[5] = { "c0", "c1", "c2", "c3", "c4" };
+        for (int k = 0; k < 5; k++) {
+            if (httpd_query_key_value(q, ck[k], v, sizeof(v)) != ESP_OK) break;
+            char *e;
+            const double c = strtod(v, &e);
+            if (e == v || !isfinite(c)) break;
+            s->cal[k] = c;
+            s->ncal = k + 1;
+        }
+        if (s->ncal < 2 || !(s->cal[1] > 0)) s->ncal = 0;
     }
     /* страница не прислала время - берём часы прибора (UTC), если заданы */
     if (t <= 1500000000LL && mca_time_now_ms()) {
@@ -2965,6 +3688,20 @@ static void exp_head(httpd_req_t *r, exp_snap_t *s, const char *ext,
 static void exp_xml(httpd_req_t *r, exp_snap_t *s, char *b)
 {
     exp_head(r, s, "xml", "application/xml");
+    /* калибровка - как пишет её BecqMoni: полином от младшей степени */
+    char cal[700] = "";
+    if (s->ncal) {
+        int p = snprintf(cal, sizeof(cal),
+            "        <EnergyCalibration>\r\n"
+            "          <PolynomialOrder>%d</PolynomialOrder>\r\n"
+            "          <Coefficients>\r\n", s->ncal - 1);
+        for (int k = 0; k < s->ncal; k++)
+            p += snprintf(cal + p, sizeof(cal) - p,
+                "            <Coefficient>%.9g</Coefficient>\r\n", s->cal[k]);
+        snprintf(cal + p, sizeof(cal) - p,
+            "          </Coefficients>\r\n"
+            "        </EnergyCalibration>\r\n");
+    }
     httpd_resp_sendstr_chunk(r,
         "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n"
         "<ResultDataFile xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\""
@@ -2994,13 +3731,14 @@ static void exp_xml(httpd_req_t *r, exp_snap_t *s, char *b)
         "      <EnergySpectrum>\r\n"
         "        <NumberOfChannels>%u</NumberOfChannels>\r\n"
         "        <ChannelPitch>1</ChannelPitch>\r\n"
+        "%s"
         "        <ValidPulseCount>%" PRIu64 "</ValidPulseCount>\r\n"
         "        <TotalPulseCount>%" PRIu64 "</TotalPulseCount>\r\n"
         "        <MeasurementTime>%lu</MeasurementTime>\r\n"
         "        <LiveTime>%.1f</LiveTime>\r\n"
         "        <NumberOfSamples>1</NumberOfSamples>\r\n"
         "        <Spectrum>\r\n",
-        TMA(&s->ts), TMA(&s->ts), TMA(&s->te), (unsigned)s->n,
+        TMA(&s->ts), TMA(&s->ts), TMA(&s->te), (unsigned)s->n, cal,
         s->sum, s->total, (unsigned long)(s->treal + 0.5), s->tlive);
     httpd_resp_send_chunk(r, b, n);
     for (size_t i = 0; i < s->n; ) {
@@ -3028,14 +3766,24 @@ static void exp_csv(httpd_req_t *r, exp_snap_t *s, char *b)
     /* простой CSV: одна строка-заголовок, дальше
      * «канал,счёт» с канала 0, без пробелов, окончания CRLF */
     exp_head(r, s, "csv", "text/csv");
-    int n = snprintf(b, 4096, "Channel,Counts (TotalTime=%.1fs%s)\r\n",
+    int n = snprintf(b, 4096, "Channel,%sCounts (TotalTime=%.1fs%s)\r\n",
+                     s->ncal ? "Energy_keV," : "",
                      s->treal, s->tvalid ? "" : "; TIME UNKNOWN");
     httpd_resp_send_chunk(r, b, n);
     for (size_t i = 0; i < s->n; ) {
         int pos = 0;
-        for (int j = 0; j < 200 && i < s->n; j++, i++)
-            pos += snprintf(b + pos, 4096 - pos, "%u,%" PRIu32 "\r\n",
-                            (unsigned)i, s->d[i]);
+        for (int j = 0; j < 100 && i < s->n; j++, i++) {
+            if (s->ncal) {
+                const double x = (double)i;
+                double e = 0.0;                 /* по схеме Горнера */
+                for (int k = s->ncal - 1; k >= 0; k--) e = e * x + s->cal[k];
+                pos += snprintf(b + pos, 4096 - pos, "%u,%.3f,%" PRIu32 "\r\n",
+                                (unsigned)i, e, s->d[i]);
+            } else {
+                pos += snprintf(b + pos, 4096 - pos, "%u,%" PRIu32 "\r\n",
+                                (unsigned)i, s->d[i]);
+            }
+        }
         httpd_resp_send_chunk(r, b, pos);
     }
 }
@@ -3072,17 +3820,32 @@ static void exp_n42(httpd_req_t *r, exp_snap_t *s, char *b)
         "      <RadInstrumentComponentVersion>ESP32-S3 + AD9226</RadInstrumentComponentVersion>\r\n"
         "    </RadInstrumentVersion>\r\n"
         "  </RadInstrumentInformation>\r\n");
+    if (s->ncal) {
+        /* EnergyCalibration - после RadInstrumentInformation, до
+         * RadMeasurement; спектр ссылается на неё по id */
+        int p = snprintf(b, 4096,
+            "  <EnergyCalibration id=\"EnergyCalibration\">\r\n"
+            "    <CoefficientValues>");
+        for (int k = 0; k < s->ncal; k++)
+            p += snprintf(b + p, 4096 - p, "%s%.9g", k ? " " : "", s->cal[k]);
+        p += snprintf(b + p, 4096 - p,
+            "</CoefficientValues>\r\n"
+            "  </EnergyCalibration>\r\n");
+        httpd_resp_send_chunk(r, b, p);
+    }
     n = snprintf(b, 4096,
         "  <RadMeasurement id=\"SpectrumMeasurement-0\">\r\n"
         "    <MeasurementClassCode>Foreground</MeasurementClassCode>\r\n"
         "    <StartDateTime>%02d.%02d.%04d %02d:%02d:%02d</StartDateTime>\r\n"
         "    <RealTimeDuration>PT%luS</RealTimeDuration>\r\n"
-        "    <Spectrum id=\"SpectrumData\" radDetectorInformationReference=\"Detector\">\r\n"
+        "    <Spectrum id=\"SpectrumData\" radDetectorInformationReference=\"Detector\"%s>\r\n"
         "      <LiveTimeDuration>PT%.1fS</LiveTimeDuration>\r\n"
         "      <ChannelData compressionCode=\"None\">",
         s->ts.tm_mday, s->ts.tm_mon + 1, s->ts.tm_year + 1900,
         s->ts.tm_hour, s->ts.tm_min, s->ts.tm_sec,
-        (unsigned long)(s->treal + 0.5), s->tlive);
+        (unsigned long)(s->treal + 0.5),
+        s->ncal ? " energyCalibrationReference=\"EnergyCalibration\"" : "",
+        s->tlive);
     httpd_resp_send_chunk(r, b, n);
     for (size_t i = 0; i < s->n; ) {
         int pos = 0;
@@ -3104,6 +3867,14 @@ static void exp_n42(httpd_req_t *r, exp_snap_t *s, char *b)
 
 static void exp_spe(httpd_req_t *r, exp_snap_t *s, char *b)
 {
+    /* ENERGY=N,c0,...,cN - полином от младшей степени, N - степень */
+    char cal[260] = "";
+    if (s->ncal) {
+        int p = snprintf(cal, sizeof(cal), "ENERGY=%d", s->ncal - 1);
+        for (int k = 0; k < s->ncal; k++)
+            p += snprintf(cal + p, sizeof(cal) - p, ",%.9g", s->cal[k]);
+        snprintf(cal + p, sizeof(cal) - p, "\r\n");
+    }
     /* заголовок KEY=VALUE, маркер SPECTR=, затем счёты uint32
      * little-endian подряд - ESP32 сам little-endian, шлём как есть */
     exp_head(r, s, "spe", "application/octet-stream");
@@ -3115,13 +3886,14 @@ static void exp_spe(httpd_req_t *r, exp_snap_t *s, char *b)
         "TREAL=%.2f\r\n"
         "DETECTOR=MCA AD9226\r\n"
         "%s"
+        "%s"
         "SPECTRSIZE=%u\r\n"
         "SPECTR=",
         s->ts.tm_mday, s->ts.tm_mon + 1, (s->ts.tm_year + 1900) % 100,
         s->ts.tm_hour, s->ts.tm_min, s->ts.tm_sec,
         s->tlive, s->treal,
         s->tvalid ? "" : "COMMENT=TIME UNKNOWN (the device has no clock)\r\n",
-        (unsigned)s->n);
+        cal, (unsigned)s->n);
     httpd_resp_send_chunk(r, b, pos);
     for (size_t i = 0; i < s->n; ) {
         size_t cnt = s->n - i < 1024 ? s->n - i : 1024;
@@ -3180,13 +3952,26 @@ static esp_err_t h_logo(httpd_req_t *r)
                            logo_png_end - logo_png_start);
 }
 
+/* Значок вкладки - из того же логотипа, 16/32/48 px (на 16 и 32 линии
+ * утолщены, иначе орбиты пропадают). */
+extern const uint8_t favicon_ico_start[] asm("_binary_favicon_ico_start");
+extern const uint8_t favicon_ico_end[]   asm("_binary_favicon_ico_end");
+
+static esp_err_t h_favicon(httpd_req_t *r)
+{
+    httpd_resp_set_type(r, "image/x-icon");
+    httpd_resp_set_hdr(r, "Cache-Control", "max-age=86400");
+    return httpd_resp_send(r, (const char *)favicon_ico_start,
+                           favicon_ico_end - favicon_ico_start);
+}
+
 esp_err_t mca_web_start(void)
 {
     net_init();
 
     httpd_handle_t srv = NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 40;          /* 32 своих + 2 у /ota, с запасом */
+    cfg.max_uri_handlers = 44;          /* 39 своих + 2 у /ota, с запасом */
     cfg.stack_size       = 8192;
     cfg.core_id          = 0;           /* веб на ядро 0, DSP на ядро 1 */
     cfg.lru_purge_enable = true;
@@ -3202,9 +3987,12 @@ esp_err_t mca_web_start(void)
         URI("/s.css", h_css, NULL),
         URI("/l.js", h_ljs, NULL),
         URI("/logo.png", h_logo, NULL),
+        URI("/favicon.ico", h_favicon, NULL),
         URI("/spectrum", h_spectrum, NULL),
         URI("/scope", h_scope, NULL),
         URI("/stat", h_stat, NULL),
+        URI("/cps", h_cps, NULL),
+        URI("/dose", h_dose, NULL),
         URI("/cfg", h_cfg, NULL),
         URI("/cmd", h_cmd, NULL),
         URI("/settings", h_set_page, NULL),
@@ -3223,6 +4011,7 @@ esp_err_t mca_web_start(void)
         URI("/help", h_help, NULL),
         URI("/time", h_time, NULL),
         URI("/hist", h_hist, NULL),
+        URI("/calib", h_calib_get, NULL),
         URI("/export.xml", h_export, (void *)"xml"),
         URI("/export.csv", h_export, (void *)"csv"),
         URI("/export.n42", h_export, (void *)"n42"),
@@ -3231,6 +4020,11 @@ esp_err_t mca_web_start(void)
 #undef URI
     for (int i = 0; i < sizeof(u) / sizeof(u[0]); i++)
         httpd_register_uri_handler(srv, &u[i]);
+    static const httpd_uri_t cal_post = {
+        .uri = "/calib", .method = HTTP_POST, .handler = h_calib_post,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(srv, &cal_post);
 
     /* осциллограф по WebSocket */
     s_srv = srv;

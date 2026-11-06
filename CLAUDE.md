@@ -12,6 +12,9 @@ WiFi/Ethernet, эмуляция MCA (shproto) на UART0. ESP-IDF 5.4.4. Уст�
 - Обработка на модели: `python tools/test_dsp.py`. Кодек эмуляции: `python tools/emu_check.py --selftest`.
 - Страница без платы: `python tools/mkpage.py` → `build/page_test.html`.
 - Перевод страниц: `python tools/check_i18n.py` — у каждой русской надписи есть английская.
+- Калибровка по энергии (ядро строками в `mca_web.c`): `python tools/check_cal.py` (нужен node).
+- Мощность дозы: `cd tools/dosemodel && python fit_blocks.py` — G(E) блоков; проба KCl
+  со страницы: `python tools/check_kcl.py` (нужен node).
 - Python с русским выводом — с `PYTHONIOENCODING=utf-8`.
 
 ## Что держать в согласии
@@ -19,6 +22,9 @@ WiFi/Ethernet, эмуляция MCA (shproto) на UART0. ESP-IDF 5.4.4. Уст�
   Правка обработки или дефолтов в прошивке → та же правка в модели и прогон `test_dsp.py`.
 - Сжатие кадров осциллографа: `main/scope_codec.c` ↔ `tools/scopecodec.py` ↔ `wdec` на
   странице (`mca_web.c`). Меняется формат → все три и уровень 9 `test_dsp.py`.
+- G(E) дозы: коэффициенты `G_H10`, `G_KA` в `main/mca_dose.c` ↔ вывод `tools/dosemodel/fit_blocks.py`;
+  порядок блоков — `MCA_DOSE_DET_NAME` ↔ `KDET` и список `ddet` на странице.
+- Проба KCl: `kclcore.js` в `mca_web.c` — порт `tools/dosemodel/mc_kcl.py`; правка одного → `check_kcl.py`.
 - README.md и README.en.md — одно содержание; меняется один — меняется второй.
 - Поведение для пользователя изменилось → раздел README в том же коммите.
 - Страницы прибора на двух языках: новая надпись без английской пары валит `check_i18n.py`.
