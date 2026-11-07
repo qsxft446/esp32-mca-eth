@@ -52,7 +52,7 @@ static mca_dose_why_t  s_why = MCA_DOSE_NO_CAL;
 static int             s_det = 3;         /* NaI 40x40 - блок, с которого начинали */
 static float           s_k[MCA_DOSE_NDET] = { 1, 1, 1, 1, 1, 1 };
 static bool            s_cal_dirty = true;
-static double          s_c[5];            /* калибровка, кэВ(канал)    */
+static double          s_c[MCA_CALIB_NC]; /* калибровка, кэВ(канал)    */
 static int             s_nc;
 static char            s_sig[96];         /* подпись калибровки        */
 static char            s_built[96];       /* для каких настроек таблицы */
@@ -69,32 +69,38 @@ static double gpoly(const double *a, double e_kev)
     return e_kev > G_EMAX ? g * e_kev / G_EMAX : g;
 }
 
-/* "c":[..] и "sig":".." из JSON калибровки страницы */
-static bool parse_cal(const char *s)
+/* "c":[..] и "sig":".." из JSON калибровки страницы. Общий разбор: им же
+ * эмуляция MCA отдаёт калибровку программам на ПК (mca_emu.c, -cal). */
+bool mca_dose_parse_calib(const char *s, double *c, int *nc, char *sig, size_t sign)
 {
     const char *p = strstr(s, "\"c\":[");
     const char *q = strstr(s, "\"sig\":\"");
     if (!p || !q) return false;
     p += 5;
-    s_nc = 0;
-    while (s_nc < 5) {
+    *nc = 0;
+    while (*nc < MCA_CALIB_NC) {
         char *end;
         const double v = strtod(p, &end);
         if (end == p || !isfinite(v)) break;
-        s_c[s_nc++] = v;
+        c[(*nc)++] = v;
         p = end;
         while (*p == ' ') p++;
         if (*p == ',') p++; else break;
     }
     q += 7;
     const char *e = strchr(q, '"');
-    if (!e || e - q >= (int)sizeof(s_sig) || s_nc < 2) return false;
-    memcpy(s_sig, q, e - q);
-    s_sig[e - q] = 0;
+    if (!e || e - q >= (int)sign || *nc < 2) return false;
+    memcpy(sig, q, e - q);
+    sig[e - q] = 0;
     return true;
 }
 
-static void cur_sig(char *out, size_t n)
+static bool parse_cal(const char *s)
+{
+    return mca_dose_parse_calib(s, s_c, &s_nc, s_sig, sizeof(s_sig));
+}
+
+void mca_dose_sig(char *out, size_t n)
 {
     mca_params_t p;
     mca_dsp_get_params(&p);
@@ -198,7 +204,7 @@ void mca_dose_tick_1s(void)
     }
     if (!s_sig[0]) return;
     char now[96];
-    cur_sig(now, sizeof(now));
+    mca_dose_sig(now, sizeof(now));
     if (strcmp(now, s_sig) != 0) {
         if (s_why != MCA_DOSE_OTHER_SET) {
             s_why = MCA_DOSE_OTHER_SET;

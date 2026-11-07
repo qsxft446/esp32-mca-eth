@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
 
@@ -32,6 +33,16 @@ void  mca_dose_init(void);
 void  mca_dose_tick_1s(void);
 /* Калибровку в приборе переписали (POST /calib) - перечитать. */
 void  mca_dose_calib_changed(void);
+/* Калибровка по энергии - JSON страницы (/calib): многочлен кэВ(канал),
+ * "c":[a0,a1,...] - до MCA_CALIB_NC коэффициентов по каналам прибора, и
+ * "sig" - подпись настроек обработки, при которых её сделали. Разбор:
+ * false - нет коэффициентов (меньше двух) или подписи. */
+#define MCA_CALIB_NC 5
+bool  mca_dose_parse_calib(const char *js, double *c, int *nc, char *sig, size_t sign);
+/* Подпись текущих настроек (способ, окна, L, G, кодов на канал, полярность,
+ * частота) - та же, что считает страница: калибровка годится, только если
+ * её подпись совпадает с этой. */
+void  mca_dose_sig(char *out, size_t n);
 mca_dose_why_t mca_dose_state(void);
 /* блок детектирования (номер в MCA_DOSE_DET_NAME) и его поправка k */
 int   mca_dose_det(void);

@@ -256,9 +256,9 @@ port, only through a TCP socket; the console is now free.
   spectrum go every second — even when acquisition is stopped: BecqMoni
   listens to the stream before sending commands and decides from the
   acquisition time in the status whether acquisition is running.
-- **Commands:** `-inf`, `-cal` (40 registers, read and write, stored in the
-  device memory; by default there is no calibration and the serial number
-  is derived from the MAC), `-sta [sec] [-r] [-s]`, `-sto`, `-sho`, `-stt`,
+- **Commands:** `-inf`, `-cal` (40 registers: 0–10 are the device energy
+  calibration, see below; 11–38 are stored in the device memory; 39 is the
+  serial number derived from the MAC), `-sta [sec] [-r] [-s]`, `-sto`, `-sho`, `-stt`,
   `-rst`, `-mode 0`, `-spd` (no speed over the network — only the answer),
   `-frq` (nearest higher frequency from the table), `-reboot`. Every
   executed command is answered with the text `-ok` — exactly what BecqMoni
@@ -281,6 +281,32 @@ port, only through a TCP socket; the console is now free.
   read only by the dead-time button in the device settings: acquire a few
   seconds with a source first, then press it; press it again after
   changing the ADC frequency or processing parameters.
+- **The energy calibration is shared with BecqMoni**, as with the original
+  device: registers 0–9 of the `-cal` command hold five coefficients of the
+  “channel → keV” polynomial (each a 64-bit number in two registers, high
+  half first; an empty one is `FFFFFFFF FFFFFFFF`), register 10 holds the
+  CRC32 of lines 0–9. The format was checked against the BecqMoni source
+  (`AtomSpectraTcpCalibrationReader`).
+  - **Reading:** the registers are built from the device calibration from
+    the page (the calibration button on “Spectrum”) if it was made with the
+    current processing settings; otherwise they are empty and BecqMoni
+    reports that there is no calibration. BecqMoni reads it when
+    acquisition starts and with the calibration read button in the device
+    settings.
+  - **Writing:** `-cal N hhhhhhhh` for registers 0–9, then register 10 — on
+    it the coefficients become the device calibration (shown on the page as
+    “BecqMoni”, used for the dose). A calibration with a gap in the
+    coefficients or with fewer than two is rejected with `-err invalid
+    calibration`, and the previous one is kept. What was written is read
+    back bit for bit. BecqMoni itself does not offer writing the calibration
+    over the network (only over a COM port), so over the network it is done
+    with commands from its console.
+  - **Channels:** over the network BecqMoni treats the polynomial as over
+    8192 channels and takes the calibration only with 8192 channels in its
+    settings. With “Channels” below 8192 the device converts the polynomial
+    both ways: its channel x is stretched over mul = 8192/N channels, the
+    middle being channel k = mul·x + (mul − 1)/2. The simplest is to keep
+    “Channels” at 8192 — then the coefficients pass as they are.
 - **Channels — as set in the device “Channels” setting
   (2048/4096/8192).** The protocol and programs always hold 8192 channels:
   BecqMoni keeps the spectrum in an 8192-element array and itself sums
@@ -297,7 +323,10 @@ PC check: `python tools/emu_check.py <device address> [port]` (default
 port 8234) — connects the way BecqMoni does, sends commands and parses
 the answers according to the rules of the reference protocol (CRC,
 escaping, `-inf`/`-cal` format, order of status and spectrum) and of
-BecqMoni (answers to commands). The check stops and starts acquisition
+BecqMoni (answers to commands), and the calibration in `-cal` by the
+BecqMoni rules against the device calibration. With `--cal-write` it also
+writes a test calibration the way BecqMoni does, checks it and **restores
+the previous device calibration**. The check stops and starts acquisition
 and returns it to the previous state at the end; it does not reset the
 spectrum.
 

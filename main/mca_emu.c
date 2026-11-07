@@ -5,6 +5,10 @@
 #include "mca_web.h"
 #include "mca_prof.h"
 #include "adc_clk.h"
+#include "mca_settings.h"
+#include "mca_dose.h"
+#include "mca_time.h"
+#include <math.h>
 
 #include <string.h>
 #include <stdio.h>
@@ -96,6 +100,12 @@ static int               s_lfd = -1;      /* слушающий сокет      
 static int               s_cfd = -1;      /* клиент, -1 - нет         */
 static char              s_peer[20];      /* адрес клиента            */
 static uint32_t          s_regs[N_REGS];
+/* Ключ калибровки, которую записала программа (см. cal_from_regs): пока
+ * калибровка прибора и число каналов те же, регистры 0..10 отдаются
+ * ровно такими, как их записали. 0 - не записывали. */
+static uint32_t          s_calsrc;
+/* регистры 0..9 записаны, а регистр 10 ещё нет - запись не закончена */
+static bool              s_cal_pending;
 static bool              s_silent;        /* -sta -s: без выгрузки     */
 static uint32_t          s_limit_s;       /* -sta xx: время набора, с  */
 static bool              s_in_sweep;      /* идёт проход по спектру    */
@@ -193,6 +203,7 @@ static void regs_save(void)
     nvs_handle_t h;
     if (nvs_open(EMU_NS, NVS_READWRITE, &h) != ESP_OK) return;
     nvs_set_blob(h, "emu_regs", s_regs, sizeof(s_regs));
+    nvs_set_u32(h, "emu_calsrc", s_calsrc);
     nvs_commit(h);
     nvs_close(h);
 }
@@ -206,6 +217,7 @@ static void regs_load(void)
     size_t len = sizeof(s_regs);
     if (nvs_open(EMU_NS, NVS_READONLY, &h) == ESP_OK) {
         esp_err_t e = nvs_get_blob(h, "emu_regs", s_regs, &len);
+        nvs_get_u32(h, "emu_calsrc", &s_calsrc);
         nvs_close(h);
         if (e == ESP_OK && len == sizeof(s_regs)) return;
     }
@@ -223,9 +235,13 @@ static void regs_load(void)
     if (s_regs[REG_SERIAL] == 0xFFFFFFFF) s_regs[REG_SERIAL] = 1;
 }
 
-/* 40 строк по 8 hex с \r\n - ровно 400 байт, как у настоящего прибора. */
+static void cal_to_regs(void);
+
+/* 40 строк по 8 hex с \r\n - ровно 400 байт, как у настоящего прибора.
+ * Регистры 0..10 - калибровка по энергии прибора (см. cal_to_regs). */
 static void send_cal(void)
 {
+    cal_to_regs();
     static char b[N_REGS * 10 + 1];
     size_t pos = 0;
     for (int i = 0; i < N_REGS; i++)
@@ -248,6 +264,139 @@ static uint32_t out_channels(const mca_params_t *p)
 {
     return (p->nch == 2048 || p->nch == 4096) ? (uint32_t)p->nch
                                               : MCA_CHANNELS;
+}
+
+
+/* ---------------- калибровка по энергии в регистрах -cal ----------------
+ *
+ * Как её читает и пишет BecqMoni (AtomSpectraTcpCalibrationReader.cs,
+ * DeviceConfigForm.cs, ветка master): в регистрах 0..9 - пять
+ * коэффициентов многочлена E(k) = a0 + a1 k + ... + a4 k^4, кэВ, каждый -
+ * 64-битное число double в двух регистрах, старшая половина первой; пустой
+ * коэффициент - FFFFFFFF FFFFFFFF, после пустого непустых быть не должно.
+ * Регистр 10 - CRC32 (обычный, как в zlib) строк 0..9 подряд, как они
+ * пришли в ответе. Строки ответа разделены \r\n.
+ *
+ * k - канал из 8192 (так BecqMoni по сети берёт калибровку только при 8192
+ * каналах в своих настройках). Калибровка прибора (страница, /calib) - по
+ * его каналам x, а эмуляция растягивает канал x на mul = 8192/N соседних
+ * (out_channels): канал k - это x = (k - s) / mul, s = (mul - 1) / 2 -
+ * середина растянутого канала. Отсюда пересчёт многочлена в обе стороны;
+ * при 8192 каналах mul = 1, и коэффициенты переходят как есть.
+ *
+ * Чтение: из калибровки прибора, если она есть и сделана при текущих
+ * настройках обработки (та же подпись, что проверяет страница); иначе -
+ * пустые коэффициенты, программа скажет, что калибровки нет.
+ * Запись: регистры 0..9 копятся, на регистре 10 (BecqMoni пишет его
+ * последним) коэффициенты разбираются и становятся калибровкой прибора -
+ * видна на странице, по ней считается доза. */
+
+/* p(y) = q(alpha * y + beta): коэффициенты p по коэффициентам q */
+static void poly_affine(const double *q, int n, double alpha, double beta, double *p)
+{
+    for (int j = 0; j < n; j++) {
+        double sum = 0;
+        for (int i = j; i < n; i++) {
+            double c = 1;                        /* C(i, j) */
+            for (int t = 1; t <= j; t++) c = c * (i - j + t) / t;
+            sum += q[i] * c * pow(alpha, j) * pow(beta, i - j);
+        }
+        p[j] = sum;
+    }
+}
+
+static void cal_scale(double *mul, double *mid, uint32_t *nch)
+{
+    mca_params_t p;
+    mca_dsp_get_params(&p);
+    *nch = out_channels(&p);
+    *mul = (double)(MCA_CHANNELS / *nch);
+    *mid = (*mul - 1) / 2;
+}
+
+/* ключ «эта калибровка при этом числе каналов» */
+static uint32_t cal_key(const char *js, uint32_t nch)
+{
+    const uint32_t k = crc32_std(js) ^ (nch * 2654435761u);
+    return k ? k : 1;
+}
+
+static void cal_crc(void)
+{
+    char cat[REG_CRC * 8 + 1];
+    for (int i = 0; i < REG_CRC; i++)
+        snprintf(cat + i * 8, 9, "%08lX", (unsigned long)s_regs[i]);
+    s_regs[REG_CRC] = crc32_std(cat);
+}
+
+static char s_caljs[MCA_CALIB_MAX + 1];
+
+static void cal_to_regs(void)
+{
+    double mul, mid;
+    uint32_t nch;
+    cal_scale(&mul, &mid, &nch);
+    double a[MCA_CALIB_NC] = { 0 };
+    int na = 0;
+    char sig[96], now[96];
+    const size_t n = mca_settings_load_calib(s_caljs, sizeof(s_caljs));
+    mca_dose_sig(now, sizeof(now));
+    const bool ok = n && mca_dose_parse_calib(s_caljs, a, &na, sig, sizeof(sig)) &&
+                    strcmp(sig, now) == 0;
+    /* записанное программой - как записано (без ошибок округления); начатая
+     * и не законченная запись отбрасывается */
+    const bool pend = s_cal_pending;
+    s_cal_pending = false;
+    if (ok && !pend && s_calsrc == cal_key(s_caljs, nch)) return;
+
+    double b[MCA_CALIB_NC] = { 0 };
+    if (ok) poly_affine(a, na, 1.0 / mul, -mid / mul, b);
+    for (int i = 0; i < MCA_CALIB_NC; i++) {
+        uint64_t w = UINT64_MAX;                 /* пустой коэффициент */
+        if (ok && i < na) memcpy(&w, &b[i], sizeof(w));
+        s_regs[2 * i]     = (uint32_t)(w >> 32);
+        s_regs[2 * i + 1] = (uint32_t)w;
+    }
+    cal_crc();
+}
+
+/* Регистры 0..9 записаны - сделать из них калибровку прибора. */
+static bool cal_from_regs(void)
+{
+    double b[MCA_CALIB_NC] = { 0 };
+    int nb = 0;
+    bool empty = false;
+    for (int i = 0; i < MCA_CALIB_NC; i++) {
+        const uint64_t w = ((uint64_t)s_regs[2 * i] << 32) | s_regs[2 * i + 1];
+        if (w == UINT64_MAX) { empty = true; continue; }
+        if (empty) return false;                 /* дыра в коэффициентах */
+        memcpy(&b[nb], &w, sizeof(w));
+        if (!isfinite(b[nb])) return false;
+        nb++;
+    }
+    while (nb > 0 && b[nb - 1] == 0) nb--;       /* хвостовые нули, как в BecqMoni */
+    if (nb < 2) return false;
+
+    double mul, mid;
+    uint32_t nch;
+    cal_scale(&mul, &mid, &nch);
+    double a[MCA_CALIB_NC] = { 0 };
+    poly_affine(b, nb, mul, mid, a);
+    char sig[96];
+    mca_dose_sig(sig, sizeof(sig));
+    int pos = snprintf(s_caljs, sizeof(s_caljs), "{\"c\":[");
+    for (int i = 0; i < nb; i++)
+        pos += snprintf(s_caljs + pos, sizeof(s_caljs) - pos, "%s%.17g", i ? "," : "", a[i]);
+    const int64_t t = mca_time_now_ms() / 1000;
+    pos += snprintf(s_caljs + pos, sizeof(s_caljs) - pos,
+                    "],\"sig\":\"%s\",\"iso\":\"BecqMoni\",\"t\":%lld,\"lines\":[]}",
+                    sig, (long long)t);
+    if (pos <= 0 || pos >= (int)sizeof(s_caljs)) return false;
+    if (mca_settings_save_calib(s_caljs, (size_t)pos) != ESP_OK) return false;
+    mca_dose_calib_changed();
+    s_calsrc = cal_key(s_caljs, nch);
+    ESP_LOGI(TAG, "калибровка записана программой: %d коэфф., E(0) = %.2f кэВ", nb, a[0]);
+    return true;
 }
 
 /* ---------------- -inf ---------------- */
@@ -391,12 +540,25 @@ static void handle_cmd(char *s)
             send_cal();
         } else if (v) {
             const int r = atoi(a);
-            if (r >= 0 && r < N_REGS) {
+            if (r < 0 || r >= N_REGS) {
+                send_text(ANSWER_UNSUPP);
+            } else if (r < REG_CRC) {
+                /* коэффициенты копятся до регистра 10 */
+                s_regs[r] = (uint32_t)strtoul(v, NULL, 16);
+                s_cal_pending = true;
+                send_text(ANSWER_OK);
+            } else if (r == REG_CRC) {
+                /* CRC программы не сверяем: по сети данные не бьются, а
+                 * свою запись строк она может делать иначе; отдаём свою */
+                const bool ok = cal_from_regs();
+                s_cal_pending = false;
+                cal_crc();
+                regs_save();
+                send_text(ok ? ANSWER_OK : "-err invalid calibration");
+            } else {
                 s_regs[r] = (uint32_t)strtoul(v, NULL, 16);
                 regs_save();
                 send_text(ANSWER_OK);
-            } else {
-                send_text(ANSWER_UNSUPP);
             }
         }
     } else if (!strcmp(cmd, "-sta")) {
