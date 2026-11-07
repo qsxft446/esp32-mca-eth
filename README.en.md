@@ -111,8 +111,8 @@ between the boards (board GND: pins 3, 8, 13, 18, 23, 28, 33, 38).
 
 **The data lines run along both header rows:** this board has no run of
 consecutive free pins. GPIO4–7 are taken by the microSD slot, 9–14 by the
-W5500, 33–37 by the chip's Octal PSRAM, 19–20 by USB, 43–44 by UART0 (MCA
-emulation), 0/45/46 are boot pins. OTR is on GPIO3: this boot pin selects
+W5500, 33–37 by the chip's Octal PSRAM, 19–20 by USB, 43–44 by UART0 (the
+console), 0/45/46 are boot pins. OTR is on GPIO3: this boot pin selects
 the JTAG source only when an eFuse is burned, otherwise its level at start
 does not matter. LCD_CAM itself does not care about the line order, and the
 data-line check in diagnostics assembles the word from the `MCA_DATA_PINS`
@@ -226,37 +226,47 @@ is on the screen, as a picture. If the picture is shifted by a couple of
 pixels with garbage at the edge, it is a 1.3" display with an SH1106
 controller, not an SSD1306.
 
-## MCA emulation on the serial port (shproto protocol)
+## MCA emulation over the network (shproto protocol)
 
-The device can answer on a serial port as an MCA speaking the binary
-**shproto** protocol — PC programs that work with such analyzers (for
-example [BecqMoni](https://github.com/Am6er/BecqMoni)) see it as a regular
-analyzer.
+The device answers over the network as an MCA speaking the binary
+**shproto** protocol — PC programs that work with such analyzers over the
+network (for example [BecqMoni](https://github.com/Am6er/BecqMoni)) see it
+as a regular analyzer. It is the same stream that used to go over the COM
+port, only through a TCP socket; the console is now free.
 
-- **Port** — UART0: the “UART”/COM connector of the board (USB-UART
-  bridge), not the native USB. Settings `8 N 1`.
-- **Enabling** — “Oscilloscope” → settings → “MCA emulation on COM”: “off” or
-  a baud rate
-  `38400 | 115200 | 460800 | 600000 | 921600`. Takes effect immediately and
-  is saved. The whole spectrum fits into one second only at 460800 and
-  above.
-- **The console is silent** while emulation is on: firmware messages are
-  not sent to the port (nor to the native USB). Bootloader messages on reset
-  still come out at 115200 — programs skip them. Flashing through this port
-  works as usual.
+- **Where it is set** — “Settings” → “PC software link” (the panel above
+  “Firmware”): the “MCA emulation over the network” checkbox and the TCP
+  port. By default emulation is on, port 8234. Turning it on and off takes
+  effect at once and is saved.
+- **Port** — 1024 to 65535 (lower ports are system ones, 80 is taken by the
+  device page). A change is saved in the device memory and restarts the
+  server at once: a connected program is disconnected and has to be given
+  the new port. Change it if 8234 is taken or blocked in your network.
+- **State** is shown in the same place and refreshed every 3 s: “listening
+  on port N”, “program connected from <address>” or “port not open” (taken,
+  or the server is restarting — it retries every 2 s).
+- **Connecting from BecqMoni** — the “AtomSpectra TCP” device (that is its
+  name in the program list). The device is found by search: it announces
+  itself on the network (mDNS, service `_atomspectra._tcp`, name
+  `MCA AD9226 xxxx`, where xxxx is the end of the serial number). Or enter
+  the device address and port by hand. There is one connection: a new one
+  replaces the previous one (after a dropped link the program reconnects,
+  while the old socket may still look alive).
+- **Stream.** While a program is connected, a status packet and the whole
+  spectrum go every second — even when acquisition is stopped: BecqMoni
+  listens to the stream before sending commands and decides from the
+  acquisition time in the status whether acquisition is running.
 - **Commands:** `-inf`, `-cal` (40 registers, read and write, stored in the
   device memory; by default there is no calibration and the serial number
   is derived from the MAC), `-sta [sec] [-r] [-s]`, `-sto`, `-sho`, `-stt`,
-  `-rst`, `-mode 0`, `-spd`, `-frq` (nearest higher frequency from the
-  table), `-reboot`. Every executed command is answered with the text
-  `-ok`, and `-sta` at 38400 and 115200 with `Warning: silent mode forced
-  due to low interface speed-ok`: these are exactly the answers BecqMoni
-  waits for when starting an acquisition (without them it reports that it
-  cannot read data from the port). Commands are parsed in the middle of a
-  spectrum upload as well, so the answer comes in under a second at any
-  baud rate. Factory tuning commands (`-ris`, `-fall`, `-U`, `-V`, `-nos`,
-  `-pileup`…) are not executed and are answered with `-err not supported`:
-  processing parameters are set on the device page.
+  `-rst`, `-mode 0`, `-spd` (no speed over the network — only the answer),
+  `-frq` (nearest higher frequency from the table), `-reboot`. Every
+  executed command is answered with the text `-ok` — exactly what BecqMoni
+  waits for when starting and stopping acquisition. Commands are parsed in
+  the middle of a spectrum upload as well, so the answer does not wait for
+  the end of the pass. Factory tuning commands (`-ris`, `-fall`, `-U`, `-V`,
+  `-nos`, `-pileup`…) are not executed and are answered with
+  `-err not supported`: processing parameters are set on the device page.
 - **During acquisition**, every second — a status packet (acquisition time,
   processing load, CPS, rejected pulses — pile-ups and off-scale events), then the
   whole spectrum: 8192 channels in packets of 64. `-sta` starts spectrum
@@ -283,10 +293,13 @@ analyzer.
   compressed. Events above the scale (channels N to 8191) go to “rejected”,
   so that the “total pulses” and the dead time in the program stay correct.
 
-PC check: `python tools/emu_check.py COM3 600000` — sends commands and
-parses the answers according to the rules of the reference protocol (CRC,
+PC check: `python tools/emu_check.py <device address> [port]` (default
+port 8234) — connects the way BecqMoni does, sends commands and parses
+the answers according to the rules of the reference protocol (CRC,
 escaping, `-inf`/`-cal` format, order of status and spectrum) and of
-BecqMoni (answers to commands).
+BecqMoni (answers to commands). The check stops and starts acquisition
+and returns it to the previous state at the end; it does not reset the
+spectrum.
 
 ## Web interface
 
@@ -1440,9 +1453,9 @@ on other ESP32-S3 boards:
 - `hotloop.py` — hot-loop cycle estimate from the disassembly.
 - `mkpage.py` — builds `build/page_test.html` with the device page and stub
   responses; open with `python -m http.server 8777 --directory build`.
-- `emu_check.py` — checks the MCA emulation on the serial port from a PC
-  (`python tools/emu_check.py COM3 600000`; `--selftest` checks the codec
-  only).
+- `emu_check.py` — checks the MCA emulation over the network from a PC
+  (`python tools/emu_check.py <device address> [port]`; `--selftest`
+  checks the codec only).
 - `check_i18n.py` — checks that every label of the device pages has an
   English pair (`python tools/check_i18n.py`).
 - `cpswin.py` — the fast CPS and dose window (a port of `main/cps_win.c`):

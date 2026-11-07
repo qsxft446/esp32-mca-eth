@@ -1843,9 +1843,6 @@ static esp_err_t h_cfg(httpd_req_t *r)
         if (q_int(q, "mode", &v) && v >= 0 && v <= MCA_MODE_MAX)
             mca_mode = (mca_mode_t)v;
         if (q_int(q, "freq", &v)) mca_cmd_freq_idx = v;
-        /* эмуляция MCA на COM: скорость порта или 0 - выключить */
-        if (q_int(q, "emu", &v)) mca_emu_set((uint32_t)v);
-
         q_int(q, "threshold",       &p.threshold);
         q_int(q, "cpc",             &p.cpc_milli);
         q_int(q, "nch",             &p.nch);
@@ -1876,7 +1873,7 @@ static esp_err_t h_cfg(httpd_req_t *r)
         if (memcmp(&before, &p, sizeof(p)) != 0) mca_settings_save_params(&p);
     }
 
-    char buf[900];
+    char buf[960];
     int n = snprintf(buf, sizeof(buf),
         "{\"threshold\":%ld,\"cpc\":%ld,\"nch\":%ld,"
         "\"algo\":%ld,\"polarity\":%ld,\"int_rise\":%ld,\"int_fall\":%ld,"
@@ -1887,8 +1884,7 @@ static esp_err_t h_cfg(httpd_req_t *r)
         "\"pileup_pre_pct\":%ld,"
         "\"pileup_post_pct\":%ld,\"shape_on\":%ld,\"shape_tol\":%ld,"
         "\"shape_lmin\":%ld,\"shape_lmax\":%ld,\"shape_ln\":%ld,"
-        "\"shape_ref\":%ld,\"shape_win\":%ld,\"shape_hz\":%ld,"
-        "\"emu\":%lu,\"fl\":[",
+        "\"shape_ref\":%ld,\"shape_win\":%ld,\"shape_hz\":%ld,\"fl\":[",
         (long)p.threshold, (long)p.cpc_milli, (long)p.nch,
         (long)p.algo, (long)p.polarity, (long)p.int_rise, (long)p.int_fall,
         (long)p.hysteresis, (long)p.trap_L,
@@ -1898,8 +1894,7 @@ static esp_err_t h_cfg(httpd_req_t *r)
         (long)p.pileup_pre_pct,
         (long)p.pileup_post_pct, (long)p.shape_on, (long)p.shape_tol,
         (long)p.shape_lmin, (long)p.shape_lmax, (long)p.shape_ln,
-        (long)p.shape_ref, (long)p.shape_win, (long)p.shape_hz,
-        (unsigned long)mca_emu_baud());
+        (long)p.shape_ref, (long)p.shape_win, (long)p.shape_hz);
     /* snprintf возвращает длину, которая ПОТРЕБОВАЛАСЬ БЫ. При нехватке
      * места это больше размера буфера, и отправка читала бы за его
      * границей. Ограничиваем после каждого шага. */
@@ -1914,6 +1909,43 @@ static esp_err_t h_cfg(httpd_req_t *r)
     n += snprintf(buf + n, sizeof(buf) - n, "]}");
     if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
     httpd_resp_set_type(r, "application/json");
+    return httpd_resp_send(r, buf, n);
+}
+
+/* /emu - связь с программами на ПК: эмуляция MCA по TCP (mca_emu.c).
+ * ?on=0|1 - выключить / включить сразу, ?port=N - TCP-порт (1024..65535;
+ * работающий сервер перезапускается на новом порту). Ответ - состояние:
+ * {"on", "port", "listen" - порт открыт, "client" - адрес подключённой
+ * программы или "", "ok", "msg"/"en" - итог смены порта}. */
+static esp_err_t h_emu(httpd_req_t *r)
+{
+    char q[64];
+    bool ok = true;
+    const char *msg = "", *en = "";
+    if (httpd_req_get_url_query_str(r, q, sizeof(q)) == ESP_OK) {
+        int32_t v;
+        if (q_int(q, "port", &v)) {
+            if (v < 0 || mca_emu_set_port((uint32_t)v) != ESP_OK) {
+                ok  = false;
+                msg = "Порт - от 1024 до 65535";
+                en  = "Port must be 1024 to 65535";
+            } else {
+                msg = "Порт сохранён";
+                en  = "Port saved";
+            }
+        }
+        if (q_int(q, "on", &v)) mca_emu_set((uint32_t)v);
+    }
+    char buf[256];
+    int n = snprintf(buf, sizeof(buf),
+        "{\"on\":%d,\"port\":%u,\"listen\":%d,\"client\":\"%s\","
+        "\"ok\":%s,\"msg\":\"%s\",\"en\":\"%s\"}",
+        mca_emu_on() ? 1 : 0, (unsigned)mca_emu_port(),
+        mca_emu_listening() ? 1 : 0, mca_emu_client(),
+        ok ? "true" : "false", msg, en);
+    if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+    httpd_resp_set_type(r, "application/json");
+    httpd_resp_set_hdr(r, "Cache-Control", "no-store");
     return httpd_resp_send(r, buf, n);
 }
 
@@ -2266,8 +2298,25 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "не откроется с нового адреса (не та подсеть или шлюз), прибор вернётся к прежним настройкам. Кнопка "
 "BOOT, удержанная 5 с во время работы, возвращает DHCP.</p>"
 "</section>"
+/* правая колонка: связь с программами на ПК, под ней прошивка */
+"<div style='flex:1 1 360px;display:flex;flex-direction:column;gap:14px'>"
+/* связь с программами на ПК: эмуляция MCA по TCP (mca_emu.c), /emu */
+"<section class='panel pad'>"
+"<h3 data-en='PC software link'>Связь с программами на ПК</h3>"
+"<div id=em class=n style=margin-bottom:10px>...</div>"
+"<div class=grp style='margin:6px 0 8px'>"
+"<label><input type=checkbox id=em_on onchange=emOn()> <span data-en='MCA emulation over the network'>эмуляция MCA по сети</span></label>"
+"<label><span data-en='TCP port'>TCP-порт</span> <input id=em_port type=number min=1024 max=65535 style=width:90px></label>"
+"<button class='btn green sm' onclick=emPort() data-en='Save port'>Сохранить порт</button></div>"
+"<div id=emsg class=n></div>"
+"<p class=n data-en='The device answers PC programs using the binary shproto protocol, like a network analyzer. In BecqMoni choose the “AtomSpectra TCP” device: the device is found by search (mDNS) or is entered by the address of this page and the port. The default port is 8234; change it if it is taken or blocked in your network, and then set the new port in the program as well.'>"
+"Прибор отвечает программам на ПК по бинарному протоколу shproto, как сетевой анализатор. В BecqMoni "
+"выберите устройство «AtomSpectra TCP»: прибор находится поиском (mDNS) или вводится адресом этой "
+"страницы и портом. По умолчанию порт 8234; меняйте, если он занят или закрыт в вашей сети, - "
+"тогда и в программе укажите новый.</p>"
+"</section>"
 /* обновление прошивки по сети: файл build/esp32_mca.bin, см. mca_ota.c */
-"<section class='panel pad' style='flex:1 1 360px'>"
+"<section class='panel pad'>"
 "<h3 data-en='Firmware'>Прошивка</h3>"
 "<div id=fw class=n style=margin-bottom:10px>...</div>"
 "<input id=fwf type=file accept=.bin style='width:100%;margin:4px 0 10px'>"
@@ -2276,7 +2325,7 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "<p class=n data-en='File build/esp32_mca.bin from the project build. If the new firmware does not "
 "come up on the network, the next restart brings back the previous one.'>Файл build/esp32_mca.bin "
 "из сборки проекта. Если новая прошивка не выйдет на связь, следующая перезагрузка вернёт прежнюю.</p>"
-"</section></div>"
+"</section></div></div>"
 "<section class='panel pad'>"
 "<h3 data-en='ADC settings'>Настройки АЦП</h3>"
 "<div style=overflow-x:auto><table class=ptab id=pbox></table></div>"
@@ -2361,22 +2410,15 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "[L('Отбраковка наложений','Pile-up rejection'),["
 "['pileup_pre_pct',L('Наложение до %','Pile-up before %'),'b',L('Брак, если перед пиком трапеция выше этого % амплитуды. 0 - выключено','Reject if before the peak the trapezoid is above this % of the amplitude. 0 - off')],"
 "['pileup_post_pct',L('Наложение после %','Pile-up after %'),'b',L('Брак, если после пика не упала ниже этого %. Работают, только если оба больше 0','Reject if after the peak it has not dropped below this %. Active only if both are above 0')]"
-"],1],"
-"[L('Связь с программами на ПК','PC software link'),["
-"['emu',L('Эмуляция MCA на COM','MCA emulation on COM'),'b',L('Порт UART0 отвечает по протоколу shproto (BecqMoni и др.). Консоль при этом молчит','UART0 answers using the shproto protocol (BecqMoni etc.). The console goes silent')]"
 "],1]];"
-/* fq и emu - не параметры обработки: уходят в прибор сразу, своими запросами */
-"var P=[];GR.forEach(function(g){g[1].forEach(function(r){if(r[0]!='fq'&&r[0]!='emu')P.push(r[0])})});"
+/* fq - не параметр обработки: уходит в прибор сразу, своим запросом */
+"var P=[];GR.forEach(function(g){g[1].forEach(function(r){if(r[0]!='fq')P.push(r[0])})});"
 /* пометка только у параметров одного способа; без пометки - действует всегда */
 "var BDG={t:[L('трапеция','trapezoid'),'t'],i:[L('интегрирование','integration'),'i']};"
 /* поля выпадающими меню: значение и подпись */
 "var SEL={algo:[['0',L('трапеция','trapezoid')],['1',L('интегрирование','integration')],['2',L('свёртка с эталоном','convolution with the reference')]],"
-"nch:[['2048','2048'],['4096','4096'],['8192','8192']],"
-"emu:[['0',L('выключена','off')],['38400','38400'],['115200','115200'],['460800','460800'],"
-"['600000','600000'],['921600','921600']]};"
+"nch:[['2048','2048'],['4096','4096'],['8192','8192']]};"
 "var H={"
-"emu:L('Эмуляция анализатора на последовательном порту UART0 - разъём UART/COM на плате (не встроенный USB). Прибор отвечает по бинарному протоколу shproto, и программы на ПК, умеющие работать с такими анализаторами (например, BecqMoni), видят его как MCA: набор, остановка, сброс, выгрузка спектра и статуса, калибровка. Скорость порта выбирается здесь, действует сразу и сохраняется. Пока эмуляция включена, консоль молчит: сообщения прошивки на порт не идут. Программе отдаётся столько каналов, сколько выбрано в «Каналов»: в BecqMoni выставьте то же число каналов, тогда они совпадут с прибором один в один. Заводские команды настройки из программы не принимаются - параметры задаются на этой странице.',"
-"'Analyzer emulation on the serial port UART0 - the UART/COM connector on the board (not the native USB). The device answers using the binary shproto protocol, and PC programs that work with such analyzers (for example, BecqMoni) see it as an MCA: start, stop, reset, spectrum and status upload, calibration. The port speed is selected here, takes effect immediately and is saved. While emulation is on, the console is silent: firmware messages are not sent to the port. The program receives as many channels as selected in “Channels”: set the same number of channels in BecqMoni, then they match the device one to one. Factory tuning commands from the program are not accepted - parameters are set on this page.'),"
 "fq:L('Частота семплирования АЦП. Выше - подробнее форма импульса, но обработка может не успевать: смотрите потерянные чанки на странице «Диагностика». По замеру на этой плате (около 3500 имп/с) обработка спектра занимает около 70 % ядра на 16 МГц и около 90 % на 20 МГц; при большем счёте нагрузка выше. Параметры фильтра заданы в отсчётах, поэтому на другой частоте то же L или G - другое время.',"
 "'ADC sample rate. Higher - more detailed pulse shape, but processing may not keep up: watch lost chunks on the “Diagnostics” page. Measured on this board (about 3500 cps), spectrum processing takes about 70 % of the core at 16 MHz and about 90 % at 20 MHz; with a higher count rate the load is higher. Filter parameters are set in samples, so at another rate the same L or G is a different time.'),"
 "polarity:L('0 - импульсы вверх от базовой линии, 1 - вниз (например, анод ФЭУ напрямую). При 1 сигнал переворачивается ещё до обработки, и порог и спектр работают как с импульсами вверх; осциллограф синхронизируется по фронту вниз. Постоянная составляющая сигнала на обработку не влияет - её вычитает трапеция.',"
@@ -2455,20 +2497,13 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "function cpcTop(){var c=+document.getElementById('p_cpc').value,n=+document.getElementById('p_nch').value;"
 "document.getElementById('cpctop').textContent=c>0&&n?L('Сейчас шкала до ','Scale now up to ')+(+(c*n).toFixed(1))+L(' кодов.',' codes.'):''}"
 "document.getElementById('p_algo').onchange=showFields;"
-"document.getElementById('p_emu').onchange=setemu;"
 "document.getElementById('p_cpc').oninput=cpcTop;document.getElementById('p_nch').onchange=cpcTop;"
 "function setfreq(){window.REALHZ=FHZ[fs.value];fetch('/cfg?freq='+fs.value)}"
-/* эмуляция MCA на COM: включается сразу, с подтверждением - консоль замолчит */
-"function setemu(){var e=document.getElementById('p_emu'),v=e.value;"
-"if(v!='0'&&!confirm(L('Включить эмуляцию MCA на порту UART0, ','Enable MCA emulation on UART0 at ')+v+"
-"L(' бод? Сообщения консоли на этот порт идти перестанут.',' baud? Console messages will stop going to this port.')))"
-"{e.value=window.EMU||'0';return}window.EMU=v;fetch('/cfg?emu='+v)}"
 /* «Кодов на канал» прибор хранит в тысячных: 0.5 уходит как 500 */
 "function apply(){var q=P.map(function(k){var v=document.getElementById('p_'+k).value;"
 "return k=='cpc'?'cpc='+Math.round(v*1000):k+'='+v}).join('&');"
 "fetch('/cfg?'+q).then(function(r){return r.json()}).then(fillCfg).catch(function(){})}"
 "function fillCfg(p){if(p.fl){FHZ=p.fl;fillFq()}"
-"if(p.emu!==undefined){window.EMU=String(p.emu);document.getElementById('p_emu').value=window.EMU}"
 "P.forEach(function(k){document.getElementById('p_'+k).value=k=='cpc'?p[k]/1000:p[k]});"
 "if(p.shape_on!==undefined){document.getElementById('sh_on').checked=p.shape_on==1;document.getElementById('sh_tol').value=p.shape_tol;"
 "document.getElementById('sh_lmin').value=p.shape_lmin;document.getElementById('sh_lmax').value=p.shape_lmax;document.getElementById('sh_ln').value=p.shape_ln;window.ALGO=p.algo}"
@@ -2520,7 +2555,24 @@ SUB_HEAD("Настройки", "Settings") SUB_NAV(N_SET_ON, N_DIAG, N_HELP)
 "function fww(){var p=document.getElementById('fwp');fwi().then(function(j){"
 "p.textContent=L('прибор перезапущен, работает версия ','device restarted, running version ')+j.ver})"
 ".catch(function(){p.textContent=L('жду перезапуска прибора...','waiting for the device to restart...');setTimeout(fww,2000)})}"
-"ldcfg();ld();fwi();"
+/* СВЯЗЬ С ПРОГРАММАМИ НА ПК: /emu - состояние эмуляции MCA по TCP;
+   ?on=0|1 включает и выключает сразу, ?port=N - новый порт (сервер
+   перезапускается, программе нужно переподключиться). Состояние -
+   раз в 3 с: видно, подключилась ли программа. */
+"function emShow(j){var s;"
+"if(!j.on)s=L('выключена','off');"
+"else if(!j.listen)s=L('порт ','port ')+j.port+L(' не открыт - занят или идёт перезапуск',' not open - taken or restarting');"
+"else s=L('ждёт подключения на порту ','listening on port ')+'<b>'+j.port+'</b>'+(j.client?L(', подключена программа ',', program connected from ')+'<b>'+j.client+'</b>':L(', программа не подключена',', no program connected'));"
+"document.getElementById('em').innerHTML=s;document.getElementById('em_on').checked=j.on==1;"
+"var p=document.getElementById('em_port');if(document.activeElement!==p)p.value=j.port;"
+"if(j.msg)document.getElementById('emsg').textContent=L(j.msg,j.en||j.msg)}"
+"function emld(q){return fetch('/emu'+(q?'?'+q:'')).then(function(r){return r.json()}).then(emShow).catch(function(){})}"
+"function emOn(){emld('on='+(document.getElementById('em_on').checked?1:0))}"
+"function emPort(){var v=+document.getElementById('em_port').value|0;"
+"if(v<1024||v>65535){document.getElementById('emsg').textContent=L('Порт - от 1024 до 65535','Port must be 1024 to 65535');return}"
+"if(!confirm(L('Сменить порт на ','Change the port to ')+v+L('? Подключённая программа отключится, в ней нужно будет указать новый порт.','? A connected program will be disconnected; set the new port in it.')))return;"
+"emld('port='+v).then(function(){setTimeout(emld,2500)})}"
+"ldcfg();ld();fwi();emld();setInterval(function(){emld()},3000);"
 /* ФИЛЬТР ФОРМЫ. /shape: 32 x int32 (набрано, нужно, p10, p50, p90 - x10,
    окно, действует, эталон x10, допуск, включён, окно эталона, частота
    эталона, частота сейчас, проверено, отброшено, столбцов гистограммы;
@@ -3317,7 +3369,9 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "АЦП, а строка «запас по шкале» &mdash; сколько кодов осталось от базы "
 "до потолка и до пола.</td></tr>"
 "<tr><td>Настройки</td><td>Отдельная страница (ссылка «Настройки» вверху). "
-"<b>Сеть</b> &mdash; адрес прибора: от роутера (DHCP) или статический. <b>Прошивка</b> &mdash; "
+"<b>Сеть</b> &mdash; адрес прибора: от роутера (DHCP) или статический. <b>Связь с программами на ПК</b> "
+"&mdash; эмуляция MCA по сети для BecqMoni: включение, TCP-порт (по умолчанию 8234) и кто подключён. "
+"<b>Прошивка</b> &mdash; "
 "версия и обновление по сети файлом build/esp32_mca.bin. <b>Настройки АЦП</b> &mdash; "
 "частота, порог, полярность, шкала спектра и в блоке «Дополнительно» все "
 "параметры обработки; в прибор уходят кнопкой «Применить». Смена «Кодов на "
@@ -3335,8 +3389,8 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "<tr><td>Диагностика</td><td>Отдельная страница. <b>Лог прибора</b> &mdash; сообщения "
 "прошивки с начала работы (последние 256 строк), цвет по уровню: красные &mdash; "
 "ошибки, жёлтые &mdash; предупреждения, тег окрашен по подсистеме (АЦП, сеть, прошивка...); "
-"галочки уровней и подсистем скрывают лишнее, «Сохранить» пишет лог в файл. Лог виден и тогда, когда консоль молчит из-за эмуляции MCA на "
-"COM. <b>Диагностика АЦП</b> &mdash; поток отсчётов и его реальная скорость, регистры "
+"галочки уровней и подсистем скрывают лишнее, «Сохранить» пишет лог в файл. Лог виден и без кабеля USB, по сети. "
+"<b>Диагностика АЦП</b> &mdash; поток отсчётов и его реальная скорость, регистры "
 "камерного интерфейса, профиль за последнюю секунду (загрузка обработки &mdash; та же, что в "
 "строке состояния спектра, загрузка ядра 0, такты на отсчёт, запросы, память), журнал потерь чанков, побитовая статистика линий данных "
 "и их проверка.</td></tr>"
@@ -3543,7 +3597,9 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "range, and the “headroom from baseline” line shows how many codes are left from the "
 "baseline to the ceiling and the floor.</td></tr>"
 "<tr><td>Settings</td><td>A separate page (the “Settings” link at the top). "
-"<b>Network</b> &mdash; the device address: from the router (DHCP) or static. <b>Firmware</b> "
+"<b>Network</b> &mdash; the device address: from the router (DHCP) or static. <b>PC software link</b> "
+"&mdash; MCA emulation over the network for BecqMoni: on/off, the TCP port (8234 by default) and who is "
+"connected. <b>Firmware</b> "
 "&mdash; the version and an update over the network with the build/esp32_mca.bin file. "
 "<b>ADC settings</b> &mdash; sample rate, threshold, polarity, spectrum scale and, in "
 "the “Advanced” block, all processing parameters; they go to the device with the "
@@ -3561,8 +3617,8 @@ SUB_HEAD("Справка", "Help") SUB_NAV(N_SET, N_DIAG, N_HELP_ON)
 "<tr><td>Diagnostics</td><td>A separate page. <b>Device log</b> &mdash; firmware "
 "messages since start (the last 256 lines), coloured by level: red &mdash; errors, "
 "yellow &mdash; warnings, the tag is coloured by subsystem (ADC, network, firmware...); "
-"the level and subsystem checkboxes hide what is not needed, “Save” writes the log to a file. The log is visible even when the console is silent because of MCA emulation "
-"on COM. <b>ADC diagnostics</b> &mdash; the sample stream and its real rate, camera "
+"the level and subsystem checkboxes hide what is not needed, “Save” writes the log to a file. The log is visible without a USB cable too, over the network. "
+"<b>ADC diagnostics</b> &mdash; the sample stream and its real rate, camera "
 "interface registers, the last-second profile (processing load &mdash; the same as in the spectrum "
 "status line, core 0 load, cycles per "
 "sample, requests, memory), the chunk loss log, per-bit statistics of the data lines "
@@ -3972,7 +4028,7 @@ esp_err_t mca_web_start(void)
 
     httpd_handle_t srv = NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers = 44;          /* 39 своих + 2 у /ota, с запасом */
+    cfg.max_uri_handlers = 44;          /* 40 своих + 2 у /ota, с запасом */
     cfg.stack_size       = 8192;
     cfg.core_id          = 0;           /* веб на ядро 0, DSP на ядро 1 */
     cfg.lru_purge_enable = true;
@@ -3995,6 +4051,7 @@ esp_err_t mca_web_start(void)
         URI("/cps", h_cps, NULL),
         URI("/dose", h_dose, NULL),
         URI("/cfg", h_cfg, NULL),
+        URI("/emu", h_emu, NULL),
         URI("/cmd", h_cmd, NULL),
         URI("/settings", h_set_page, NULL),
         URI("/diag", h_diag_page, NULL),

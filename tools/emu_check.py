@@ -1,24 +1,27 @@
-"""Проверка эмуляции MCA по COM-порту (протокол shproto) с ПК.
+"""Проверка эмуляции MCA по сети (протокол shproto на TCP-порту 8234) с ПК.
 
-    python tools/emu_check.py COM3 600000
+    python tools/emu_check.py <ip> [порт]
     python tools/emu_check.py --selftest      # только кодек, без прибора
 
-Шлёт команды так же, как программы на ПК (текст в пакете 0x03 с нулём на
-конце), и разбирает ответы по правилам эталонной реализации протокола:
+Подключается так же, как BecqMoni («AtomSpectra TCP»), шлёт команды
+текстом в пакете 0x03 с нулём на конце и разбирает ответы по правилам
+эталонной реализации протокола:
   - пакет 0xFF 0xFE cmd данные CRC16(lo,hi) 0xA5, CRC16 Modbus;
     экранирование 0xFE/0xA5/0xFD через 0xFD и инверсию;
-  - ответ -inf: ключи VERSION ... PileUpThr;
-  - ответ -cal: 40 строк по 8 hex, CRC32 строк 0..9 в строке 10,
-    серийник в строке 39 (8 hex, не FFFFFFFF);
-  - набор: статус (>= 10 байт) приходит ДО конца прохода по спектру,
-    проход - смещения 0, 64, ... без пропусков до 8192;
-  - ответы на команды - как их ждёт BecqMoni (waitForAnswer): первый
-    текстовый пакет после команды, обрезанный по \\r, совпадает целиком:
-    "-ok" на -sto (в том числе посреди прохода по спектру - за 1 с),
-    на -sta - "-ok" или, на 38400 и 115200, строка с предупреждением.
-ВНИМАНИЕ: проверка запускает набор (-sta) и останавливает его (-sto);
-спектр не сбрасывает.
+  - поток: ещё до первой команды каждую секунду идут статус и весь спектр
+    (BecqMoni 2.5 с слушает поток и по времени в статусе решает, идёт ли
+    набор); статус приходит ДО конца прохода, проход - смещения 0, 64, ...
+    без пропусков до 8192;
+  - ответ -inf: ключи VERSION ... PileUpThr; -cal: 40 строк по 8 hex,
+    CRC32 строк 0..9 в строке 10, серийник в строке 39;
+  - ответы на команды - как их ждёт BecqMoni: "-ok" на -sto, -sta
+    (в том числе посреди прохода по спектру - за 1 с);
+  - после -sto время набора в статусе стоит, после -sta - растёт;
+  - второе подключение вытесняет первое.
+ВНИМАНИЕ: проверка останавливает и запускает набор (-sto/-sta) и в конце
+возвращает его в прежнее состояние; спектр не сбрасывает.
 """
+import socket
 import struct
 import sys
 import time
@@ -104,22 +107,64 @@ def selftest():
     return bad
 
 
-def run(port, baud):
-    import serial                       # pyserial - есть в окружении IDF
-    ser = serial.Serial(port, baud, timeout=0.05)
-    p = Parser()
+class Link:
+    """TCP-подключение к прибору с разбором потока."""
 
-    def collect(sec):
+    def __init__(self, host, port):
+        self.sock = socket.create_connection((host, port), timeout=5)
+        self.sock.settimeout(0.05)
+        self.p = Parser()
+        self.closed = False
+
+    def pump(self, sec):
         t_end = time.time() + sec
         while time.time() < t_end:
-            p.feed(ser.read(4096))
+            try:
+                d = self.sock.recv(65536)
+                if not d:
+                    self.closed = True
+                    return
+                self.p.feed(d)
+            except socket.timeout:
+                pass
+            except OSError:
+                self.closed = True
+                return
 
-    def cmd(text, wait=0.8):
-        p.packets.clear()
-        ser.write(frame(CMD_TEXT, text.encode() + b"\0"))
-        collect(wait)
-        return list(p.packets)
+    def send(self, text):
+        self.sock.sendall(frame(CMD_TEXT, text.encode() + b"\0"))
 
+    def answer(self, text, timeout):
+        """Как BecqMoni: ПЕРВЫЙ текстовый пакет после команды, обрезанный по
+        первому CR. Возвращает (строка, секунд)."""
+        self.p.packets.clear()
+        t0 = time.time()
+        self.send(text)
+        while time.time() - t0 < timeout:
+            self.pump(0.05)
+            for c, d in self.p.packets:
+                if c == CMD_TEXT:
+                    return d.decode("ascii", errors="replace").split("\r")[0], time.time() - t0
+        return None, timeout
+
+    def cmd_text(self, text, wait=0.8):
+        self.p.packets.clear()
+        self.send(text)
+        self.pump(wait)
+        return "".join(d.decode(errors="replace") for c, d in self.p.packets if c == CMD_TEXT)
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+def stat_times(packets):
+    return [struct.unpack_from("<I", d)[0] for c, d in packets if c == CMD_STAT and len(d) >= 4]
+
+
+def run(host, port):
     fails = []
 
     def check(name, cond, detail=""):
@@ -127,102 +172,82 @@ def run(port, baud):
         if not cond:
             fails.append(name)
 
-    def answer(text, timeout):
-        """Как waitForAnswer в BecqMoni: ПЕРВЫЙ текстовый пакет после
-        команды, обрезанный по первому \\r. Возвращает (строка, секунд)."""
-        p.packets.clear()
-        t0 = time.time()
-        ser.write(frame(CMD_TEXT, text.encode() + b"\0"))
-        while time.time() - t0 < timeout:
-            p.feed(ser.read(4096))
-            for c, d in p.packets:
-                if c == CMD_TEXT:
-                    s = d.decode("ascii", errors="replace")
-                    return s.split("\r")[0], time.time() - t0
-        return None, timeout
+    k = Link(host, port)
+    # 1. поток до первой команды - как проба BecqMoni (ProbeMs 2.5 с)
+    k.pump(3.2)
+    pk = list(k.p.packets)
+    st = [d for c, d in pk if c == CMD_STAT]
+    hist = [(struct.unpack_from("<H", d)[0], (len(d) - 2) // 4) for c, d in pk if c == CMD_HIST]
+    check("поток без команд: статус каждую секунду", len(st) >= 2, f"статусов за 3.2 с: {len(st)}")
+    starts = [i for i, (o, n) in enumerate(hist) if o == 0]
+    ok_sweep = any(i + CHANNELS // 64 <= len(hist) and
+                   all(o == j * 64 and n == 64 for j, (o, n) in enumerate(hist[i:i + CHANNELS // 64]))
+                   for i in starts)
+    check("поток без команд: полный проход 0, 64, ... 8192", ok_sweep, f"пакетов спектра {len(hist)}")
+    si = [i for i, (c, d) in enumerate(pk) if c == CMD_STAT]
+    ends = [i for i, (c, d) in enumerate(pk)
+            if c == CMD_HIST and struct.unpack_from("<H", d)[0] + 64 >= CHANNELS]
+    check("статус приходит до конца прохода", bool(si and ends and si[0] < ends[-1]))
+    if st and len(st[0]) >= 10:
+        t, load, cps = struct.unpack_from("<IHI", st[0])
+        print(f"       время {t} с, загрузка {load} %, CPS {cps}")
+    times = stat_times(pk)
+    was_running = len(times) >= 2 and times[-1] > times[0]
+    print(f"       набор до проверки: {'идёт' if was_running else 'стоит'} (время {times})")
 
-    slow = baud in (38400, 115200)
-    want_sta = ("Warning: silent mode forced due to low interface speed-ok"
-                if slow else "-ok")
-
-    ser.reset_input_buffer()
-    a, dt = answer("-sto", 1.0)
-    check("-sto: ответ -ok за 1 с (как ждёт BecqMoni)", a == "-ok", f"{a!r} за {dt:.2f} с")
-    collect(1.0)                        # тишина перед проверками
-
-    texts = [d.decode(errors="replace") for c, d in cmd("-inf") if c == CMD_TEXT]
-    inf = "".join(texts)
+    # 2. команды и ответы
+    a, dt = k.answer("-sto", 1.0)
+    check("-sto: ответ -ok за 1 с", a == "-ok", f"{a!r} за {dt:.2f} с")
+    k.p.packets.clear()
+    k.pump(2.5)
+    t2 = stat_times(k.p.packets)
+    check("после -sto время в статусе стоит", len(t2) >= 2 and t2[-1] == t2[0], str(t2))
+    inf = k.cmd_text("-inf")
     check("-inf: ответ с VERSION и PileUpThr", "VERSION " in inf and "PileUpThr " in inf,
           inf[:90].replace("\r\n", " | "))
-    keys = {}
-    toks = inf.replace("\r", " ").replace("\n", " ").split()
-    for i, k in enumerate(toks[:-1]):
-        if k in ("VERSION", "RISE", "FALL", "NOISE", "F", "MAX", "t"):
-            keys[k] = toks[i + 1]
-    check("-inf: RISE, FALL, F разбираются", all(k in keys for k in ("RISE", "FALL", "F")),
-          str(keys))
-
-    cal = "".join(d.decode(errors="replace") for c, d in cmd("-cal") if c == CMD_TEXT)
+    cal = k.cmd_text("-cal")
     lines = [l for l in cal.replace("\r", "").split("\n") if l]
-    hexok = all(len(l) == 8 and all(ch in "0123456789ABCDEFabcdef" for ch in l)
-                for l in lines)
+    hexok = all(len(l) == 8 and all(ch in "0123456789ABCDEFabcdef" for ch in l) for l in lines)
     check("-cal: 40 строк по 8 hex", len(lines) == 40 and hexok, f"строк {len(lines)}")
     if len(lines) == 40:
-        check("-cal: CRC32 строк 0..9 в строке 10",
-              crc32_std("".join(lines[:10])) == int(lines[10], 16))
-        check("-cal: серийник 8 hex и не FFFFFFFF", lines[39].upper() != "FFFFFFFF",
-              lines[39])
-
-    stt = "".join(d.decode(errors="replace") for c, d in cmd("-stt") if c == CMD_TEXT)
+        check("-cal: CRC32 строк 0..9 в строке 10", crc32_std("".join(lines[:10])) == int(lines[10], 16))
+        check("-cal: серийник 8 hex и не FFFFFFFF", lines[39].upper() != "FFFFFFFF", lines[39])
+    stt = k.cmd_text("-stt")
     check("-stt: stopped после -sto", stt.strip() == "stopped", repr(stt))
-
-    a, dt = answer("-sta", 2.0 if slow else 1.0)
-    check("-sta: ответ как ждёт BecqMoni", a == want_sta, f"{a!r} за {dt:.2f} с")
-    # ответ на -sto посреди прохода по спектру - тоже за секунду
-    collect(1.3)
-    a, dt = answer("-sto", 1.0)
-    check("-sto посреди прохода: -ok за 1 с", a == "-ok", f"{a!r} за {dt:.2f} с")
-    collect(1.0 if not slow else 9.5)   # дать закончиться начатому проходу
-    a, _ = answer("-sta", 2.0 if slow else 1.0)
-    pk = [(c, d) for c, d in p.packets]
-    p.packets.clear()
-    collect(3.5 if not slow else 12.0)
-    pk += list(p.packets)
-    hist = [(struct.unpack_from("<H", d)[0], (len(d) - 2) // 4)
-            for c, d in pk if c == CMD_HIST]
-    stat_i = [i for i, (c, d) in enumerate(pk) if c == CMD_STAT]
-    sweep_end = [i for i, (c, d) in enumerate(pk)
-                 if c == CMD_HIST and struct.unpack_from("<H", d)[0] + (len(d) - 2) // 4 >= CHANNELS]
-    check("набор: пакеты спектра идут", len(hist) >= CHANNELS // 64, f"пакетов {len(hist)}")
-    if sweep_end and stat_i:
-        check("набор: статус приходит до конца прохода", stat_i[0] < sweep_end[0])
-        st = [d for c, d in pk if c == CMD_STAT][0]
-        check("статус: не короче 10 байт", len(st) >= 10, f"{len(st)} байт")
-        if len(st) >= 10:
-            t, load, cps = struct.unpack_from("<IHI", st)
-            print(f"       время {t} с, загрузка {load} %, CPS {cps}")
-    first = next((i for i, (o, n) in enumerate(hist) if o == 0), None)
-    if first is not None and first + CHANNELS // 64 <= len(hist):
-        sw = hist[first:first + CHANNELS // 64]
-        check("проход: смещения 0, 64, ... без пропусков до 8192",
-              all(o == i * 64 and n == 64 for i, (o, n) in enumerate(sw)))
-    else:
-        check("проход по спектру целиком получен", False)
-    stt = "".join(d.decode(errors="replace") for c, d in cmd("-stt") if c == CMD_TEXT)
+    a, dt = k.answer("-sta", 1.0)
+    check("-sta: ответ -ok за 1 с", a == "-ok", f"{a!r} за {dt:.2f} с")
+    k.p.packets.clear()
+    k.pump(2.5)
+    t3 = stat_times(k.p.packets)
+    check("после -sta время в статусе растёт", len(t3) >= 2 and t3[-1] > t3[0], str(t3))
+    stt = k.cmd_text("-stt")
     check("-stt: collecting во время набора", "collecting" in stt, repr(stt))
-
-    cmd("-sto", 2.0 if not slow else 10.0)   # дать закончиться начатому проходу
-    pk = cmd("-stt", 1.5)
-    check("-sto: спектр больше не идёт", not any(c == CMD_HIST for c, d in pk))
-
-    a, _ = answer("-ris 8", 1.0)
+    # ответ посреди прохода по спектру: дождаться начала прохода
+    k.p.packets.clear()
+    t0 = time.time()
+    while time.time() - t0 < 1.5 and not any(c == CMD_HIST for c, d in k.p.packets):
+        k.pump(0.02)
+    a, dt = k.answer("-sto", 1.0)
+    check("-sto посреди прохода: -ok за 1 с", a == "-ok", f"{a!r} за {dt:.2f} с")
+    a, _ = k.answer("-spd 600000", 1.0)
+    check("-spd: -ok, по сети ничего не меняет", a == "-ok", repr(a))
+    a, _ = k.answer("-ris 8", 1.0)
     check("заводская команда: честный отказ", a == "-err not supported", repr(a))
 
-    pk = cmd("-sho", 3.0 if not slow else 10.0)
-    n = sum(1 for c, d in pk if c == CMD_HIST)
-    check("-sho: ровно один проход", n == CHANNELS // 64, f"пакетов {n}")
+    # 3. второе подключение вытесняет первое
+    k2 = Link(host, port)
+    k.pump(1.5)
+    k2.pump(2.0)
+    check("второе подключение: первое закрыто прибором", k.closed)
+    check("второе подключение: поток идёт новому клиенту",
+          any(c == CMD_STAT for c, d in k2.p.packets))
+    k.close()
 
-    print(f"\nбитых кадров: {p.dropped}")
+    # вернуть набор как был
+    a, _ = k2.answer("-sta" if was_running else "-sto", 1.0)
+    print(f"       набор возвращён: {'идёт' if was_running else 'стоит'} ({a!r})")
+    k2.close()
+    print(f"\nбитых кадров: {k.p.dropped + k2.p.dropped}")
     print("Все проверки пройдены" if not fails else f"ПРОВАЛЕНО: {len(fails)}")
     return len(fails)
 
@@ -230,7 +255,7 @@ def run(port, baud):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--selftest":
         sys.exit(1 if selftest() else 0)
-    if len(sys.argv) < 3:
+    if len(sys.argv) < 2:
         print(__doc__)
         sys.exit(2)
-    sys.exit(1 if run(sys.argv[1], int(sys.argv[2])) else 0)
+    sys.exit(1 if run(sys.argv[1], int(sys.argv[2]) if len(sys.argv) > 2 else 8234) else 0)

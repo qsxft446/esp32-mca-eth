@@ -1,0 +1,4 @@
+## Компоненты из реестра ESP-IDF (скачиваются при первой сборке).
+dependencies:
+  # объявление прибора в сети для BecqMoni: служба _atomspectra._tcp (mca_emu.c)
+  espressif/mdns: "^1.4.0"

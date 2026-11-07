@@ -10,9 +10,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <errno.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
+#include "lwip/sockets.h"
+#include "mdns.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
@@ -23,8 +26,21 @@ static const char *TAG = "mca_emu";
 
 /* ================= ЭМУЛЯЦИЯ MCA ПО ПРОТОКОЛУ SHPROTO =================
  *
- * Порт - UART0, тот же, что у консоли (мост USB-UART на плате). Формат
- * пакета, экранирование, CRC и разбор повторяют эталонный shproto
+ * Транспорт - TCP-сервер на порту 8234: так BecqMoni подключается к
+ * анализаторам AtomSpectra по сети («AtomSpectra TCP» - тот же поток
+ * shproto, что по COM-порту, только через сокет). Прибор находится поиском
+ * в BecqMoni (объявление mDNS _atomspectra._tcp, в TXT sn - серийник, как
+ * в регистре 39 по -cal) или по адресу. Клиент один: новое подключение
+ * вытесняет прежнее - после обрыва связи BecqMoni переподключается, а
+ * старый сокет может ещё числиться живым. Раньше транспортом был UART0, и
+ * консоль на это время молчала; теперь консоль свободна.
+ *
+ * ПОТОК. Пока клиент подключён, каждую секунду идут статус и весь спектр -
+ * и при остановленном наборе: BecqMoni перед командами 2.5 с слушает поток
+ * и по времени набора в статусе решает, идёт набор или стоит; молчащий
+ * прибор он без вопроса не трогает (AtomSpectraTcpSession, ProbeMs).
+ *
+ * Формат пакета, экранирование, CRC и разбор повторяют эталонный shproto
  * байт в байт:
  *
  *   0xFF 0xFE  <cmd> <данные...>  <CRC16 lo> <CRC16 hi>  0xA5
@@ -37,31 +53,23 @@ static const char *TAG = "mca_emu";
  *
  * Команды с ПК приходят текстом в пакете 0x03, с нулём на конце.
  * Ответы: 0x03 - текст, 0x04 - статус, 0x01 - спектр кусками по 64
- * канала (как у настоящего прибора). Во время набора каждую секунду -
- * статус, затем весь спектр: приёмники копят статус и применяют его в
- * момент, когда проход по спектру закончен, поэтому статус - первым.
+ * канала (как у настоящего прибора). Каждую секунду - статус, затем весь
+ * спектр: приёмники копят статус и применяют его в момент, когда проход
+ * по спектру закончен, поэтому статус - первым.
  *
- * ОТВЕТЫ НА КОМАНДЫ. Программы ждут подтверждение отдельным текстовым
- * пакетом. BecqMoni после команды берёт ПЕРВЫЙ пришедший текстовый пакет,
- * обрезает его по первому \r и сравнивает целиком: на -sto, -rst, -sta
- * ждёт "-ok" (1 с), а на -sta при 38400 и 115200 - ровно
- * "Warning: silent mode forced due to low interface speed-ok" (2 с). Не
- * дождалась - «не удаётся прочитать данные из порта». Поэтому:
- *  - на каждую выполненную команду - "-ok";
- *  - команды разбираются и между пакетами спектра: на медленном порту
- *    проход длится секунды, и ответ не должен ждать его конца;
- *  - буфер передачи небольшой (1 КБ): ответ встаёт в очередь за ним, и
- *    на 38400 это ~0.27 с, а не секунда с лишним.
- * На 38400 и 115200 настоящий прибор не выгружает спектр каждую секунду
- * («silent»). Здесь спектр идёт и на этих скоростях, просто медленнее:
- * иначе программа, не опрашивающая прибор, спектра не увидела бы.
+ * ОТВЕТЫ НА КОМАНДЫ. BecqMoni после команды ждёт отдельный текстовый пакет
+ * "-ok" (на -sto, -rst, -sta). Поэтому на каждую выполненную команду -
+ * "-ok", и команды разбираются и между пакетами спектра: ответ не ждёт
+ * конца прохода. -spd (скорость порта) по сети не нужна: "-ok", ничего не
+ * меняется.
  *
  * Заводские команды настройки (-ris, -fall, -U, -V, -nos, -hyst, -step,
  * -t..., -pileup...) не выполняются, на них ответ "-err not supported":
  * программа на ПК не должна сбивать настройки обработки этого прибора -
  * они задаются на его странице. */
 
-#define EMU_UART        UART_NUM_0
+#define EMU_PORT_DEF    8234        /* как у AtomSpectra по сети */
+#define EMU_PORT_MIN    1024        /* ниже - служебные, 80 занят страницей */
 #define EMU_NS          "mca_cfg"
 #define CMD_HIST        0x01
 #define CMD_TEXT        0x03
@@ -71,33 +79,29 @@ static const char *TAG = "mca_emu";
 #define N_REGS          40          /* регистры -cal            */
 #define REG_CRC         10          /* CRC32 регистров 0..9     */
 #define REG_SERIAL      39
-#define TX_RING         1024        /* см. «ответы на команды»  */
 
 #define ANSWER_OK       "-ok"
-#define ANSWER_SLOW     "Warning: silent mode forced due to low interface speed-ok"
 #define ANSWER_UNSUPP   "-err not supported"
 
 _Static_assert(MCA_CHANNELS % CHUNK_BINS == 0, "спектр не делится на пакеты");
 _Static_assert(MCA_CHANNELS <= 65535, "смещение в пакете 16-битное");
 
-static const uint32_t BAUDS[] = { 38400, 115200, 460800, 600000, 921600 };
-
-static volatile uint32_t s_baud;          /* 0 - выключено            */
+static volatile bool     s_on;            /* сервер запущен           */
+/* TCP-порт эмуляции: задаётся на странице «Настройки», хранится в NVS
+ * (ключ emu_port). Смена при включённой эмуляции перезапускает сервер. */
+static volatile uint16_t s_port = EMU_PORT_DEF;
 static TaskHandle_t      s_task;
 static volatile bool     s_stop_req;
+static int               s_lfd = -1;      /* слушающий сокет          */
+static int               s_cfd = -1;      /* клиент, -1 - нет         */
+static char              s_peer[20];      /* адрес клиента            */
 static uint32_t          s_regs[N_REGS];
 static bool              s_silent;        /* -sta -s: без выгрузки     */
 static uint32_t          s_limit_s;       /* -sta xx: время набора, с  */
 static bool              s_in_sweep;      /* идёт проход по спектру    */
 
-static void rx_poll(TickType_t wait);
-
-static bool baud_ok(uint32_t b)
-{
-    for (size_t i = 0; i < sizeof(BAUDS) / sizeof(BAUDS[0]); i++)
-        if (BAUDS[i] == b) return true;
-    return false;
-}
+static void rx_poll(int wait_ms);
+static void cli_close(const char *why);
 
 /* ---------------- CRC ---------------- */
 static uint16_t crc16_modbus(uint16_t crc, uint8_t b)
@@ -160,7 +164,13 @@ static void pkt_end(void)
     tx_esc(c & 0xFF);
     tx_esc(c >> 8);
     if (s_tx_len < sizeof(s_tx)) s_tx[s_tx_len++] = 0xA5;
-    uart_write_bytes(EMU_UART, s_tx, s_tx_len);
+    /* целиком или никак: сокет блокирующий, с тайм-аутом отправки; клиент
+     * не принимает (завис, ушёл без FIN) - он отключается */
+    for (size_t off = 0; s_cfd >= 0 && off < s_tx_len; ) {
+        const int r = send(s_cfd, s_tx + off, s_tx_len - off, 0);
+        if (r <= 0) { cli_close("не принимает данные"); break; }
+        off += (size_t)r;
+    }
 }
 
 static void pkt_add16(uint16_t v) { pkt_add(v & 0xFF); pkt_add(v >> 8); }
@@ -327,7 +337,8 @@ static void send_sweep(void)
     pkt_add32(0);
     pkt_end();
 
-    for (uint32_t off = 0; off < MCA_CHANNELS && !s_stop_req; off += CHUNK_BINS) {
+    for (uint32_t off = 0; off < MCA_CHANNELS && !s_stop_req && s_cfd >= 0;
+         off += CHUNK_BINS) {
         /* 64 отдаваемых канала - это 64/mul наших, начиная с off/mul;
          * канал c растягивается на mul соседних: по s/mul в каждый и ещё
          * по единице в первые s%mul - сумма ровно s */
@@ -346,22 +357,15 @@ static void send_sweep(void)
     s_in_sweep = false;
 }
 
-/* ---------------- скорость ---------------- */
-static void baud_save(uint32_t b)
+/* ---------------- включение ---------------- */
+static void on_save(uint32_t on)
 {
     nvs_handle_t h;
     if (nvs_open(EMU_NS, NVS_READWRITE, &h) != ESP_OK) return;
-    nvs_set_u32(h, "emu_baud", b);
+    nvs_set_u32(h, "emu_tcp", on);
+    nvs_erase_key(h, "emu_baud");       /* прежний ключ эмуляции на UART0 */
     nvs_commit(h);
     nvs_close(h);
-}
-
-static void baud_live(uint32_t b)
-{
-    uart_wait_tx_done(EMU_UART, pdMS_TO_TICKS(1000));
-    uart_set_baudrate(EMU_UART, b);
-    s_baud = b;
-    baud_save(b);
 }
 
 /* ---------------- команды ---------------- */
@@ -376,6 +380,7 @@ static void handle_cmd(char *s)
     char *save = NULL;
     char *cmd = strtok_r(s, " ", &save);
     if (!cmd) return;
+    ESP_LOGI(TAG, "команда %s", cmd);
 
     if (!strcmp(cmd, "-inf")) {
         send_inf();
@@ -404,10 +409,7 @@ static void handle_cmd(char *s)
         }
         mca_mode     = MCA_MODE_SPECTRUM;
         mca_spec_run = true;
-        /* так отвечает настоящий прибор на медленном порту - и именно эту
-         * строку ждёт BecqMoni на 38400 и 115200 */
-        send_text((s_baud == 38400 || s_baud == 115200) ? ANSWER_SLOW
-                                                        : ANSWER_OK);
+        send_text(ANSWER_OK);
     } else if (!strcmp(cmd, "-sto")) {
         mca_spec_run = false;
         send_text(ANSWER_OK);
@@ -427,14 +429,7 @@ static void handle_cmd(char *s)
             send_text(ANSWER_UNSUPP);   /* осциллограф и импульсы - нет */
         }
     } else if (!strcmp(cmd, "-spd")) {
-        char *a = strtok_r(NULL, " ", &save);
-        const uint32_t b = a ? (uint32_t)strtoul(a, NULL, 10) : 0;
-        if (baud_ok(b)) {
-            send_text(ANSWER_OK);       /* ещё на прежней скорости */
-            baud_live(b);
-        } else {
-            send_text(ANSWER_UNSUPP);
-        }
+        send_text(ANSWER_OK);           /* скорость порта по сети не нужна */
     } else if (!strcmp(cmd, "-frq")) {
         /* ближайшая большая доступная частота, как у настоящего прибора */
         char *a = strtok_r(NULL, " ", &save);
@@ -450,7 +445,7 @@ static void handle_cmd(char *s)
         }
     } else if (!strcmp(cmd, "-reboot")) {
         send_text(ANSWER_OK);
-        uart_wait_tx_done(EMU_UART, pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(300));
         esp_restart();
     } else {
         /* заводская настройка и прочее - см. в начале файла */
@@ -471,7 +466,7 @@ static void rx_byte(uint8_t b)
         s_rx_esc = false;
         return;
     }
-    if (!s_rx_started) return;          /* в т.ч. одиночный 0xFF раз в секунду */
+    if (!s_rx_started) return;          /* в т.ч. одиночный 0xFF */
     if (b == 0xFD) { s_rx_esc = true; return; }
     if (b == 0xA5) {                    /* конец пакета */
         s_rx_started = false;
@@ -487,7 +482,7 @@ static void rx_byte(uint8_t b)
             text[len] = 0;
             handle_cmd(text);
         } else if (cmd == CMD_REBOOT) {
-            uart_wait_tx_done(EMU_UART, pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(200));
             esp_restart();
         }
         return;
@@ -496,26 +491,101 @@ static void rx_byte(uint8_t b)
     if (s_rx_len < sizeof(s_rx)) s_rx[s_rx_len++] = b;
 }
 
-/* Разобрать всё, что пришло; wait - сколько ждать первого байта. */
-static void rx_poll(TickType_t wait)
+/* ---------------- сокеты ---------------- */
+static void cli_close(const char *why)
 {
-    uint8_t buf[128];
-    int n;
-    while ((n = uart_read_bytes(EMU_UART, buf, sizeof(buf), wait)) > 0) {
-        for (int i = 0; i < n; i++) rx_byte(buf[i]);
-        wait = 0;
+    if (s_cfd < 0) return;
+    shutdown(s_cfd, SHUT_RDWR);
+    close(s_cfd);
+    s_cfd = -1;
+    s_rx_started = false;
+    ESP_LOGI(TAG, "клиент %s отключён: %s", s_peer, why);
+}
+
+/* Разобрать всё, что пришло; wait_ms - сколько ждать первого байта. */
+static void rx_poll(int wait_ms)
+{
+    if (s_cfd < 0) return;
+    fd_set rs;
+    FD_ZERO(&rs);
+    FD_SET(s_cfd, &rs);
+    struct timeval tv = { .tv_sec = 0, .tv_usec = wait_ms * 1000 };
+    if (select(s_cfd + 1, &rs, NULL, NULL, &tv) <= 0) return;
+    uint8_t buf[256];
+    for (;;) {
+        const int n = recv(s_cfd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n > 0) {
+            for (int i = 0; i < n; i++) rx_byte(buf[i]);
+            continue;
+        }
+        if (n == 0) cli_close("закрыл соединение");
+        else if (errno != EAGAIN && errno != EWOULDBLOCK) cli_close("ошибка приёма");
+        return;
     }
+}
+
+static bool listen_open(void)
+{
+    s_lfd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (s_lfd < 0) return false;
+    int one = 1;
+    setsockopt(s_lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a = {
+        .sin_family = AF_INET,
+        .sin_port = htons(s_port),
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+    };
+    if (bind(s_lfd, (struct sockaddr *)&a, sizeof(a)) != 0 || listen(s_lfd, 1) != 0) {
+        ESP_LOGE(TAG, "порт %u не открыт: errno %d", (unsigned)s_port, errno);
+        close(s_lfd);
+        s_lfd = -1;
+        return false;
+    }
+    fcntl(s_lfd, F_SETFL, fcntl(s_lfd, F_GETFL, 0) | O_NONBLOCK);
+    return true;
+}
+
+/* Новое подключение - если есть; прежний клиент уступает место. */
+static void try_accept(void)
+{
+    struct sockaddr_in a;
+    socklen_t al = sizeof(a);
+    const int fd = accept(s_lfd, (struct sockaddr *)&a, &al);
+    if (fd < 0) return;
+    if (s_cfd >= 0) cli_close("подключился другой клиент");
+    /* сокет клиента - блокирующий (accept наследует O_NONBLOCK), отправка
+     * с тайм-аутом; без задержки Нейгла - ответы на команды мелкие;
+     * keepalive - чтобы заметить клиента, пропавшего без FIN */
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) & ~O_NONBLOCK);
+    int one = 1, idle = 5, intvl = 2, cnt = 3;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    struct timeval to = { .tv_sec = 3, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &to, sizeof(to));
+    inet_ntoa_r(a.sin_addr, s_peer, sizeof(s_peer));
+    s_cfd = fd;
+    s_rx_started = false;
+    s_silent = false;
+    ESP_LOGI(TAG, "клиент %s подключён", s_peer);
 }
 
 static void emu_task(void *arg)
 {
+    while (!s_stop_req && !listen_open()) vTaskDelay(pdMS_TO_TICKS(2000));
+    if (!s_stop_req)
+        ESP_LOGI(TAG, "эмуляция MCA (shproto) на TCP-порту %u", (unsigned)s_port);
     int64_t next = esp_timer_get_time() + 1000000;
     while (!s_stop_req) {
-        rx_poll(pdMS_TO_TICKS(20));
+        try_accept();
+        if (s_cfd >= 0) rx_poll(20);
+        else vTaskDelay(pdMS_TO_TICKS(50));
 
         const int64_t now = esp_timer_get_time();
         if (now < next) continue;
-        /* на медленном порту проход дольше секунды - не копим долг */
+        /* проход дольше секунды (медленная связь) - не копим долг */
         next = (now - next > 2000000) ? now + 1000000 : next + 1000000;
 
         if (s_limit_s && mca_spec_run) {
@@ -526,72 +596,121 @@ static void emu_task(void *arg)
                 s_limit_s = 0;
             }
         }
-        if (mca_spec_run && !s_silent) send_sweep();
+        /* и при остановленном наборе - см. «поток» в начале файла */
+        if (s_cfd >= 0 && !s_silent) send_sweep();
     }
+    cli_close("эмуляция выключена");
+    if (s_lfd >= 0) { close(s_lfd); s_lfd = -1; }
     s_task = NULL;
     vTaskDelete(NULL);
 }
 
-/* ---------------- включение / выключение ---------------- */
-static void emu_start(uint32_t baud)
+/* ---------------- объявление в сети ---------------- */
+/* mDNS: служба _atomspectra._tcp на порту эмуляции - её ищет BecqMoni
+ * («обновить» в настройке AtomSpectra TCP). Имя узла и экземпляра - с
+ * концом серийника, чтобы два прибора в сети не путались. */
+static void mdns_announce(bool on)
 {
-    ESP_LOGW(TAG, "эмуляция MCA на UART0, %lu бод - дальше консоль молчит",
-             (unsigned long)baud);
-    vTaskDelay(pdMS_TO_TICKS(30));      /* дать сообщению уйти */
-    /* журнал - не в консоль: иначе он смешался бы с пакетами протокола;
-     * на странице «Диагностика» он по-прежнему виден (mca_log) */
-    mca_log_console(false);
+    static bool inited;
+    if (!inited) {
+        const esp_err_t e = mdns_init();
+        if (e != ESP_OK) {
+            ESP_LOGW(TAG, "mDNS не запущен: %s", esp_err_to_name(e));
+            return;
+        }
+        inited = true;
+        char host[24], inst[40];
+        snprintf(host, sizeof(host), "mca-%04lx", (unsigned long)(s_regs[REG_SERIAL] & 0xFFFF));
+        snprintf(inst, sizeof(inst), "MCA AD9226 %04lX", (unsigned long)(s_regs[REG_SERIAL] & 0xFFFF));
+        mdns_hostname_set(host);
+        mdns_instance_name_set(inst);
+    }
+    if (on) {
+        char sn[12], fw[32];
+        snprintf(sn, sizeof(sn), "%08lX", (unsigned long)s_regs[REG_SERIAL]);
+        snprintf(fw, sizeof(fw), "%s", esp_app_get_description()->version);
+        mdns_txt_item_t txt[] = {
+            { "sn", sn }, { "fw", fw }, { "proto", "shproto" },
+        };
+        const esp_err_t e = mdns_service_add(NULL, "_atomspectra", "_tcp", s_port,
+                                             txt, sizeof(txt) / sizeof(txt[0]));
+        if (e != ESP_OK && e != ESP_ERR_INVALID_ARG)
+            ESP_LOGW(TAG, "служба mDNS не объявлена: %s", esp_err_to_name(e));
+    } else {
+        mdns_service_remove("_atomspectra", "_tcp");
+    }
+}
 
-    if (!uart_is_driver_installed(EMU_UART))
-        uart_driver_install(EMU_UART, 1024, TX_RING, 0, NULL, 0);
-    uart_set_baudrate(EMU_UART, baud);
-    uart_flush_input(EMU_UART);
-
-    s_rx_started = false;
+/* ---------------- включение / выключение ---------------- */
+static void emu_start(void)
+{
     s_in_sweep = false;
     s_silent  = false;
     s_limit_s = 0;
     s_stop_req = false;
-    s_baud = baud;
+    s_on = true;
     xTaskCreatePinnedToCore(emu_task, "mca_emu", 6144, NULL, 4, &s_task, 0);
+    mdns_announce(true);
 }
 
 static void emu_stop(void)
 {
     s_stop_req = true;
     for (int i = 0; i < 300 && s_task; i++) vTaskDelay(pdMS_TO_TICKS(10));
-    uart_wait_tx_done(EMU_UART, pdMS_TO_TICKS(500));
-    uart_set_baudrate(EMU_UART, CONFIG_ESP_CONSOLE_UART_BAUDRATE);
-    uart_driver_delete(EMU_UART);
-    mca_log_console(true);
-    s_baud = 0;
-    ESP_LOGI(TAG, "эмуляция MCA выключена, консоль снова работает");
+    mdns_announce(false);
+    s_on = false;
+    ESP_LOGI(TAG, "эмуляция MCA выключена");
 }
 
 void mca_emu_init(void)
 {
     regs_load();
     nvs_handle_t h;
-    uint32_t b = 0;
+    uint32_t on = 1;                    /* по умолчанию включена */
+    uint16_t port = EMU_PORT_DEF;
     if (nvs_open(EMU_NS, NVS_READONLY, &h) == ESP_OK) {
-        nvs_get_u32(h, "emu_baud", &b);
+        nvs_get_u32(h, "emu_tcp", &on);
+        nvs_get_u16(h, "emu_port", &port);
         nvs_close(h);
     }
-    if (baud_ok(b)) emu_start(b);
+    s_port = port >= EMU_PORT_MIN ? port : EMU_PORT_DEF;
+    if (on) emu_start();
 }
 
-esp_err_t mca_emu_set(uint32_t baud)
+esp_err_t mca_emu_set_port(uint32_t port)
 {
-    if (baud && !baud_ok(baud)) return ESP_ERR_INVALID_ARG;
-    baud_save(baud);
-    if (!baud) {
-        if (s_baud) emu_stop();
-    } else if (!s_baud) {
-        emu_start(baud);
-    } else if (baud != s_baud) {
-        baud_live(baud);
+    if (port < EMU_PORT_MIN || port > 65535) return ESP_ERR_INVALID_ARG;
+    if (port == s_port) return ESP_OK;
+    nvs_handle_t h;
+    if (nvs_open(EMU_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u16(h, "emu_port", (uint16_t)port);
+        nvs_commit(h);
+        nvs_close(h);
     }
+    /* Работающий сервер перезапускаем на новом порту: закроется слушающий
+     * сокет и клиент, объявление mDNS уйдёт с новым портом. Программе на ПК
+     * нужно переподключиться уже на новый порт. */
+    const bool was = s_on;
+    if (was) emu_stop();
+    s_port = (uint16_t)port;
+    ESP_LOGI(TAG, "порт эмуляции: %u", (unsigned)s_port);
+    if (was) emu_start();
     return ESP_OK;
 }
 
-uint32_t mca_emu_baud(void) { return s_baud; }
+uint16_t mca_emu_port(void) { return s_port; }
+
+bool mca_emu_listening(void) { return s_lfd >= 0; }
+
+esp_err_t mca_emu_set(uint32_t on)
+{
+    on = on ? 1 : 0;
+    on_save(on);
+    if (on && !s_on) emu_start();
+    else if (!on && s_on) emu_stop();
+    return ESP_OK;
+}
+
+bool mca_emu_on(void) { return s_on; }
+
+const char *mca_emu_client(void) { return s_cfd >= 0 ? s_peer : ""; }
