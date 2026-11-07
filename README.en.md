@@ -691,7 +691,7 @@ per second (the next request goes only after the answer to the previous one;
 the device answers in 47 ms on average); this does not affect chunk losses:
 with the card open and closed the losses are the same (measured 2026-11-04,
 20 MHz, ~5000 cps, with settings that already overload the core —
-convolution with a 114-sample window).
+template fit with a 114-sample window).
 
 **Which pulses go into the reference** — like reference recording in
 BecqMoni: the line “reference: height from … to … codes, pulses …” (0 — above
@@ -699,8 +699,10 @@ three thresholds / no upper limit; defaults 0, 0, 2000). Clipped pulses (top
 cut by the ADC limit) never go into the reference. Each pulse enters the mean
 scaled to its height — large ones do not dominate.
 
-**Measurement method “convolution with the reference”** (after BecqMoni):
-the height is the one at which the reference pulse fits the pulse best; the
+**Measurement method “template fit”** (after BecqMoni):
+the height is the one at which the reference pulse fits the pulse best (each
+sample goes in with a weight following the reference shape:
+A = Σ(x·r) / Σ(r·r)); the
 baseline is 32 samples before the rise starts (ending L before the threshold
 crossing). The scale is that of integration: height × the mean of the
 reference over the “before / after peak” window, so switching between them
@@ -708,10 +710,26 @@ does not stretch the spectrum. It needs a reference for this window and
 rate, without one the amplitude is computed by the trapezoid; a new
 reference clears the spectrum. If the tail of the reference does not fit in
 the chunk, the height is fitted on the part that does. On the noisy PMT of
-this device, after the baseline fix (2026-11-04), convolution is better than
-both integration and the trapezoid — see “Findings from debugging”,
-“Convolution with the reference: model versus device”. The reference is
+this device, after the baseline fix (2026-11-04), template fit beat the
+integration and trapezoid of that time — see “Findings from debugging”,
+“Template fit: model versus device”; but since 2026-11-06 integration has the
+same baseline, and with a long window it is better (below, “Which to choose”). The reference is
 learned only from running acquisition: after a reboot press “Start” first.
+
+**The shape filter and the measurement method are two independent steps.**
+The method computes the amplitude (which channel the pulse goes to), the
+filter decides whether the pulse goes into the spectrum, and it works with
+any method. They share the “before / after peak” window and the reference:
+“Learn reference” stores both the width for the filter and the mean shape
+for the template fit. The reference is needed: for the trapezoid and
+integration — only with the filter on, for the template fit — always.
+
+**Which to choose.** On a noisy PMT the best was integration with the shape
+filter on: Ra-226, 24 MHz, 609 keV peak — integration 19 + 250 with the
+filter 47.2 keV (without the filter 47.5), template fit 19 + 152 —
+54.0 keV, the best trapezoid — 55.2 keV (measured 2026-11-06, “Findings
+from debugging”, “609 keV resolution”). The help on the page explains all
+three methods with a worked example.
 
 **Check on the device** (2026-11-05): noisy PMT, weak Cs-137 in a lead
 castle, 20 MHz, trapezoid L = 10, G = 51, threshold 16, window 13 + 36,
@@ -809,7 +827,7 @@ event (1.75 — vector difference, 3.6 — search).
 
 After 2026-11-04 (the chunk tail is moved with `memcpy`, not `memmove`; the
 chunk is processed right in the DMA buffer) at 20 MHz and ~4000 cps: 7.55
-cycles per sample of 12, processing 63 %, no losses; with convolution — 7.71
+cycles per sample of 12, processing 63 %, no losses; with template fit — 7.71
 and 64 %. It used to be 10.88 and 91 %. Details — “Findings from debugging”,
 “Processing core budget”.
 
@@ -829,7 +847,7 @@ Ra-226, ~4800 cps, integration, shape filter off, the same windows in time
 Data lines are alive at both rates, none stuck. The spectrum is the same
 (4820 cps, regions within 3 %, the peak shifted by 0.5 % — the windows in
 samples are rounded). Resolution did not grow with the rate: the detector
-sets it. Core headroom at 24 MHz is ~18 %; convolution and the shape filter
+sets it. Core headroom at 24 MHz is ~18 %; template fit and the shape filter
 add another 1–2 % (per-event work), at a noticeably higher count rate watch
 the losses in “Diagnostics”. Queue headroom is 1.36 ms of stream (1.64 ms at
 20 MHz).
@@ -1081,7 +1099,7 @@ pre-allocated memory.
   pulses matches the accepted ones, the width with the baseline before the
   rise is 32.5 versus 33.2; real bursts with that baseline — ~15. Now the
   baseline is 32 samples ending L before the threshold crossing, as in
-  convolution.
+  template fit.
 
   Share of real pulses rejected (tail 15–25 samples after the peak ≥ 0.42 of
   the height, no pile-up; tolerance 40 %, window 10 + 36):
@@ -1193,10 +1211,10 @@ margin. But after the changes above core 1 already has ~4.4 cycles per sample
 spare at 20 MHz (63 %), so the move is needed only for a noticeably higher
 count rate or heavy event processing.
 
-### Convolution with the reference: model versus device
+### Template fit: model versus device
 
 - **Model** (white noise 1.6 codes, identical pulses, L = 10, G = 51, window
-  13 + 36): FWHM at 30 codes — trapezoid 5.64 %, convolution with an 8-sample
+  13 + 36): FWHM at 30 codes — trapezoid 5.64 %, template fit with an 8-sample
   baseline 7.04 %, 16 — 5.28 %, 32 — 4.18 %, 64 — 3.52 %; at 400 codes
   0.72 % versus ~0.85 %. The BecqMoni variant — a zero-mean reference, no
   baseline needed — 2.81 % at 400 codes and 6.82 % at 30. A 32-sample baseline
@@ -1208,34 +1226,34 @@ count rate or heavy event processing.
   | Method | 662 keV peak, FWHM | Ba X-ray 32 keV, peak / valley |
   |---|---|---|
   | integration | 8.74 % | 0.94 (no peak) |
-  | convolution with the reference | 11.05 % | 0.90 (no peak) |
+  | template fit | 11.05 % | 0.90 (no peak) |
   | trapezoid | 9.61 % | 2.20 |
 
-  No chunk losses, load 84.3–84.5 % in all three. On the device convolution is
+  No chunk losses, load 84.3–84.5 % in all three. On the device template fit is
   worse both at 662 keV and at the threshold — the model did not show this.
   An assumption (not checked): the model has white noise and identical
   pulses, while the real baseline wanders slowly by a few codes (the swing
   grows with the window: 10 codes over 26 µs, 18 over 1.6 ms) and the shape
-  varies from pulse to pulse. Long-window methods (convolution, integration)
+  varies from pulse to pulse. Long-window methods (template fit, integration)
   pick this up, the trapezoid — a difference of two windows — does not. For
   low-energy lines on this PMT the trapezoid is better. *This assumption did
   not hold — the cause is below.*
 - **Cause: the baseline lay on the rise** (analysis 2026-11-04 on 19 thousand
   isolated pulses from raw scope frames, Ra-226, 20 MHz, window 10 + 50). The
-  convolution baseline was taken right before the “before peak” window, and
+  template fit baseline was taken right before the “before peak” window, and
   the rise of this PMT (~20 samples) is longer than that window (10): the
   baseline lay on the rise and the height was underestimated by an amount
   that depends on the rise shape — the reference started at −0.40 instead of
-  0. Main peak FWHM on these pulses: trapezoid 9.25 %, convolution as it was
+  0. Main peak FWHM on these pulses: trapezoid 9.25 %, template fit as it was
   11.75 % (8-sample baseline — 21 %, 64 — 9.5 %), with the baseline ending L
   before the threshold crossing — 9.00 %. The threshold is crossed no later
   than L samples after the rise starts, so such a baseline never touches the
   rise whatever the window. The reference is now learned with the same
   baseline.
-- **Spectrum stretch.** The convolution height is the pulse height, while
+- **Spectrum stretch.** The template fit height is the pulse height, while
   integration gives the mean over the window, about 0.6 of the height with a
   10 + 50 window. So switching stretched the spectrum 1.5–2 times (device,
-  Ra-226: 1.62). Now convolution outputs height × the mean of the reference
+  Ra-226: 1.62). Now template fit outputs height × the mean of the reference
   over the integration window — what integration of a clean pulse of this
   shape would give.
 - **Chunk end.** If the tail of the reference did not fit in the chunk, the
@@ -1255,14 +1273,14 @@ count rate or heavy event processing.
   |---|---|---|---|---|
   | trapezoid | 270.4 | 10.75 % | 63.5 % | 0 |
   | integration | 215.7 | 10.00 % | 63.8 % | 0 |
-  | convolution with the reference | 225.1 | 9.50 % | 65.3 % | 0 |
+  | template fit | 225.1 | 9.50 % | 65.3 % | 0 |
 
-  Convolution to integration scale ×1.043 (both by the peak and by stretching
+  Template fit to integration scale ×1.043 (both by the peak and by stretching
   the whole spectrum; shape match 0.998). The remaining 4 % is an assumption:
   the integration baseline (running average) slightly lowers the amplitude;
   on the model the same integration gives 17.61 versus 18.85 with an exact
   baseline. *Since 2026-11-06 the integration baseline is before the rise,
-  as for convolution (model: 19.19, convolution 19.19), see “609 keV
+  as for template fit (model: 19.19, template fit 19.19), see “609 keV
   resolution”.*
 
 ### 609 keV resolution (Ra-226): method and window
@@ -1280,7 +1298,7 @@ different methods — and comparing methods by it is unfair.
 | trapezoid L10 G13 (as it was) | 69.9 | 11.47 | 296 |
 | trapezoid L10 G40 | 63.0 | 10.33 | 290 |
 | trapezoid L48 G98 | 55.2 | 9.07 | 276 |
-| convolution 19 + 152 | 54.0 | 8.86 | 288 |
+| template fit 19 + 152 | 54.0 | 8.86 | 288 |
 | integration 12 + 120 | 57.9 | 9.50 | 269 |
 | integration 19 + 152, running baseline | 49.4 | 8.12 | 261 |
 | integration 19 + 152, baseline before the rise | 49.0 | 8.04 | 262 |
@@ -1314,7 +1332,7 @@ A repeat of the same run differed by 0.2 keV, the fit error is about
 - **The shape filter** does not affect the 609 keV peak (48.9 versus
   49.0 keV); it is needed near the threshold.
 - **In the code.** The integration baseline is now 32 samples before the
-  rise, as for convolution and the width measure (the running one is only a
+  rise, as for template fit and the width measure (the running one is only a
   fallback): scale zero −21 → −16.5 keV, resolution 49.4 → 49.0 keV (at the
   edge of the error). “Baseline 2^N” is limited to 1–16: the device had 55,
   and shifting a 32-bit number by 32 or more is undefined in C. The
